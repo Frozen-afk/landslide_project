@@ -1,0 +1,11 @@
+fastapi==0.141.1
+matplotlib==3.11.1
+numpy==2.5.2
+opencv-python-headless==5.0.0.93
+pillow==12.3.0
+pycolmap==4.1.1
+pytest==9.1.1
+python-multipart==0.0.32
+requests>=2.34
+scipy==1.18.0
+uvicorn==0.52.3

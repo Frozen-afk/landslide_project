@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Landslide Volume from Phone Photos</title>
+<link rel="stylesheet" href="/static/style.css?v=2">
+</head>
+<body>
+<header>
+  <h1>📷 Landslide volume from phone photos</h1>
+  <p>Upload overlapping photos (60–80% overlap, sweep left → right), scale from
+  a reference of known size, mark the landslide, get the volume.</p>
+</header>
+
+<main>
+<!-- 1. upload -->
+<section id="step-upload" class="card">
+  <h2>1 · Photos</h2>
+  <input type="file" id="file-input" accept="image/*" multiple>
+  <button id="upload-btn" class="primary" disabled>Upload &amp; reconstruct</button>
+  <span id="upload-note" class="note">select photos in capture order (left → right)</span>
+  <div id="progress" class="hidden">
+    <div class="spinner"></div>
+    <span id="progress-text">uploading…</span>
+    <pre id="progress-log"></pre>
+  </div>
+  <div id="job-list" class="note"></div>
+</section>
+
+<!-- 2. scale -->
+<section id="step-scale" class="card hidden">
+  <h2>2 · Reference for scale</h2>
+  <div class="tabs">
+    <label><input type="radio" name="scalemode" value="aruco" checked> ArUco marker (auto)</label>
+    <label><input type="radio" name="scalemode" value="manual"> Known object (manual)</label>
+  </div>
+
+  <div id="scale-aruco">
+    <p class="note">Use the printable marker from this project (or any ArUco
+    marker of known size). Enter its real side length:</p>
+    <label>marker side <input id="aruco-side" type="number" value="0.25" step="0.01" min="0.01"> m</label>
+    <label>dictionary
+      <select id="aruco-dict">
+        <option value="auto" selected>auto (try all)</option>
+        <option>DICT_6X6_250</option><option>DICT_5X5_100</option>
+        <option>DICT_4X4_50</option><option>DICT_7X7_250</option>
+      </select>
+    </label>
+    <button id="aruco-btn" class="primary">Detect &amp; set scale</button>
+    <p id="aruco-result" class="note"></p>
+  </div>
+
+  <div id="scale-manual" class="hidden">
+    <p class="note">Pick two photos that both show a reference of known length
+    (ruler, pole, tape, person height…). Click its two endpoints in each photo.</p>
+    <div class="manual-row">
+      <div><label>photo A <select id="man-img-a"></select></label>
+        <canvas id="man-canvas-a" width="640" height="480"></canvas>
+        <div class="note">clicks: <span id="man-clicks-a">0 / 2</span> ·
+          <button class="link" data-clear="a">reset</button></div>
+      </div>
+      <div><label>photo B <select id="man-img-b"></select></label>
+        <canvas id="man-canvas-b" width="640" height="480"></canvas>
+        <div class="note">clicks: <span id="man-clicks-b">0 / 2</span> ·
+          <button class="link" data-clear="b">reset</button></div>
+      </div>
+    </div>
+    <label>real length <input id="man-length" type="number" value="1.0" step="0.01" min="0.01"> m</label>
+    <button id="man-btn" class="primary">Set scale</button>
+    <p id="man-result" class="note"></p>
+  </div>
+  <p id="scale-status"></p>
+</section>
+
+<!-- 3. mark region -->
+<section id="step-mark" class="card hidden">
+  <h2>3 · Mark the landslide</h2>
+  <p class="note">Draw the boundary ON THE RIM — the ring just outside your polygon is used
+  as the undisturbed-ground datum for the volume. The top-down view has no perspective
+  distortion and is the most accurate way to trace.</p>
+  <div class="row">
+    <label>trace on
+      <select id="trace-mode">
+        <option value="photo" selected>photo (perspective)</option>
+        <option value="ortho">top-down view</option>
+      </select>
+    </label>
+    <button id="ortho-btn" class="hidden">Generate top-down view</button>
+    <span id="ortho-note" class="note"></span>
+  </div>
+  <label>photo <select id="mark-img"></select></label>
+  <canvas id="mark-canvas" width="960" height="720"></canvas>
+  <div class="row">
+    <button id="poly-auto">✨ Auto-detect (AI)</button>
+    <button id="poly-undo">Undo point</button>
+    <button id="poly-close" class="primary" disabled>Close polygon</button>
+    <button id="poly-clear">Clear</button>
+    <button id="poly-free">Freehand: off</button>
+    <span id="freehand-note" class="note"></span>
+  </div>
+  <p id="auto-note" class="note"></p>
+  <div class="row">
+    <label class="inline"><input type="checkbox" id="use-dense" checked> dense cloud</label>
+    <button id="measure-btn" class="primary" disabled>Compute volume</button>
+  </div>
+</section>
+
+<!-- 4. result -->
+<section id="step-result" class="card hidden">
+  <h2>4 · Result</h2>
+  <div id="result-table"></div>
+  <div id="result-warnings" class="warnbox hidden"></div>
+  <div class="row">
+    <label>material (bulking/swell)
+      <select id="mat-factor">
+        <option value="1" selected>in-place (bank volume)</option>
+        <option value="1.2">loose soil × 1.20</option>
+        <option value="1.25">mixed gravel × 1.25</option>
+        <option value="1.4">blasted/fractured rock × 1.40</option>
+      </select>
+    </label>
+    <span class="note">loose volume = bank volume × swell factor (what the trucks carry)</span>
+  </div>
+  <div class="row imgs">
+    <figure><img id="img-overlay" alt="overlay"><figcaption>marked region</figcaption></figure>
+    <figure><img id="img-height" alt="heightmap"><figcaption>height vs datum (m)</figcaption></figure>
+  </div>
+</section>
+</main>
+
+<script src="/static/app.js?v=4"></script>
+</body>
+</html>

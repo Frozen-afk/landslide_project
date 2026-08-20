@@ -1,0 +1,6 @@
+.env
+data/jobs/
+__pycache__/
+.venv/
+.pytest_cache/
+data/synth/work/

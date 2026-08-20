@@ -24,16 +24,62 @@ def fit_plane(pts: np.ndarray):
     return c, Vt[2], Vt[:2]
 
 
-def fit_plane_robust(pts: np.ndarray, iters: int = 3, clip: float = 2.5,
-                     min_keep_frac: float = 0.5):
-    """Sigma-clipped plane fit: (centroid, normal, in-plane basis, inlier_mask).
+def fit_plane_ransac(pts: np.ndarray, iters: int = 250, seed: int = 12345):
+    """MSAC plane consensus; returns a boolean inlier mask (or None).
 
-    The rim band around a real polygon contains vegetation and stereo floaters;
-    a plain TLS plane would tilt toward them and bias every height. Iteratively
-    refit and drop points farther than `clip`*sigma until stable, but never
-    keep fewer than `min_keep_frac` of the points.
+    Seeds `fit_plane_robust` when the rim band carries a *clustered*
+    contaminant (vegetation patch, a rubble pile in the band, stereo floaters
+    from one bad pair): iterative sigma-clipping starts from an all-points
+    fit that such a cluster can drag — and with it the datum normal — before
+    clipping ever engages. The consensus search runs on a bounded subsample
+    so cost is flat in rim size; the final mask is evaluated on every point.
+    Deterministic: fixed seed, no randomness escapes to callers.
     """
-    keep = np.ones(len(pts), dtype=bool)
+    pts = np.asarray(pts, np.float64)
+    n = len(pts)
+    if n < 30:
+        return None
+    extent = float(np.ptp(pts, axis=0).max())
+    if extent <= 0:
+        return None
+    rng = np.random.default_rng(seed)
+    sub = pts[rng.choice(n, min(n, 20_000), replace=False)]
+    thr = max(0.005 * extent, 1e-9)     # 0.5% of scene extent, refined below
+    best_mask, best_score = None, np.inf
+    m = len(sub)
+    for _ in range(iters):
+        i, j, k = rng.choice(m, 3, replace=False)
+        normal = np.cross(sub[j] - sub[i], sub[k] - sub[i])
+        nn = float(np.linalg.norm(normal))
+        if nn < 1e-12 * extent:
+            continue
+        normal /= nn
+        d = np.abs((sub - sub[i]) @ normal)
+        inl = d <= thr
+        cnt = int(inl.sum())
+        if cnt < 3:
+            continue
+        score = float(d[inl].sum()) + (m - cnt) * thr    # MSAC truncation
+        if score < best_score:
+            best_score, best_mask = score, inl
+    if best_mask is None:
+        return None
+    # refine: TLS plane on the consensus, then re-evaluate the inlier mask at
+    # 2.5x the consensus's own robust (MAD-based) scale, on the FULL rim
+    c, n0, _ = fit_plane(sub[best_mask])
+    d = np.abs((pts - c) @ n0)
+    d_con = np.abs((sub[best_mask] - c) @ n0)
+    sigma = 1.4826 * float(np.median(d_con)) if len(d_con) else 0.0
+    thr_ref = max(2.5 * sigma, 1e-9)
+    keep = d <= thr_ref
+    if keep.sum() < max(0.25 * n, 15):    # degenerate consensus — refuse
+        return None
+    return keep
+
+
+def _clip_loop(pts: np.ndarray, keep: np.ndarray, iters: int, clip: float,
+               min_keep_frac: float) -> np.ndarray:
+    """Iterative sigma-clip refinement starting from `keep`; may grow or shrink."""
     if len(pts) >= 30:
         for _ in range(iters):
             c, n, _ = fit_plane(pts[keep])
@@ -45,8 +91,40 @@ def fit_plane_robust(pts: np.ndarray, iters: int = 3, clip: float = 2.5,
             if new.sum() < max(min_keep_frac * len(pts), 15) or (new == keep).all():
                 break
             keep = new
-    c, n, basis = fit_plane(pts[keep])
-    return c, n, basis, keep
+    return keep
+
+
+def _med_abs_resid(pts: np.ndarray, keep: np.ndarray) -> float:
+    c, n, _ = fit_plane(pts[keep])
+    return float(np.median(np.abs((pts - c) @ n)))
+
+
+def fit_plane_robust(pts: np.ndarray, iters: int = 3, clip: float = 2.5,
+                     min_keep_frac: float = 0.5):
+    """Sigma-clipped plane fit: (centroid, normal, in-plane basis, inlier_mask).
+
+    Two candidates are refined and compared: the plain all-points clip (the
+    right seed when the rim is genuinely curved — a later paraboloid upgrade
+    handles the curvature, and a RANSAC plane would lock onto one band of
+    the ring) and a RANSAC-seeded clip (the right seed when a clustered
+    contaminant — rubble in the band, a vegetation patch — would drag the
+    all-points fit). The seeded fit wins only when its plane explains the
+    whole rim decisively better (median absolute residual over ALL points,
+    so a tight fit on a tiny subset cannot win by construction).
+    """
+    pts = np.asarray(pts, np.float64)
+    keep_all = _clip_loop(pts, np.ones(len(pts), dtype=bool),
+                          iters, clip, min_keep_frac)
+    seed = fit_plane_ransac(pts)
+    if seed is not None:
+        keep_seed = _clip_loop(pts, seed, iters, clip, min_keep_frac)
+        if keep_seed.sum() >= max(0.25 * len(pts), 15):
+            r_all = _med_abs_resid(pts, keep_all)
+            r_seed = _med_abs_resid(pts, keep_seed)
+            if r_all > 1e-12 and r_seed < 0.5 * r_all:
+                keep_all = keep_seed
+    c, n, basis = fit_plane(pts[keep_all])
+    return c, n, basis, keep_all
 
 
 def _quad_features(uv: np.ndarray, s: float) -> np.ndarray:

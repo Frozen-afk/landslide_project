@@ -191,3 +191,52 @@ def test_wall_rim_does_not_invert_pile_into_depression():
     rel = abs(res["net_volume_m3"] - truth) / truth
     assert rel < 0.15, f"net {res['net_volume_m3']:.2f} vs truth {truth:.2f}"
     assert any("steep surfaces" in w for w in res["warnings"])
+
+
+def _clustered_contaminated_rim(n_good=400, n_bad=250, seed=7):
+    """Flat road rim + a dense rubble patch sitting 0.5 m above it.
+
+    Scattered outliers are handled by sigma clipping alone; a dense cluster
+    (a rubble pile inside the rim band, vegetation patch) tilts the initial
+    all-points fit before clipping engages — this is the RANSAC case.
+    """
+    rng = np.random.default_rng(seed)
+    good = rng.uniform([0, 0, 0], [10, 10, 0.01], (n_good, 3))
+    patch = rng.uniform([4, 4, 0.5], [6, 6, 0.55], (n_bad, 3))
+    return np.concatenate([good, patch]), good, patch
+
+
+def test_fit_plane_ransac_ignores_clustered_contamination():
+    from landslide.volume import fit_plane_ransac
+    pts, good, patch = _clustered_contaminated_rim()
+    keep = fit_plane_ransac(pts)
+    assert keep is not None
+    assert keep[:len(good)].mean() > 0.9        # road points are the consensus
+    assert keep[len(good):].mean() < 0.1        # the rubble cluster is rejected
+    # and the full robust fit lands on the road, not between road and rubble
+    c, n, _, inliers = fit_plane_robust(pts)
+    assert abs(abs(n @ np.array([0, 0, 1.0])) - 1) < 0.02   # normal ~vertical
+    assert abs(c[2]) < 0.05                                 # height ~road level
+
+
+def test_fit_plane_ransac_degenerate_inputs():
+    from landslide.volume import fit_plane_ransac
+    assert fit_plane_ransac(np.zeros((10, 3))) is None        # too few points
+    assert fit_plane_ransac(np.ones((100, 3))) is None        # zero extent
+    # degenerate consensus must not break the robust fit
+    c, n, _, keep = fit_plane_robust(np.ones((100, 3)))
+    assert keep.all() and np.isfinite(c).all()
+
+
+def test_robust_datum_survives_clustered_rim_contamination():
+    interior, rim, analytic = make_bowl_points()
+    rng = np.random.default_rng(5)
+    # dense stereo-floater cluster hugging one side of the rim band
+    src = rim[rng.choice(len(rim), 60, replace=False)]
+    side = rim[rim[:, 0] > rim[:, 0].mean()]
+    cluster_anchor = side.mean(axis=0)
+    bad = cluster_anchor + rng.uniform([-0.3, -0.3, 0.6], [0.3, 0.3, 0.7],
+                                       (120, 3))
+    res = prism_volume(interior, np.concatenate([rim, bad]), log=lambda *_: None)
+    rel = abs(res["cut_volume_m3"] - analytic) / analytic
+    assert rel < 0.05, f"cut {res['cut_volume_m3']:.2f} vs analytic {analytic:.2f}"

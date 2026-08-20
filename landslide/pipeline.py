@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Iterable
 
@@ -15,7 +16,13 @@ from .viz import draw_overlay, draw_overlay_image, heat_topdown
 
 
 def _photo_metrics(im, max_side: int = 900):
-    """Sharpness (Laplacian variance) + 64-bit difference hash of a PIL image."""
+    """Sharpness, exposure clipping, dhash of a PIL image.
+
+    Returns (laplacian_var, clipped_fraction, dhash). `clipped_fraction` is
+    the share of pixels pinned to black or white — a frame half-blown by a
+    stuck auto-exposure carries no recoverable texture in those regions no
+    matter how sharp the rest is.
+    """
     import cv2
     g = im.convert("L")
     s = min(1.0, max_side / max(im.size))
@@ -23,50 +30,74 @@ def _photo_metrics(im, max_side: int = 900):
         g = g.resize((max(1, round(g.width * s)), max(1, round(g.height * s))))
     arr = np.asarray(g)
     lap = float(cv2.Laplacian(arr, cv2.CV_64F).var())
+    clipped = float(((arr <= 2) | (arr >= 253)).mean())
     small = cv2.resize(arr, (9, 8))
     dhash = (small[:, 1:] > small[:, :-1]).flatten()
-    return lap, dhash
+    return lap, clipped, dhash
+
+
+# a frame with at least this fraction of pixels pinned to the histogram rails
+# is unusable for SfM; deliberately harsh so only hopeless frames go
+EXPOSURE_CLIP_FRAC = 0.5
 
 
 def _cull(metrics: list, log) -> list[int]:
-    """Indices of photos to drop: blurry frames and near-duplicate neighbours.
+    """Indices of photos to drop: bad exposure, blur, near-duplicate neighbours.
 
-    Motion blur starves SIFT of features and produces noisy stereo edges;
-    near-duplicate shots add no parallax and slow matching down. Thresholds
-    are deliberately conservative (the 0.25×median guard keeps uniformly-soft
-    sets intact, at most half the upload goes, ≥ 3 photos always survive);
-    near-duplicates are exempt from the cap — they are redundant by
-    definition.
+    Over/under-exposed frames (half the histogram pinned at the rails) go
+    first: SIFT has nothing to anchor on where the sensor clipped. Motion
+    blur starves SIFT of features and produces noisy stereo edges;
+    near-duplicate shots add no parallax and slow matching down. Blur
+    thresholds are deliberately conservative (the 0.25×median guard keeps
+    uniformly-soft sets intact, at most half the upload goes, ≥ 3 photos
+    always survive); near-duplicates are exempt from the cap — they are
+    redundant by definition.
     """
     n = len(metrics)
     laps = np.array([m[0] for m in metrics])
+    clips = np.array([m[1] for m in metrics])
     med = float(np.median(laps))
-    drop = set()
-    for i, m in enumerate(metrics):
-        if m[0] < max(6.0, 0.25 * med):
-            drop.add(i)
-    if len(drop) > 0.5 * n:                       # metric failure, not blur
+    reasons: dict[int, str] = {}
+
+    drop = {i for i in range(n) if clips[i] >= EXPOSURE_CLIP_FRAC}
+    for i in drop:
+        reasons[i] = "over/under-exposed"
+    blur_cut = max(6.0, 0.25 * med)
+    blur_fail = {i for i in range(n) if laps[i] < blur_cut}
+    if len(blur_fail) > 0.5 * n:                   # metric failure, not blur
         keep_n = n - int(np.ceil(0.5 * n))
-        drop = set(np.argsort(laps)[:keep_n].tolist())
+        blur_drop = set(np.argsort(laps)[:keep_n].tolist())
+    else:
+        blur_drop = blur_fail - drop
+    for i in blur_drop:
+        drop.add(i)
+        reasons[i] = "blurry"
+
     # near-duplicates of the previous kept frame: drop the blurrier of the two
     prev = -1
     for i in range(n):
         if i in drop:
             continue
         if prev >= 0:
-            ham = int(np.count_nonzero(metrics[i][1] != metrics[prev][1]))
+            ham = int(np.count_nonzero(metrics[i][2] != metrics[prev][2]))
             if ham <= 3:
                 if laps[i] <= laps[prev]:
                     drop.add(i)
+                    reasons[i] = "near-duplicate"
                     continue
                 drop.add(prev)
+                reasons[prev] = "near-duplicate"
         prev = i
-    if n - len(drop) < 3:
-        drop -= set(np.argsort(laps)[-3:].tolist())
-    blur_cut = max(6.0, 0.25 * med)
+    if n - len(drop) < 3:      # always leave 3 survivors: best exposure+sharpness
+        order = np.lexsort((laps, clips))          # worst exposure/sharpness first
+        drop -= set(order[-3:].tolist())
     for i in sorted(drop):
-        log(f"[import] dropping {metrics[i][2].name}: "
-            + ("blurry" if laps[i] < blur_cut else "near-duplicate"))
+        log(f"[import] dropping {metrics[i][3].name}: {reasons[i]}")
+    if drop:
+        counts = Counter(reasons.values())
+        log("[import] quality gate: "
+            + ", ".join(f"{c} {r}" for r, c in counts.most_common())
+            + f" — {n - len(drop)} of {n} photos kept")
     return sorted(drop)
 
 
@@ -106,9 +137,6 @@ def import_photos(sources: Iterable[Path], photos_dir: Path, max_side: int = 300
     drop = set(_cull(metrics, log))
     for i in drop:
         (photos_dir / names[i]).unlink(missing_ok=True)
-    if drop:
-        log(f"[import] culled {len(drop)}/{len(names)} photos, "
-            f"{len(names) - len(drop)} kept")
     return [n for i, n in enumerate(names) if i not in drop]
 
 

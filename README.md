@@ -52,11 +52,14 @@ Workflow in the browser:
   few images, the pipeline automatically retries with denser sequential
   matching, higher-resolution features, and shared camera intrinsics before
   giving up.
-- **Blur & duplicate culling (pre-SfM)** — photos are scored by Laplacian
-  variance (sharpness) and a difference hash; motion-blurred frames and
-  near-duplicate shots that add no parallax are dropped before feature
-  extraction. Culling is conservative: at most half the upload, ≥ 3 photos
-  always survive.
+- **Blur, exposure & duplicate culling (pre-SfM)** — photos are scored by
+  Laplacian variance (sharpness), histogram clipping (exposure), and a
+  difference hash; motion-blurred frames, over/under-exposed frames (half
+  the histogram pinned at black/white), and near-duplicate shots that add
+  no parallax are dropped before feature extraction. Every rejection is
+  logged with its reason plus a one-line summary ("quality gate: 2 blurry,
+  1 over/under-exposed — 18 of 21 photos kept"). Culling is conservative:
+  at most half the upload, ≥ 3 photos always survive.
 - **Top-down orthophoto tracing** — optionally render the scaled cloud as a
   bird's-eye orthophoto (with scale bar) and trace the boundary there.
   Pixel coordinates map directly to ground coordinates, so a line drawn over
@@ -69,6 +72,15 @@ Workflow in the browser:
   an absolute-improvement floor so noise never flips the model. Spline/RBF
   datums are deliberately not used: the rim is a thin ring with no interior
   data, and splines oscillate when extrapolated across that hole.
+- **RANSAC-hardened datum plane** — the plane fit runs two refinements and
+  keeps the better one: sigma-clipping from all rim points (right when the
+  rim is curved — the paraboloid upgrade then handles the curvature) and a
+  RANSAC-seeded clip (right when a *clustered* contaminant — rubble inside
+  the rim band, a vegetation patch, stereo floaters from one bad pair —
+  would drag the all-points fit before clipping engages). The RANSAC
+  candidate only wins when its plane explains the entire rim decisively
+  better, so a tight fit on a one-sided band of a curved rim can never
+  hijack the datum. Deterministic seed, bounded cost.
 - **Outer-buffer rim sampling** — the undisturbed-ground rim band starts a
   little *outside* the traced line (photo mode: half the band width in px;
   ortho mode: 0.1–0.5 m), so clicks that land slightly inside the debris

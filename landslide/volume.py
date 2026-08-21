@@ -160,6 +160,46 @@ def eval_quadratic(quad, uv: np.ndarray) -> np.ndarray:
     return _quad_features(np.asarray(uv, np.float64), s) @ coef
 
 
+def slope_stats(uv: np.ndarray, z: np.ndarray, steep_deg: float = 35.0,
+                min_cell_pts: int = 3):
+    """Gridded surface-slope statistics: (max_deg, mean_deg, steep_area_m2).
+
+    Per-triangle gradients amplify point noise on thin triangles into ~90°
+    spikes; binning to a grid first (mean height over >=3 points per cell)
+    and taking central differences over the cell size is stable at the
+    decimeter scale the hazard classification needs.
+    """
+    uv = np.asarray(uv, np.float64)
+    z = np.asarray(z, np.float64)
+    if len(uv) < 30:
+        return 0.0, 0.0, 0.0
+    d_self, _ = cKDTree(uv).query(uv, k=2, workers=-1)
+    spacing = float(np.median(d_self[:, 1]))
+    cell = float(np.clip(2.5 * spacing, 0.05, 1.0))
+    nx = int(np.ceil(np.ptp(uv[:, 0]) / cell)) + 1
+    ny = int(np.ceil(np.ptp(uv[:, 1]) / cell)) + 1
+    ix = np.clip(((uv[:, 0] - uv[:, 0].min()) / cell).astype(int), 0, nx - 1)
+    iy = np.clip(((uv[:, 1] - uv[:, 1].min()) / cell).astype(int), 0, ny - 1)
+    flat = iy * nx + ix
+    counts = np.bincount(flat, minlength=nx * ny)
+    sums = np.bincount(flat, weights=z, minlength=nx * ny)
+    ok = counts >= min_cell_pts
+    if ok.sum() < 9:                      # need a 3x3 core for gradients
+        return 0.0, 0.0, 0.0
+    grid = np.full(nx * ny, np.nan)
+    grid[ok] = sums[ok] / counts[ok]
+    g = grid.reshape(ny, nx)
+    gy, gx = np.gradient(g, cell)
+    slope = np.degrees(np.arctan(np.hypot(gx, gy)))
+    valid = np.isfinite(slope)
+    if not valid.any():
+        return 0.0, 0.0, 0.0
+    steep = valid & (slope > steep_deg)
+    return (float(slope[valid].max()),
+            float(slope[valid].mean()),
+            float(steep.sum()) * cell * cell)
+
+
 def _get_covis(ctx: ReconCtx):
     if getattr(ctx, "_covis", None) is None:
         from .sfm import covisibility_pairs
@@ -379,10 +419,38 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
     net = fill - cut                          # depression -> negative net
     area = float(area_tri.sum())
 
+    # ---- secondary-hazard: surface slope (over-steepened debris / scarp) ----
+    # slope of the real surface above the datum plane (quad datum included),
+    # computed on a robust grid — see slope_stats
+    z_pts = h + eval_quadratic(quad, uv2) \
+        if (quad is not None and datum == "rim_quad") else h
+    max_slope, mean_slope, area_steep = slope_stats(uv2, z_pts)
+    if area_steep > max(0.5, 0.02 * area):
+        warnings.append(f"{area_steep:.1f} m² of the surface is steeper than "
+                        "35° (over-steepened debris or scarp — secondary "
+                        "slide risk while clearing)")
+
+    # ---- statistical significance (LoD-style, 95%) ----
+    # cells whose |height| is below ~2 sigma of the datum/surface noise carry
+    # no reliable change signal; reported, not thresholded — zeroing them
+    # would bias thin real layers toward zero volume
+    lod = 1.96 * max(sigma, 1e-6)
+    sig = np.abs(h_tri) > lod
+    sig_area_frac = float(area_tri[sig].sum() / area) if area > 0 else 0.0
+    vol_noise = lod * area
+    if abs(net) < vol_noise:
+        warnings.append(f"net volume ({net:.2f} m³) is within survey noise "
+                        f"(±{vol_noise:.2f} m³ at 95%) — the change may not "
+                        "be real")
+
     if sigma > 0.5 and area > 0:
         warnings.append(f"datum plane residual is high (rms {sigma:.2f} m) — the "
                         "ground around the polygon is rough or curved; treat the "
                         "absolute volumes with caution")
+    # per-point surface height above the datum plane (quad included) for the
+    # slope-map artifact
+    z_pts = h + eval_quadratic(quad, uv2) \
+        if (quad is not None and datum == "rim_quad") else h
     return {
         "net_volume_m3": net,
         "cut_volume_m3": cut,
@@ -398,6 +466,11 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
         "mean_height_m": float(h.mean()),
         "max_depth_m": float(-h.min()) if len(h) else 0.0,
         "max_height_m": float(h.max()) if len(h) else 0.0,
+        "max_slope_deg": max_slope,
+        "mean_slope_deg": mean_slope,
+        "area_steep_m2": area_steep,
+        "lod_m": lod,
+        "sig_area_frac": sig_area_frac,
         "warnings": warnings,
-        "_debug": {"uv2": uv2, "h": h, "centroid": c, "normal": n},
+        "_debug": {"uv2": uv2, "h": h, "z": z_pts, "centroid": c, "normal": n},
     }

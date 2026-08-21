@@ -100,6 +100,25 @@ Workflow in the browser:
   acting multiplicatively on the volume (2σ). A material swell toggle
   (loose soil ×1.20, mixed gravel ×1.25, blasted rock ×1.40) converts bank
   volume into the loose truckload volume.
+- **Statistical significance (LoD-style)** — every measurement reports
+  `lod_m` (95% level of detection: 1.96× datum/surface noise) and
+  `sig_area_frac`, the share of the region whose height change exceeds it.
+  When the net volume sits inside the noise band the result says so
+  explicitly ("net volume is within survey noise") instead of presenting
+  noise as debris. Cells are reported, not thresholded — zeroing
+  sub-threshold cells would bias thin real layers toward no volume.
+- **Slope-hazard map (secondary-slide risk)** — every measurement renders
+  `slopemap.png`: the surface binned to a robust grid, slope from central
+  differences, colored green (<25°, stable) / yellow (25–35°) / red
+  (>35°, over-steepened scarp or debris face at the angle-of-repose risk
+  zone). The result table carries `max_slope_deg`, `mean_slope_deg` and
+  `area_steep_m2` plus a warning when a meaningful share is over-steepened
+  — what a dispatch crew needs before sending people onto the pile.
+- **Resolution vs speed dial** — dense stereo runs at 1280 px by default
+  (the accuracy choice: ~18% volume error on the synthetic benchmark);
+  `dense_cloud(..., stereo_width=640)` is ~5× faster for previews at ~33%
+  error. Per-triangle slope estimates on noisy clouds produce spurious 90°
+  spikes — that's why the hazard map uses gridded medians/means instead.
 - **Job persistence** — jobs, their logs, scale state, and results survive
   server restarts. The 3D reconstruction is rebuilt on demand from the cached
   COLMAP database when you revisit an old job.

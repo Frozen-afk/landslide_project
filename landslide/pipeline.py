@@ -12,7 +12,7 @@ from PIL import Image, ImageOps
 from .densify import dense_cloud, estimate_up
 from .sfm import IMAGE_EXTS, ReconCtx, count_photos, reconstruct
 from .volume import prism_volume, select_region
-from .viz import draw_overlay, draw_overlay_image, heat_topdown
+from .viz import draw_overlay, draw_overlay_image, heat_slope, heat_topdown
 
 
 def _photo_metrics(im, max_side: int = 900):
@@ -227,6 +227,8 @@ def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
             res["artifacts"] = ["overlay.jpg", "heightmap.png"]
         heat_topdown(debug["uv2"], debug["h"],
                      artifacts_dir / "heightmap.png")
+        heat_slope(debug["uv2"], debug["z"], artifacts_dir / "slopemap.png")
+        res["artifacts"] = ["overlay.jpg", "heightmap.png", "slopemap.png"]
         if save_cloud:
             _save_ply(pts * ctx.scale, ctx.cloud(dense=dense)[1],
                       artifacts_dir / "pointcloud.ply")

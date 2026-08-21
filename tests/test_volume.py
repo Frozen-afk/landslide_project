@@ -232,7 +232,6 @@ def test_robust_datum_survives_clustered_rim_contamination():
     interior, rim, analytic = make_bowl_points()
     rng = np.random.default_rng(5)
     # dense stereo-floater cluster hugging one side of the rim band
-    src = rim[rng.choice(len(rim), 60, replace=False)]
     side = rim[rim[:, 0] > rim[:, 0].mean()]
     cluster_anchor = side.mean(axis=0)
     bad = cluster_anchor + rng.uniform([-0.3, -0.3, 0.6], [0.3, 0.3, 0.7],
@@ -240,3 +239,53 @@ def test_robust_datum_survives_clustered_rim_contamination():
     res = prism_volume(interior, np.concatenate([rim, bad]), log=lambda *_: None)
     rel = abs(res["cut_volume_m3"] - analytic) / analytic
     assert rel < 0.05, f"cut {res['cut_volume_m3']:.2f} vs analytic {analytic:.2f}"
+
+
+def _inclined_interior(slope_deg=45.0, half=4.0, step=0.25, rim_w=1.0):
+    """Interior plane inclined `slope_deg` above a flat rim ring."""
+    xs = np.arange(-half - rim_w, half + rim_w + step, step)
+    X, Y = np.meshgrid(xs, xs)
+    inside = (np.abs(X) <= half) & (np.abs(Y) <= half)
+    g = np.tan(np.radians(slope_deg))
+    z = g * (X + half)                        # plane rising along x
+    interior = np.stack([X[inside], Y[inside], z[inside]], 1)
+    rim_m = ~inside
+    rim = np.stack([X[rim_m], Y[rim_m], np.zeros(int(rim_m.sum()))], 1)
+    return interior, rim
+
+
+def test_slope_hazard_fields():
+    # shallow flat-ish interior: no steep area, slopes stay gentle
+    interior, rim, _ = make_bowl_points(depth=0.3)
+    res = prism_volume(interior, rim, log=lambda *_: None)
+    assert res["max_slope_deg"] < 15.0
+    assert res["area_steep_m2"] < 0.5
+    # 45° inclined surface: the interior must flag as over-steepened (the
+    # gridded estimator drops boundary cells, so not quite the full area)
+    interior, rim = _inclined_interior(45.0)
+    res = prism_volume(interior, rim, log=lambda *_: None)
+    assert abs(res["mean_slope_deg"] - 45.0) < 3.0
+    assert res["area_steep_m2"] > 0.75 * res["area_m2"]
+    assert any("steeper than 35" in w for w in res["warnings"])
+
+
+def test_significance_reporting():
+    # a clear signal: every cell far above noise -> significant
+    interior, rim = _inclined_interior(30.0)
+    res = prism_volume(interior, rim, log=lambda *_: None)
+    assert res["sig_area_frac"] > 0.9
+    assert not any("within survey noise" in w for w in res["warnings"])
+    # a whisper-thin layer over a noisy rim: net should sit inside the noise
+    # band and say so
+    rng = np.random.default_rng(4)
+    xs = np.arange(-4, 4.25, 0.25)
+    X, Y = np.meshgrid(xs, xs)
+    inside = np.hypot(X, Y) <= 4.0
+    z = 0.002 * rng.standard_normal(inside.sum())   # 2 mm of noise, no signal
+    interior = np.stack([X[inside], Y[inside], z], 1)
+    rim_m = ~inside
+    rim = np.stack([X[rim_m], Y[rim_m],
+                    0.05 * rng.standard_normal(int(rim_m.sum()))], 1)
+    res = prism_volume(interior, rim, log=lambda *_: None)
+    assert res["sig_area_frac"] < 0.2
+    assert any("within survey noise" in w for w in res["warnings"])

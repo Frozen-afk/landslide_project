@@ -77,7 +77,13 @@ def select_pairs(ctx: ReconCtx, min_covis: int = 25, per_image: int = 2,
 
 def stereo_pair(va: ImageView, vb: ImageView, sparse: np.ndarray,
                 max_width: int = 1280, _swapped: bool = False):
-    """One rectified SGBM stereo reconstruction; returns world points+colors."""
+    """One rectified SGBM stereo reconstruction; returns world points+colors.
+
+    max_width sets the working resolution. 1280 (default) is the accuracy
+    choice; on the synthetic bowl benchmark 640px runs ~5x faster but the
+    measured volume error grows from ~18% to ~33% — half-res disparity
+    smears steep walls. Only drop to 640 for quick previews, not finals.
+    """
     img_a, Ka = _load_scaled(va, max_width)
     img_b, Kb = _load_scaled(vb, max_width)
     h = min(img_a.shape[0], img_b.shape[0])
@@ -262,8 +268,12 @@ def _cap_voxel(n_points: int, voxel: float, max_points: int = MAX_FUSED_POINTS):
 
 
 def dense_cloud(ctx: ReconCtx, log: Log = print, max_pairs: int = 30,
-                force: bool = False) -> dict:
-    """Build (or load cached) semi-dense cloud; stored on ctx.dense."""
+                force: bool = False, stereo_width: int = 1280) -> dict:
+    """Build (or load cached) semi-dense cloud; stored on ctx.dense.
+
+    stereo_width sets the SGBM working resolution (see stereo_pair): 1280
+    for finals, 640 for ~5x-faster previews at reduced accuracy.
+    """
     cache = ctx.workdir / "dense.npz"
     if ctx.dense is not None and not force:
         return ctx.dense
@@ -286,10 +296,11 @@ def dense_cloud(ctx: ReconCtx, log: Log = print, max_pairs: int = 30,
     extent = float(np.ptp(ctx.sparse, axis=0).max())
     voxel = max(extent / 900.0, 1e-6)
 
-    log(f"[dense] running SGBM on {len(pairs)} stereo pairs")
+    log(f"[dense] running SGBM on {len(pairs)} stereo pairs "
+        f"at {stereo_width}px")
     all_pts, all_cols = [], []
     for i, (va, vb, c) in enumerate(pairs):
-        pts, cols = stereo_pair(va, vb, ctx.sparse)
+        pts, cols = stereo_pair(va, vb, ctx.sparse, max_width=stereo_width)
         if len(pts):
             pts, cols = voxel_downsample(pts, cols, voxel)
             all_pts.append(pts)

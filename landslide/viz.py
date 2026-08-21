@@ -57,3 +57,76 @@ def heat_topdown(uv2: np.ndarray, h: np.ndarray, out_path,
     fig.tight_layout()
     fig.savefig(str(out_path))
     plt.close(fig)
+
+
+def _slope_grid(uv2: np.ndarray, z: np.ndarray, min_cell_pts: int = 3):
+    """Bin points to a robust grid; returns (extent, cell, slope_deg grid).
+
+    Per-triangle gradients amplify point noise on thin triangles into ~90°
+    spikes; mean height over >=3 points per cell plus central differences
+    over the cell size is stable at the decimeter scale.
+    """
+    from scipy.spatial import cKDTree
+
+    d_self, _ = cKDTree(uv2).query(uv2, k=2, workers=-1)
+    spacing = float(np.median(d_self[:, 1]))
+    cell = float(np.clip(2.5 * spacing, 0.05, 1.0))
+    x0, y0 = uv2[:, 0].min(), uv2[:, 1].min()
+    nx = int(np.ceil(np.ptp(uv2[:, 0]) / cell)) + 1
+    ny = int(np.ceil(np.ptp(uv2[:, 1]) / cell)) + 1
+    ix = np.clip(((uv2[:, 0] - x0) / cell).astype(int), 0, nx - 1)
+    iy = np.clip(((uv2[:, 1] - y0) / cell).astype(int), 0, ny - 1)
+    flat = iy * nx + ix
+    counts = np.bincount(flat, minlength=nx * ny)
+    sums = np.bincount(flat, weights=z, minlength=nx * ny)
+    ok = counts >= min_cell_pts
+    grid = np.full(nx * ny, np.nan)
+    grid[ok] = sums[ok] / counts[ok]
+    g = grid.reshape(ny, nx)
+    gy, gx = np.gradient(g, cell)
+    slope = np.degrees(np.arctan(np.hypot(gx, gy)))
+    return (x0, y0, x0 + nx * cell, y0 + ny * cell), cell, slope
+
+
+def heat_slope(uv2: np.ndarray, z: np.ndarray, out_path,
+               steep_deg: float = 35.0, moderate_deg: float = 25.0) -> float:
+    """Slope-hazard map of the in-polygon surface (green/yellow/red).
+
+    z is per-point surface height above the datum plane. Green < moderate_deg
+    is stable deposition, yellow to steep_deg is a moderate slope, red >
+    steep_deg is an over-steepened scarp/debris face at secondary-slide risk
+    (35-42° is the angle of repose of loose rock/soil). Returns the area
+    share steeper than steep_deg.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import BoundaryNorm, ListedColormap
+
+    extent, cell, slope = _slope_grid(uv2, z)
+    valid = np.isfinite(slope)
+    if not valid.any():
+        return 0.0
+    steep_share = float((valid & (slope > steep_deg)).sum()
+                        / max(valid.sum(), 1))
+
+    fig, ax = plt.subplots(figsize=(7, 6), dpi=130)
+    cmap = ListedColormap(["#2e9e4f", "#e8c229", "#d2322c"])
+    norm = BoundaryNorm([0, moderate_deg, steep_deg, 90], cmap.N)
+    masked = np.ma.masked_invalid(slope)
+    im = ax.imshow(masked, origin="lower", extent=extent, cmap=cmap,
+                   norm=norm, interpolation="nearest", aspect="equal")
+    ax.set_title(f"Slope hazard (red > {steep_deg:.0f}°: secondary-slide risk)")
+    ax.set_xlabel("east-ish (m)")
+    ax.set_ylabel("north-ish (m)")
+    cb = fig.colorbar(im, ax=ax, label="surface slope (°)",
+                      ticks=[moderate_deg / 2,
+                             (moderate_deg + steep_deg) / 2,
+                             (steep_deg + 90) / 2])
+    cb.ax.set_yticklabels([f"<{moderate_deg:.0f}° stable",
+                           f"{moderate_deg:.0f}–{steep_deg:.0f}° moderate",
+                           f">{steep_deg:.0f}° over-steepened"])
+    fig.tight_layout()
+    fig.savefig(str(out_path))
+    plt.close(fig)
+    return steep_share

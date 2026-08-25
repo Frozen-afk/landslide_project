@@ -88,9 +88,13 @@ def test_median_keypoints_both_schemas(tmp_path):
 def test_build_attempts_ladder_order():
     a = _build_attempts(21, 2400)
     labels = [x["label"] for x in a]
-    assert labels[:2] == ["default", "dense sequential @3200px"]
-    assert "enhanced low-contrast" in labels
+    assert labels[0] == "default"
+    assert labels[1] == "global (GLOMAP)"      # alternative solver, second
+    assert "dense sequential @3200px" in labels
     assert labels[-1] == "shared intrinsics"
+    # large sets lead with GLOMAP (incremental bundle adjustment scales badly)
+    assert _build_attempts(30, 2400)[0]["label"] == "global (GLOMAP)"
+    assert _build_attempts(30, 2400)[0]["global_mode"] is True
     enhanced = next(x for x in a if x["label"] == "enhanced low-contrast")
     assert enhanced["enhanced"] is True
     assert enhanced["peak"] < 0.0067 and enhanced["edge"] > 10.0

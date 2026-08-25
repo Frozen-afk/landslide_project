@@ -137,14 +137,15 @@ def test_curved_hillside_gets_quadratic_datum():
     rel = abs(res["cut_volume_m3"] - analytic) / analytic
     assert rel < 0.05, f"cut {res['cut_volume_m3']:.2f} vs analytic {analytic:.2f}"
     # a plane datum through this curved rim would be badly biased — prove the
-    # upgrade matters by forcing the plane path
+    # richer models matter by forcing the simple-datum path
     import landslide.volume as V
-    orig = V.fit_quadratic
+    orig_q, orig_t = V.fit_quadratic, V.fit_tps_membrane
     V.fit_quadratic = lambda *a, **k: (None, float("inf"))
+    V.fit_tps_membrane = lambda *a, **k: None
     try:
         res_plane = prism_volume(interior, rim, log=lambda *_: None)
     finally:
-        V.fit_quadratic = orig
+        V.fit_quadratic, V.fit_tps_membrane = orig_q, orig_t
     assert res_plane["datum"] == "rim_plane"
     assert abs(res_plane["cut_volume_m3"] - analytic) / analytic > 0.10
 
@@ -289,3 +290,51 @@ def test_significance_reporting():
     res = prism_volume(interior, rim, log=lambda *_: None)
     assert res["sig_area_frac"] < 0.2
     assert any("within survey noise" in w for w in res["warnings"])
+
+
+def make_s_curve_road_with_pile(step=0.22, half=2.0, pile_r=1.3,
+                                pile_h=0.5, seed=9):
+    """Debris pile on a road that bends AND descends (z = 0.5 sin(2*pi*x/6)).
+
+    The rim band hugs the traced region (as real traces do); a single
+    paraboloid cannot follow the S-curve, the TPS membrane can. Returns
+    (interior, rim, analytic_pile_volume).
+    """
+    xs = np.arange(-half - 1.0, half + 1.0 + step, step)
+    X, Y = np.meshgrid(xs, xs)
+    r = np.hypot(X, Y)
+    road = 0.5 * np.sin(2 * np.pi * X / 6.0)
+    inside = r <= half
+    pile = np.clip(1 - r / pile_r, 0, 1)
+    z = road + pile_h * pile
+    interior = np.stack([X[inside], Y[inside], z[inside]], 1)
+    rim_m = (r > half) & (r <= half + 1.0)
+    rng = np.random.default_rng(seed)
+    rim_z = road[rim_m] + 0.01 * rng.standard_normal(int(rim_m.sum()))
+    rim = np.stack([X[rim_m], Y[rim_m], rim_z], 1)
+    # cone pile volume above the road
+    analytic = np.pi * pile_r ** 2 * pile_h / 3.0
+    return interior, rim, analytic
+
+
+def test_s_curve_road_gets_membrane_datum():
+    interior, rim, truth = make_s_curve_road_with_pile()
+    up = np.array([0.0, 0.0, 1.0])
+    res = prism_volume(interior, rim, log=lambda *_: None, up=up)
+    assert res["datum"] == "rim_tps", f"datum was {res['datum']}"
+    rel = abs(res["fill_volume_m3"] - truth) / truth
+    assert rel < 0.12, f"fill {res['fill_volume_m3']:.2f} vs truth {truth:.2f}"
+    assert res["net_volume_m3"] > 0
+    # prove the membrane matters: without it the paraboloid datum biases the
+    # pile volume badly
+    import landslide.volume as V
+    orig = V.fit_tps_membrane
+    V.fit_tps_membrane = lambda *a, **k: None
+    try:
+        res_no_tps = prism_volume(interior, rim, log=lambda *_: None, up=up)
+    finally:
+        V.fit_tps_membrane = orig
+    assert res_no_tps["datum"] != "rim_tps"
+    rel_no = abs(res_no_tps["fill_volume_m3"] - truth) / truth
+    assert rel_no > 0.20, \
+        f"quad-only fill {res_no_tps['fill_volume_m3']:.2f} unexpectedly close"

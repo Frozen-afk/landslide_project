@@ -49,9 +49,13 @@ Workflow in the browser:
 ## Robustness features
 
 - **SfM retry ladder** — if the first reconstruction attempt registers too
-  few images, the pipeline automatically retries with denser sequential
-  matching, higher-resolution features, and shared camera intrinsics before
-  giving up.
+  few images, the pipeline automatically retries with a different solver
+  (GLOMAP global SfM — one-shot pose recovery with different failure modes
+  than incremental mapping; leads the ladder from ~25 photos up where
+  incremental bundle adjustment scales badly), denser sequential matching,
+  higher-resolution features, and shared camera intrinsics before giving up.
+  Every attempt passes the same quality gate (registered images AND ≥30
+  sparse points per image).
 - **Blur, exposure & duplicate culling (pre-SfM)** — photos are scored by
   Laplacian variance (sharpness), histogram clipping (exposure), and a
   difference hash; motion-blurred frames, over/under-exposed frames (half
@@ -81,6 +85,16 @@ Workflow in the browser:
   candidate only wins when its plane explains the entire rim decisively
   better, so a tight fit on a one-sided band of a curved rim can never
   hijack the datum. Deterministic seed, bounded cost.
+- **Membrane datum for multi-axis curvature (TPS)** — a road that bends AND
+  descends cannot be one paraboloid. A smoothing thin--plate spline fitted
+  to the rim ring is offered as a third datum model and adopted only when
+  (a) it beats the incumbent on 3-fold cross-validated held-out rim points
+  by a clear margin, and (b) its interior deviation stays within what the
+  rim's own variation justifies (~1.5σ, 10 cm floor) — the extrapolation
+  guard that keeps the spline's known oscillation risk in check (the
+  classic P'w=0 side conditions are enforced exactly). On an S-curve road
+  with a rim hugging the trace it recovers pile volumes to a few percent
+  where the paraboloid is off by >20%.
 - **Outer-buffer rim sampling** — the undisturbed-ground rim band starts a
   little *outside* the traced line (photo mode: half the band width in px;
   ortho mode: 0.1–0.5 m), so clicks that land slightly inside the debris
@@ -100,13 +114,16 @@ Workflow in the browser:
   acting multiplicatively on the volume (2σ). A material swell toggle
   (loose soil ×1.20, mixed gravel ×1.25, blasted rock ×1.40) converts bank
   volume into the loose truckload volume.
-- **Statistical significance (LoD-style)** — every measurement reports
-  `lod_m` (95% level of detection: 1.96× datum/surface noise) and
-  `sig_area_frac`, the share of the region whose height change exceeds it.
-  When the net volume sits inside the noise band the result says so
-  explicitly ("net volume is within survey noise") instead of presenting
-  noise as debris. Cells are reported, not thresholded — zeroing
-  sub-threshold cells would bias thin real layers toward no volume.
+- **Statistical significance (spatially varying LoD)** — every measurement
+  reports `lod_m`/`lod_max_m` (95% level of detection: 1.96× combined datum
+  and *local surface* noise, the latter from per-point k-NN local-plane
+  roughness binned to a grid — noisier parts of the reconstruction get a
+  higher bar) and `sig_area_frac`, the share of the region whose height
+  change exceeds its local detection limit. When the net volume sits inside
+  the noise band the result says so explicitly ("net volume is within
+  survey noise") instead of presenting noise as debris. Cells are reported,
+  not thresholded — zeroing sub-threshold cells would bias thin real layers
+  toward no volume.
 - **Slope-hazard map (secondary-slide risk)** — every measurement renders
   `slopemap.png`: the surface binned to a robust grid, slope from central
   differences, colored green (<25°, stable) / yellow (25–35°) / red

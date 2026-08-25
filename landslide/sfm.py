@@ -80,14 +80,28 @@ def _median_keypoints(db_path: Path) -> float:
 def _build_attempts(n: int, max_image_size: int) -> list[dict]:
     """SfM retry ladder, cheapest and most-likely-to-work first.
 
-    Each attempt after the first addresses a distinct field-photo failure
-    mode: denser sequential matching (weak overlap), CLAHE-enhanced copies
-    with relaxed SIFT thresholds (low contrast / shadows / wet mud), then
-    one shared camera (same-zoom sets with unstable per-image intrinsics).
+    The global (GLOMAP) pass recovers poses in one shot instead of image-by-
+    image incremental growth — a different solver with different failure
+    modes, which makes it a valuable fallback. Benchmarked on real phone
+    photos it is NOT faster than incremental at small n (28 s vs 11 s
+    mapping on 9 photos; GLOMAP's 10-100x claims are for large sets where
+    incremental bundle adjustment dominates), so it only leads the ladder
+    from ~25 photos up, where incremental scaling starts to hurt.
+    Later attempts address distinct field-photo failure modes: denser
+    sequential matching (weak overlap), CLAHE-enhanced copies with relaxed
+    SIFT thresholds (low contrast / shadows / wet mud), then one shared
+    camera (same-zoom sets with unstable per-image intrinsics).
     """
+    global_att = {"label": "global (GLOMAP)", "matcher":
+                  "exhaustive" if n <= 45 else "sequential",
+                  "overlap": 12, "size": max_image_size,
+                  "shared_camera": False, "global_mode": True}
     attempts = [
         {"label": "default", "matcher": "exhaustive" if n <= 45 else "sequential",
          "overlap": 12, "size": max_image_size, "shared_camera": False},
+    ]
+    attempts.insert(0 if n >= 25 else 1, global_att)
+    attempts += [
         {"label": "dense sequential @3200px", "matcher": "sequential",
          "overlap": min(25, n - 1), "size": 3200, "shared_camera": False},
         {"label": "enhanced low-contrast", "matcher": "sequential",
@@ -237,7 +251,8 @@ def reconstruct(photos_dir, workdir, max_image_size: int = 2400,
                 max_image_size=a["size"],
                 shared_camera=a["shared_camera"],
                 enhanced=a.get("enhanced", False),
-                peak=a.get("peak"), edge=a.get("edge"), log=log)
+                peak=a.get("peak"), edge=a.get("edge"),
+                global_mode=a.get("global_mode", False), log=log)
         except Exception as e:
             log(f"[sfm] attempt '{a['label']}' failed: {e}")
             continue
@@ -276,12 +291,15 @@ def reconstruct(photos_dir, workdir, max_image_size: int = 2400,
 def _run_attempt(photos_dir: Path, workdir: Path, n: int, matcher: str,
                  overlap: int, max_image_size: int, shared_camera: bool,
                  log: Log, enhanced: bool = False,
-                 peak: float | None = None, edge: float | None = None):
+                 peak: float | None = None, edge: float | None = None,
+                 global_mode: bool = False):
     """One full SfM pass; wipes any previous database first.
 
     enhanced=True runs the pass on CLAHE+unsharp copies (same filenames,
     same geometry — the poses apply to the originals unchanged) with the
     SIFT peak/edge thresholds relaxed to keep weak low-contrast texture.
+    global_mode=True recovers poses with GLOMAP (one-shot global SfM)
+    instead of incremental mapping.
     Returns (reconstruction, n_registered, median_keypoints_per_image).
     """
     db_path = workdir / "database.db"
@@ -354,10 +372,19 @@ def _run_attempt(photos_dir: Path, workdir: Path, n: int, matcher: str,
                                   matching_options=matching,
                                   pairing_options=po)
 
-    log("[sfm] incremental mapping (this is the slow part)")
-    result = pycolmap.incremental_mapping(database_path=str(db_path),
-                                          image_path=str(img_dir),
-                                          output_path=str(out_dir))
+    if global_mode and hasattr(pycolmap, "global_mapping"):
+        log("[sfm] global mapping (GLOMAP — fast one-shot pose recovery)")
+        try:
+            result = pycolmap.global_mapping(
+                database_path=str(db_path), image_path=str(img_dir),
+                output_path=str(out_dir))
+        except Exception as e:
+            raise RuntimeError(f"global mapping failed: {e}")
+    else:
+        log("[sfm] incremental mapping (this is the slow part)")
+        result = pycolmap.incremental_mapping(database_path=str(db_path),
+                                              image_path=str(img_dir),
+                                              output_path=str(out_dir))
     rec = _largest_reconstruction(result, out_dir)
     return rec, _prop(rec, "num_reg_images"), _median_keypoints(db_path)
 

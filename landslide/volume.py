@@ -200,11 +200,168 @@ def slope_stats(uv: np.ndarray, z: np.ndarray, steep_deg: float = 35.0,
             float(steep.sum()) * cell * cell)
 
 
+def _tps_kernel(d2: np.ndarray) -> np.ndarray:
+    """Thin-plate-spline kernel r^2 log r of squared distances (0 at r=0)."""
+    out = np.zeros_like(d2)
+    m = d2 > 0
+    out[m] = 0.5 * d2[m] * np.log(d2[m])
+    return out
+
+
+def fit_tps_membrane(uv: np.ndarray, h: np.ndarray, lam: float,
+                     seed: int = 0, max_pts: int = 4000):
+    """Classic smoothing thin-plate-spline surface; returns model or None.
+
+    f(x) = a + b.x + c.y + sum_i w_i K(||x - x_i||), coordinates unit-scale
+    normalized internally (the model stores the scale; eval_tps applies it).
+    Solved as the symmetric saddle system [[K + lam*n*I, P], [P', 0]] whose
+    side conditions P'w = 0 are essential: they are what let curvature
+    propagate from the rim ring across the region interior without the
+    runaway oscillation that kept splines out of the datum until now.
+    (No robust reweighting needed: rim points reaching this stage are
+    already RANSAC/sigma-clip filtered.)
+    """
+    uv = np.asarray(uv, np.float64)
+    h = np.asarray(h, np.float64)
+    if len(uv) < 60:
+        return None
+    if len(uv) > max_pts:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(uv), max_pts, replace=False)
+        uv, h = uv[idx], h[idx]
+    s = max(float(np.ptp(uv, axis=0).max()), 1e-9)
+    uvn = uv / s
+    D2 = ((uvn[:, None, :] - uvn[None, :, :]) ** 2).sum(-1)
+    K = _tps_kernel(D2)
+    P = np.column_stack([np.ones(len(uvn)), uvn])
+    n = len(uvn)
+    A = np.zeros((n + 3, n + 3))
+    A[:n, :n] = K + lam * n * np.eye(n)
+    A[:n, n:] = P
+    A[n:, :n] = P.T
+    b = np.concatenate([h, np.zeros(3)])
+    try:
+        sol = np.linalg.solve(A, b)
+    except np.linalg.LinAlgError:
+        return None
+    return {"sup": uvn, "w": sol[:n], "a": sol[n:n + 3], "s": s}
+
+
+def eval_tps(model, uv: np.ndarray, chunk: int = 100_000) -> np.ndarray:
+    """Evaluate a fit_tps_membrane model at raw (unnormalized) points."""
+    uv = np.asarray(uv, np.float64) / model["s"]
+    out = np.empty(len(uv))
+    sup, w, a = model["sup"], model["w"], model["a"]
+    for s0 in range(0, len(uv), chunk):
+        q = uv[s0:s0 + chunk]
+        d2 = ((q[:, None, :] - sup[None, :, :]) ** 2).sum(-1)
+        out[s0:s0 + chunk] = _tps_kernel(d2) @ w + a[0] \
+            + a[1] * q[:, 0] + a[2] * q[:, 1]
+    return out
+
+
+def _fit_surface(kind: str, uv: np.ndarray, h: np.ndarray):
+    """Least-squares surface of `kind` ('plane' | 'quad' | 'tps'); returns a
+    callable uv -> height, or None if the fit is impossible."""
+    if kind == "plane":
+        A = np.column_stack([np.ones(len(uv)), uv])
+        coef, *_ = np.linalg.lstsq(A, h, rcond=None)
+        return lambda q: coef[0] + coef[1] * q[:, 0] + coef[2] * q[:, 1]
+    if kind == "quad":
+        s = max(float(np.ptp(uv, axis=0).max()), 1e-9)
+        F = _quad_features(uv, s)
+        ridge = 1e-9 * len(uv)
+        coef = np.linalg.solve(F.T @ F + ridge * np.eye(6), F.T @ h)
+        return lambda q: _quad_features(q, s) @ coef
+    if kind == "tps":
+        m = fit_tps_membrane(uv, h, lam=1e-6)
+        if m is None:
+            return None
+        return lambda q: eval_tps(m, q)
+    raise ValueError(kind)
+
+
+def _cv_rmse(kind: str, uv: np.ndarray, h: np.ndarray, folds: int = 3,
+             seed: int = 0) -> float:
+    """Held-out RMSE of a surface model via k-fold cross-validation."""
+    n = len(uv)
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n)
+    errs = []
+    for k in range(folds):
+        te = perm[k::folds]
+        tr = np.setdiff1d(perm, te, assume_unique=True)
+        if len(tr) < 30:
+            continue
+        f = _fit_surface(kind, uv[tr], h[tr])
+        if f is None:
+            return float("inf")
+        errs.append(((f(uv[te]) - h[te]) ** 2).mean())
+    return float(np.sqrt(np.mean(errs))) if errs else float("inf")
+
+
 def _get_covis(ctx: ReconCtx):
     if getattr(ctx, "_covis", None) is None:
         from .sfm import covisibility_pairs
         ctx._covis = covisibility_pairs(ctx.rec)
     return ctx._covis
+
+
+def local_roughness(uv: np.ndarray, h: np.ndarray, k: int = 9) -> np.ndarray:
+    """Per-point residual to the k-NN local plane — slope-free roughness.
+
+    Cell-wise height spread conflates noise with real slope; the residual to
+    each point's own local plane isolates the noise the LoD field needs.
+    """
+    if len(uv) <= k:
+        return np.zeros(len(uv))
+    _, idx = cKDTree(uv).query(uv, k=k, workers=-1)
+    nb = uv[idx]                                             # (n, k, 2)
+    P = np.concatenate([np.ones((*nb.shape[:2], 1)), nb], axis=2)
+    H = h[idx]                                               # (n, k)
+    A = np.einsum("nki,nkj->nij", P, P)                      # (n, 3, 3)
+    b = np.einsum("nki,nk->ni", P, H)
+    A = A + 1e-9 * np.eye(3) * np.maximum(
+        A.max(axis=(1, 2), keepdims=True), 1e-9)
+    try:
+        # numpy 2 batched solve wants an explicit trailing rhs dimension
+        coef = np.linalg.solve(A, b[..., None])[..., 0]
+    except np.linalg.LinAlgError:
+        return np.zeros(len(uv))
+    Q = np.column_stack([np.ones(len(uv)), uv])              # (n, 3)
+    return np.abs(h - np.einsum("ni,ni->n", Q, coef))
+
+
+def _lod_per_triangle(uv2: np.ndarray, h: np.ndarray, sigma_datum: float,
+                      centroids: np.ndarray, spacing: float,
+                      min_cell_pts: int = 3) -> tuple[np.ndarray, float]:
+    """Spatially varying 95% detection limit at each triangle centroid.
+
+    LoD(x,y) = 1.96 * sqrt(sigma_datum^2 + sigma_local(x,y)^2) where the
+    local noise comes from gridded roughness (points matched by fewer
+    stereo pairs / farther from the baseline are noisier and looser).
+    Returns (lod per centroid, max lod over valid cells).
+    """
+    rough = local_roughness(uv2, h)
+    cell = float(np.clip(2.5 * spacing, 0.05, 1.0))
+    x0, y0 = uv2[:, 0].min(), uv2[:, 1].min()
+    nx = int(np.ceil(np.ptp(uv2[:, 0]) / cell)) + 1
+    ny = int(np.ceil(np.ptp(uv2[:, 1]) / cell)) + 1
+    ix = np.clip(((uv2[:, 0] - x0) / cell).astype(int), 0, nx - 1)
+    iy = np.clip(((uv2[:, 1] - y0) / cell).astype(int), 0, ny - 1)
+    flat = iy * nx + ix
+    counts = np.bincount(flat, minlength=nx * ny)
+    rsum = np.bincount(flat, weights=rough, minlength=nx * ny)
+    sig_local = np.zeros(nx * ny)
+    m = counts >= min_cell_pts
+    # mean|r| of zero-mean noise ~ 0.8 sigma
+    sig_local[m] = np.maximum(rsum[m] / counts[m] / 0.8, 0.0)
+    lod_cell = 1.96 * np.sqrt(sigma_datum ** 2 + sig_local ** 2)
+    cx = np.clip(((centroids[:, 0] - x0) / cell).astype(int), 0, nx - 1)
+    cy = np.clip(((centroids[:, 1] - y0) / cell).astype(int), 0, ny - 1)
+    lod_tri = lod_cell[cy * nx + cx]
+    lod_max = float(lod_cell[m].max()) if m.any() else 1.96 * sigma_datum
+    return lod_tri, lod_max
 
 
 def _neighbor_views(ctx: ReconCtx, image_name: str, k: int = 1):
@@ -354,6 +511,7 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
     quad = None
     resid = (datum_pts[inliers] - c) @ n
     sigma = float(np.sqrt((resid ** 2).mean()))
+    tps = None
     if datum_pts is rim:
         uv_r = (datum_pts[inliers] - c) @ basis.T
         h_r = (datum_pts[inliers] - c) @ n
@@ -368,11 +526,52 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
             sigma = sigma_q
             datum = "rim_quad"
 
+        # membrane challenge: a road that bends AND descends needs more than
+        # one paraboloid. The spline's known danger (oscillation across the
+        # rim's inner hole) is held in check by smoothing + Huber and the
+        # cross-validation gate: the TPS must beat the adopted model on
+        # held-out rim points by a clear margin, or the simpler datum stays
+        if sigma > 0.03 and len(uv_r) >= 200:
+            rng = np.random.default_rng(0)
+            if len(uv_r) > 2500:
+                idx = rng.choice(len(uv_r), 2500, replace=False)
+                uv_c, h_c = uv_r[idx], h_r[idx]
+            else:
+                uv_c, h_c = uv_r, h_r
+            cur = "quad" if datum == "rim_quad" else "plane"
+            cv_cur = _cv_rmse(cur, uv_c, h_c)
+            cv_tps = _cv_rmse("tps", uv_c, h_c)
+            if cv_tps < cv_cur - max(0.02, 0.15 * cv_cur):
+                m = fit_tps_membrane(uv_r, h_r, lam=1e-6)
+                # extrapolation guard: the rim only proves curvature IT
+                # exhibits — a membrane swinging more inside the region than
+                # ~the rim's own residual is guessing, and the interior of a
+                # large region is genuinely unknowable from a far rim
+                if m is not None:
+                    uv2_all = (interior - c) @ basis.T
+                    base = (eval_quadratic(quad, uv2_all)
+                            if datum == "rim_quad" else 0.0)
+                    dev = float(np.abs(eval_tps(m, uv2_all) - base).max())
+                    if dev <= max(0.10, 1.5 * sigma):
+                        tps = m
+                        datum = "rim_tps"
+                        sigma = float(np.sqrt(
+                            ((eval_tps(m, uv_r) - h_r) ** 2).mean()))
+                        log(f"[volume] membrane datum (smoothing TPS): "
+                            f"held-out rim rms {cv_cur:.3f} -> {cv_tps:.3f} m "
+                            f"(interior deviation {dev:.3f} m)")
+                    else:
+                        log(f"[volume] membrane rejected: interior deviation "
+                            f"{dev:.2f} m exceeds the rim's own variation — "
+                            "region too large for rim-only curvature")
+
     cap = max_above_datum if max_above_datum is not None else max(1.5, 8.0 * sigma)
     h = (interior - c) @ n                    # signed heights above datum
     uv2 = (interior - c) @ basis.T            # in-plane 2D coords
     if quad is not None and datum == "rim_quad":
         h = h - eval_quadratic(quad, uv2)     # heights above the curved datum
+    elif tps is not None:
+        h = h - eval_tps(tps, uv2)            # heights above the membrane
     dropped = h > cap
     if dropped.any():
         log(f"[volume] dropping {int(dropped.sum())} points floating >{cap:.2f} m "
@@ -430,14 +629,15 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
                         "35° (over-steepened debris or scarp — secondary "
                         "slide risk while clearing)")
 
-    # ---- statistical significance (LoD-style, 95%) ----
-    # cells whose |height| is below ~2 sigma of the datum/surface noise carry
-    # no reliable change signal; reported, not thresholded — zeroing them
-    # would bias thin real layers toward zero volume
-    lod = 1.96 * max(sigma, 1e-6)
-    sig = np.abs(h_tri) > lod
+    # ---- statistical significance (spatially varying LoD, 95%) ----
+    # cells whose |height| is below the local detection limit carry no
+    # reliable change signal; reported, not thresholded — zeroing them would
+    # bias thin real layers toward zero volume
+    centroids = (p0[keep_tri] + p1[keep_tri] + p2[keep_tri]) / 3.0
+    lod_tri, lod_max = _lod_per_triangle(uv2, h, sigma, centroids, spacing)
+    sig = np.abs(h_tri) > lod_tri
     sig_area_frac = float(area_tri[sig].sum() / area) if area > 0 else 0.0
-    vol_noise = lod * area
+    vol_noise = 1.96 * sigma * area
     if abs(net) < vol_noise:
         warnings.append(f"net volume ({net:.2f} m³) is within survey noise "
                         f"(±{vol_noise:.2f} m³ at 95%) — the change may not "
@@ -447,10 +647,14 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
         warnings.append(f"datum plane residual is high (rms {sigma:.2f} m) — the "
                         "ground around the polygon is rough or curved; treat the "
                         "absolute volumes with caution")
-    # per-point surface height above the datum plane (quad included) for the
-    # slope-map artifact
-    z_pts = h + eval_quadratic(quad, uv2) \
-        if (quad is not None and datum == "rim_quad") else h
+    # per-point surface height above the datum plane (curved datum included)
+    # for the slope-map artifact
+    if quad is not None and datum == "rim_quad":
+        z_pts = h + eval_quadratic(quad, uv2)
+    elif tps is not None:
+        z_pts = h + eval_tps(tps, uv2)
+    else:
+        z_pts = h
     return {
         "net_volume_m3": net,
         "cut_volume_m3": cut,
@@ -469,7 +673,8 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
         "max_slope_deg": max_slope,
         "mean_slope_deg": mean_slope,
         "area_steep_m2": area_steep,
-        "lod_m": lod,
+        "lod_m": 1.96 * sigma,
+        "lod_max_m": lod_max,
         "sig_area_frac": sig_area_frac,
         "warnings": warnings,
         "_debug": {"uv2": uv2, "h": h, "z": z_pts, "centroid": c, "normal": n},

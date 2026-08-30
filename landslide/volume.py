@@ -300,6 +300,100 @@ def _cv_rmse(kind: str, uv: np.ndarray, h: np.ndarray, folds: int = 3,
     return float(np.sqrt(np.mean(errs))) if errs else float("inf")
 
 
+def dem_volume(interior_xyz: np.ndarray, dem_fn, log: Log = print,
+               max_edge_factor: float = 20.0,
+               max_edge_region_frac: float = 0.5) -> dict:
+    """Cut/fill of a surface against an imported pre-event DEM.
+
+    `interior_xyz` are the region's points already mapped into the DEM's
+    world frame (see dem.align_to_dem); `dem_fn(xy)` returns DEM heights
+    (NaN off the hull). Heights are the direct surface − DEM difference —
+    no rim, no extrapolated datum. Shares the bridging/slope/LoD machinery
+    of prism_volume.
+    """
+    interior_xyz = np.asarray(interior_xyz, np.float64)
+    if len(interior_xyz) < 30:
+        raise RuntimeError("too few points in the region for DEM differencing")
+    warnings: list[str] = []
+    z_dem = dem_fn(interior_xyz[:, :2])
+    ok = np.isfinite(z_dem)
+    if ok.mean() < 0.6:
+        raise RuntimeError(
+            f"only {ok.mean():.0%} of the region lies on the imported DEM — "
+            "check the DEM extent or the alignment")
+    if not ok.all():
+        warnings.append(f"{(1 - ok.mean()):.0%} of the region falls outside "
+                        "the DEM and was excluded")
+    p = interior_xyz[ok]
+    h = p[:, 2] - z_dem[ok]
+
+    tri = Delaunay(p[:, :2])
+    simp = tri.simplices
+    q0, q1, q2 = p[simp[:, 0]], p[simp[:, 1]], p[simp[:, 2]]
+    area_tri = 0.5 * np.abs((q1[:, 0] - q0[:, 0]) * (q2[:, 1] - q0[:, 1]) -
+                            (q2[:, 0] - q0[:, 0]) * (q1[:, 1] - q0[:, 1]))
+    h_tri = h[simp].mean(axis=1)
+    v_tri = area_tri * h_tri
+
+    d_self, _ = cKDTree(p[:, :2]).query(p[:, :2], k=2, workers=-1)
+    spacing = float(np.median(d_self[:, 1]))
+    lo, hi = np.percentile(p[:, :2], [1, 99], axis=0)
+    diam = float(np.linalg.norm(hi - lo))
+    max_edge = max(max_edge_factor * spacing, max_edge_region_frac * diam)
+    edges = np.stack([np.linalg.norm(q1 - q0, axis=1),
+                      np.linalg.norm(q2 - q1, axis=1),
+                      np.linalg.norm(q0 - q2, axis=1)])
+    keep_tri = edges.max(axis=0) <= max_edge
+    if not keep_tri.all():
+        bridged = float(area_tri[~keep_tri].sum())
+        log(f"[dem-volume] dropping {int((~keep_tri).sum())} bridging "
+            f"triangles, {bridged:.1f} m^2 unsupported")
+        if bridged > 0.05 * float(area_tri.sum()):
+            warnings.append(f"{bridged:.0f} m² of the marked region could "
+                            "not be reconstructed and was excluded")
+        area_tri, v_tri, h_tri = area_tri[keep_tri], v_tri[keep_tri], \
+            h_tri[keep_tri]
+
+    fill = float(v_tri[h_tri > 0].sum())
+    cut = float(-v_tri[h_tri < 0].sum())
+    net = fill - cut
+    area = float(area_tri.sum())
+
+    sigma = float(np.sqrt(((h[simp][keep_tri].mean(axis=1) - h_tri) ** 2)
+                          .mean())) if len(h_tri) else 0.0
+    max_slope, mean_slope, area_steep = slope_stats(p[:, :2], h + dem_fn(
+        p[:, :2]))
+    if area_steep > max(0.5, 0.02 * area):
+        warnings.append(f"{area_steep:.1f} m² of the surface is steeper than "
+                        "35° (over-steepened debris or scarp — secondary "
+                        "slide risk while clearing)")
+    centroids = (q0[keep_tri] + q1[keep_tri] + q2[keep_tri])[:, :2] / 3.0
+    lod_tri, lod_max = _lod_per_triangle(p[:, :2], h, sigma, centroids,
+                                         spacing)
+    sig = np.abs(h_tri) > lod_tri
+    sig_area_frac = float(area_tri[sig].sum() / area) if area > 0 else 0.0
+    vol_noise = 1.96 * sigma * area
+    if abs(net) < vol_noise:
+        warnings.append(f"net volume ({net:.2f} m³) is within survey noise "
+                        f"(±{vol_noise:.2f} m³ at 95%) — the change may not "
+                        "be real")
+
+    return {
+        "net_volume_m3": net, "cut_volume_m3": cut, "fill_volume_m3": fill,
+        "area_m2": area, "datum": "dem", "datum_rms_m": sigma,
+        "est_volume_error_m3": sigma * area,
+        "n_points": int(len(p)), "n_rim_points": 0,
+        "mean_height_m": float(h.mean()),
+        "max_depth_m": float(-h.min()), "max_height_m": float(h.max()),
+        "max_slope_deg": max_slope, "mean_slope_deg": mean_slope,
+        "area_steep_m2": area_steep,
+        "lod_m": 1.96 * sigma, "lod_max_m": lod_max,
+        "sig_area_frac": sig_area_frac,
+        "warnings": warnings,
+        "_debug": {"uv2": p[:, :2], "h": h, "z": h + dem_fn(p[:, :2])},
+    }
+
+
 def _get_covis(ctx: ReconCtx):
     if getattr(ctx, "_covis", None) is None:
         from .sfm import covisibility_pairs

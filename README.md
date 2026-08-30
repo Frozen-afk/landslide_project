@@ -139,6 +139,31 @@ Workflow in the browser:
 - **Job persistence** — jobs, their logs, scale state, and results survive
   server restarts. The 3D reconstruction is rebuilt on demand from the cached
   COLMAP database when you revisit an old job.
+- **Prior-surface DEM datum** — when a pre-event surface exists (national
+  lidar, an older survey, a drone DEM from before the slide), upload it in
+  the marking step (XYZ grid text; GeoTIFF with rasterio). It is aligned to
+  the metric model with gravity-seeded trimmed point-to-plane ICP — the
+  debris itself is rejected from the correspondence cut, and in-plane
+  sliding (the classic planar-road ICP failure) is avoided — then the
+  volume is the direct surface − DEM difference: no rim, no extrapolation,
+  and cut/fill works even where no clean rim exists. The rim datum stays
+  available as a fallback (`remove` the DEM to go back).
+- **Two-epoch change monitoring** — `python -m landslide.cli change
+  JOB_A_DIR JOB_B_DIR` compares two surveys of the same site: epoch B is
+  rigidly registered onto epoch A with the same trimmed ICP (the changed
+  pile cannot bias the alignment), epoch A becomes the prior surface, and
+  the change volume is reported with the usual LoD significance gating.
+  Positive net = material added between surveys.
+- **GPS georeferencing (annotation)** — photos carrying EXIF GPS are
+  aligned to a local ENU frame after the metric scale is set; the job
+  snapshot exposes the origin lat/lon, the GPS residual (a sanity metric —
+  GPS is metres-noisy), and the GPS-vs-marker scale cross-check. Volumes
+  are never derived from GPS; this exists for map-ready exports and repeat
+  surveys.
+- **Two-job concurrency** — the server runs two jobs at once (a long SfM no
+  longer blocks a quick measure); the 2-loaded-context limit bounds RAM.
+  Dense-cloud caches are keyed by stereo resolution, so a 640 px preview
+  rebuild can never serve a stale 1280 px cloud.
 - **Degraded-photo hardening** — field photos with deep shadows, washed-out
   gravel or wet low-contrast mud starve SIFT of features. The SfM retry
   ladder now includes a dedicated attempt that runs on CLAHE + unsharp

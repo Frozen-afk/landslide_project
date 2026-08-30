@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Optional
 
 import cv2
+import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -71,7 +72,10 @@ async def _no_cache_ui(request, call_next):
         resp.headers["Cache-Control"] = "no-cache"
     return resp
 
-EXEC = ThreadPoolExecutor(max_workers=1)
+EXEC = ThreadPoolExecutor(max_workers=2)   # 2 concurrent jobs: one long SfM
+                                           # no longer blocks a quick measure;
+                                           # MAX_LOADED_CTX=2 bounds the RAM
+                                           # of two in-flight contexts
 JOBS_LOCK = threading.Lock()
 
 
@@ -79,7 +83,8 @@ class Job:
     def __init__(self, job_id: str, created: float | None = None,
                  status: str = "reconstructing", error: str | None = None,
                  log: list[str] | None = None, scale_info: dict | None = None,
-                 result: dict | None = None, ortho: dict | None = None):
+                 result: dict | None = None, ortho: dict | None = None,
+                 dem_info: dict | None = None):
         self.id = job_id
         self.dir = DATA_DIR / job_id
         self.status = status          # reconstructing|ready|measuring|error
@@ -90,6 +95,7 @@ class Job:
         self.result = result
         self.scale_info = scale_info  # mirror of ctx.scale_info, persisted
         self.ortho = ortho            # orthophoto metadata, persisted
+        self.dem_info = dem_info      # prior-DEM transform, persisted
         self.lock = threading.Lock()
 
     # ---------- persistence ----------
@@ -106,6 +112,7 @@ class Job:
             "scale_info": (lambda s: {k: v for k, v in s.items() if k != "marker_px"}
                            if s else None)(self.scale_info),
             "result": self.result, "ortho": self.ortho,
+            "dem_info": self.dem_info,
         }
         tmp = self.state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(state))
@@ -159,6 +166,14 @@ class Job:
             if self.scale_info and self.scale_info.get("applied"):
                 ctx.scale = self.scale_info["scale"]
                 ctx.scale_info = self.scale_info
+            # informational GPS georeferencing (annotation only, never scale)
+            try:
+                from landslide.geo import attach_georef, load_gps
+                gps = load_gps(self.dir / "photos")
+                if gps:
+                    attach_georef(ctx, gps, log=self.say)
+            except Exception as e:
+                self.say(f"[geo] georeferencing skipped: {e}")
             self.ctx = ctx
             _evict_ctx()
             return ctx
@@ -174,6 +189,11 @@ class Job:
             if self.ctx is not None:
                 out["images"] = image_metadata(self.ctx)
                 out["scale"] = self.ctx.scale_info or None
+                try:
+                    from landslide.geo import geo_summary
+                    out["geo"] = geo_summary(self.ctx)
+                except Exception:
+                    out["geo"] = None
             else:
                 out["images"] = []
                 out["scale"] = self.scale_info or None
@@ -220,7 +240,8 @@ def _load_persisted_jobs() -> None:
                       status=state.get("status", "reconstructing"),
                       error=state.get("error"), log=state.get("log"),
                       scale_info=state.get("scale_info"),
-                      result=state.get("result"), ortho=state.get("ortho"))
+                      result=state.get("result"), ortho=state.get("ortho"),
+                      dem_info=state.get("dem_info"))
             if job.status in ("reconstructing", "measuring"):
                 # no state file but a finished model on disk: a job from an
                 # older server version (which didn't persist state)
@@ -372,6 +393,17 @@ def _get_ready_job(job_id: str) -> Job:
     return job
 
 
+def _attach_geo(job: Job) -> None:
+    """Georeference annotation once the metric scale is known."""
+    try:
+        from landslide.geo import attach_georef, load_gps
+        gps = load_gps(job.dir / "photos")
+        if gps:
+            attach_georef(job.ctx, gps, log=job.say)
+    except Exception as e:
+        job.say(f"[geo] georeferencing skipped: {e}")
+
+
 @app.post("/api/jobs/{job_id}/scale/aruco")
 def scale_aruco(job_id: str, spec: dict):
     job = _get_ready_job(job_id)
@@ -380,6 +412,7 @@ def scale_aruco(job_id: str, spec: dict):
                            dict_name=spec.get("dict", "auto"),
                            marker_id=spec.get("id"), log=job.say)
         job.scale_info = {k: v for k, v in info.items() if k != "marker_px"}
+        _attach_geo(job)
         job.save_state()
         return {k: v for k, v in info.items() if k != "marker_px"}
     except Exception as e:
@@ -394,11 +427,69 @@ def scale_manual(job_id: str, spec: dict):
         a, b = spec["a"], spec["b"]
         info = manual_scale(job.ctx, a, b, float(spec["length_m"]), log=job.say)
         job.scale_info = info
+        _attach_geo(job)
         job.save_state()
         return info
     except Exception as e:
         job.say(f"manual scaling failed: {e}")
         raise HTTPException(400, str(e))
+
+
+@app.post("/api/jobs/{job_id}/dem")
+def upload_dem(job_id: str, file: UploadFile = File(...)):
+    """Import a prior-surface DEM (XYZ grid text) and align it to the model.
+
+    Alignment is gravity-seeded trimmed ICP: the debris itself is rejected
+    from the correspondence cut. Requires the metric scale to be set.
+    """
+    job = _get_ready_job(job_id)
+    if not (job.scale_info or {}).get("applied"):
+        raise HTTPException(400, "set the scale (reference object) first — "
+                                 "the DEM is aligned to the metric model")
+    dest = job.dir / "dem.xyz"
+    with open(dest, "wb") as f:
+        while chunk := file.file.read(1 << 20):
+            f.write(chunk)
+    try:
+        from landslide.dem import DemSurface, align_to_dem, load_dem
+        from landslide.densify import estimate_up
+        dem = load_dem(dest, log=job.say)
+        up = estimate_up(job.ctx.views, job.ctx.sparse)
+        al = align_to_dem(job.ctx, dem["pts"], up, log=job.say)
+        job.dem_info = {"file": "dem.xyz", "R": al["R"].tolist(),
+                        "t": al["t"].tolist(), "rms_m": al["rms_m"]}
+        job.save_state()
+        return {"aligned": True, "rms_m": al["rms_m"],
+                "n_points": len(dem["pts"])}
+    except Exception as e:
+        job.say(f"DEM import failed: {e}")
+        raise HTTPException(400, str(e))
+
+
+@app.delete("/api/jobs/{job_id}/dem")
+def remove_dem(job_id: str):
+    job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(404, "unknown job")
+    job.dem_info = None
+    (job.dir / "dem.xyz").unlink(missing_ok=True)
+    job.save_state()
+    return {"removed": True}
+
+
+def _job_dem(job: Job):
+    """(R, t, DemSurface) if the job has an aligned prior DEM, else None."""
+    info = getattr(job, "dem_info", None)
+    if not info:
+        return None
+    try:
+        from landslide.dem import DemSurface, load_dem
+        dem = load_dem(job.dir / info["file"], log=lambda *_: None)
+        surface = DemSurface(dem["pts"])
+        return np.asarray(info["R"]), np.asarray(info["t"]), surface
+    except Exception as e:
+        job.say(f"[dem] could not reload the DEM ({e}) — using the rim datum")
+        return None
 
 
 @app.post("/api/jobs/{job_id}/measure")
@@ -432,6 +523,7 @@ def _run_measure(job: Job, spec: dict):
                       rim_px=float(spec.get("rim_px", 12.0)),
                       mode=spec.get("mode", "photo"),
                       ortho=job.ortho,
+                      dem=_job_dem(job),
                       artifacts_dir=job.dir / "artifacts", log=job.say)
         job.result = res
         job.set_status("ready", None)

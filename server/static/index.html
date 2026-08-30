@@ -104,6 +104,13 @@
     <label class="inline"><input type="checkbox" id="use-dense" checked> dense cloud</label>
     <button id="measure-btn" class="primary" disabled>Compute volume</button>
   </div>
+  <div class="row">
+    <label class="inline note">prior surface (optional):</label>
+    <input type="file" id="dem-input" accept=".xyz,.txt,.csv,.tif,.tiff">
+    <button id="dem-btn" disabled>Import DEM</button>
+    <button id="dem-remove" class="link hidden">remove</button>
+    <span id="dem-note" class="note">a pre-event DEM replaces the rim datum entirely (XYZ grid text)</span>
+  </div>
 </section>
 
 <!-- 4. result -->
@@ -129,6 +136,6 @@
 </section>
 </main>
 
-<script src="/static/app.js?v=4"></script>
+<script src="/static/app.js?v=5"></script>
 </body>
 </html>

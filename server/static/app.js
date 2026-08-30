@@ -318,6 +318,40 @@ async function autoDetect() {
   }
 }
 
+/* ---------- prior-surface DEM import ---------- */
+async function uploadDem() {
+  const f = $("dem-input").files[0];
+  const note = $("dem-note");
+  if (!f) return;
+  if (!state.scale || !state.scale.applied) {
+    note.innerHTML = '<span class="err">set the scale first — the DEM aligns to the metric model</span>';
+    return;
+  }
+  $("dem-btn").disabled = true;
+  note.textContent = "importing & aligning DEM (trimmed ICP)…";
+  try {
+    const fd = new FormData();
+    fd.append("file", f);
+    const r = await api(`/api/jobs/${state.jobId}/dem`,
+      { method: "POST", body: fd });
+    note.innerHTML = `<span class="ok">prior surface aligned (ICP rms ` +
+      `${r.rms_m.toFixed(3)} m) — volume now uses surface − DEM, no rim</span>`;
+    $("dem-remove").classList.remove("hidden");
+  } catch (e) {
+    note.innerHTML = `<span class="err">${e.message}</span>`;
+  } finally {
+    $("dem-btn").disabled = false;
+  }
+}
+
+async function removeDem() {
+  try {
+    await api(`/api/jobs/${state.jobId}/dem`, { method: "DELETE" });
+    $("dem-note").textContent = "prior surface removed — rim datum back in use";
+    $("dem-remove").classList.add("hidden");
+  } catch (e) { /* ignore */ }
+}
+
 /* resume the last job (or one picked from the list) after a page reload */
 async function resumeJob(id) {
   switchJob(id);
@@ -567,6 +601,11 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
   $("ortho-btn").addEventListener("click", generateOrtho);
   $("poly-auto").addEventListener("click", autoDetect);
+  $("dem-btn").addEventListener("click", uploadDem);
+  $("dem-remove").addEventListener("click", removeDem);
+  $("dem-input").addEventListener("change", (e) => {
+    $("dem-btn").disabled = !e.target.files.length;
+  });
   $("mat-factor").addEventListener("change", () => {
     if (state.lastResult) showResult(state.lastResult);
   });

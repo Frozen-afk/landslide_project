@@ -274,7 +274,8 @@ def dense_cloud(ctx: ReconCtx, log: Log = print, max_pairs: int = 30,
     stereo_width sets the SGBM working resolution (see stereo_pair): 1280
     for finals, 640 for ~5x-faster previews at reduced accuracy.
     """
-    cache = ctx.workdir / "dense.npz"
+    cache = ctx.workdir / ("dense.npz" if stereo_width == 1280
+                           else f"dense_{stereo_width}.npz")
     if ctx.dense is not None and not force:
         return ctx.dense
     if cache.exists() and not force:

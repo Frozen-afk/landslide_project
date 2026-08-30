@@ -137,7 +137,13 @@ def import_photos(sources: Iterable[Path], photos_dir: Path, max_side: int = 300
     drop = set(_cull(metrics, log))
     for i in drop:
         (photos_dir / names[i]).unlink(missing_ok=True)
-    return [n for i, n in enumerate(names) if i not in drop]
+    kept = [n for i, n in enumerate(names) if i not in drop]
+    # persist GPS fixes found in the originals (EXIF is stripped by the
+    # re-encode); informational georeferencing, never used for scale
+    from .geo import capture_gps
+    capture_gps([s for i, s in enumerate(sources) if i not in drop], kept,
+                photos_dir, log=log)
+    return kept
 
 
 def ensure_reconstruction(photos_dir, workdir, log=print) -> ReconCtx:
@@ -149,13 +155,16 @@ def ensure_reconstruction(photos_dir, workdir, log=print) -> ReconCtx:
 def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
             rim_px: float = 12.0, rim_inner_px: float | None = None,
             mode: str = "photo", ortho: dict | None = None,
-            artifacts_dir=None, log=print, save_cloud: bool = False) -> dict:
+            artifacts_dir=None, log=print, save_cloud: bool = False,
+            dem=None) -> dict:
     """Full measurement of one marked region. Returns the result dict.
 
     mode="photo": polygon is drawn on `image_name` (pixel coords).
     mode="ortho": polygon is drawn on the top-down orthophoto rendered by
     landslide.ortho.render_orthophoto; `ortho` is its metadata dict. Region
     selection then happens in true ground coordinates — no parallax.
+    dem=(R, t, surface): with a prior-surface DEM aligned to the model, the
+    datum is the DEM itself (no rim extrapolation) — surface − DEM directly.
     """
     if not ctx.scale_info.get("applied"):
         raise RuntimeError("metric scale not set yet (mark the reference first)")
@@ -174,22 +183,38 @@ def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
                              "(render it first)")
         interior, rim, rinfo = select_region_ortho(ctx, ortho, polygon, log=log)
         up = np.asarray(ortho["up"], np.float64)
-        res = prism_volume(pts[interior] * ctx.scale, pts[rim] * ctx.scale,
-                           log=log, up=up)
-        res["mode"] = "ortho"
-        res["rim_band_m"] = [rinfo["rim_inner_m"], rinfo["rim_outer_m"]]
+        if dem is not None:
+            R, t, surface = dem
+            from .volume import dem_volume
+            res = dem_volume((pts[interior] * ctx.scale) @ R.T + t,
+                             surface, log=log)
+            res["mode"] = "ortho"
+            res["rim_band_m"] = [rinfo["rim_inner_m"], rinfo["rim_outer_m"]]
+        else:
+            res = prism_volume(pts[interior] * ctx.scale, pts[rim] * ctx.scale,
+                               log=log, up=up)
+            res["mode"] = "ortho"
+            res["rim_band_m"] = [rinfo["rim_inner_m"], rinfo["rim_outer_m"]]
     elif mode == "photo":
         if image_name not in ctx.views:
             raise ValueError(f"image '{image_name}' is not part of the reconstruction")
         view, uv, interior, rim = select_region(ctx, image_name, polygon,
                                                 rim_px, rim_inner_px)
         up = estimate_up(ctx.views, ctx.sparse)
-        res = prism_volume(pts[interior] * ctx.scale, pts[rim] * ctx.scale,
-                           log=log, up=up)
-        res["mode"] = "photo"
-        res["image"] = image_name
-        res["rim_band_px"] = [rim_px * 0.5 if rim_inner_px is None else rim_inner_px,
-                              (rim_px * 0.5 if rim_inner_px is None else rim_inner_px) + rim_px]
+        if dem is not None:
+            R, t, surface = dem
+            from .volume import dem_volume
+            res = dem_volume((pts[interior] * ctx.scale) @ R.T + t,
+                             surface, log=log)
+            res["mode"] = "photo"
+            res["image"] = image_name
+        else:
+            res = prism_volume(pts[interior] * ctx.scale, pts[rim] * ctx.scale,
+                               log=log, up=up)
+            res["mode"] = "photo"
+            res["image"] = image_name
+            res["rim_band_px"] = [rim_px * 0.5 if rim_inner_px is None else rim_inner_px,
+                                  (rim_px * 0.5 if rim_inner_px is None else rim_inner_px) + rim_px]
     else:
         raise ValueError(f"unknown mode {mode!r}")
     debug = res.pop("_debug")

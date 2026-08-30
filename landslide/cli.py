@@ -76,8 +76,44 @@ def main(argv=None):
     pt = sub.add_parser("spec-template", help="print an example spec")
     pt.set_defaults(fn=lambda a: print(json.dumps(TEMPLATE, indent=2)))
 
+    pc = sub.add_parser(
+        "change", help="epoch-to-epoch change volume between two job dirs")
+    pc.add_argument("epoch_a", help="job dir of the EARLIER survey "
+                                    "(photos/ + work/ + set scale)")
+    pc.add_argument("epoch_b", help="job dir of the LATER survey")
+    pc.set_defaults(fn=_cmd_change)
+
     args = p.parse_args(argv)
     args.fn(args)
+
+
+def _cmd_change(args):
+    """Two-epoch monitoring: align B onto A (trimmed ICP), report change."""
+    from pathlib import Path
+    from .change import change_volume
+    from .sfm import reconstruct
+    import json as _json
+
+    ctxs = []
+    for d in (args.epoch_a, args.epoch_b):
+        d = Path(d)
+        ctx = reconstruct(d / "photos", d / "work", reuse=True, log=print)
+        sp = d / "state.json"
+        if sp.exists():
+            try:
+                info = _json.loads(sp.read_text()).get("scale_info")
+                if info and info.get("applied"):
+                    ctx.scale = info["scale"]
+                    ctx.scale_info = info
+            except Exception:
+                pass
+        if not ctx.scale_info.get("applied"):
+            raise SystemExit(f"{d}: metric scale not set — measure once "
+                             "with the marker reference first")
+        ctxs.append(ctx)
+    res = change_volume(ctxs[0], ctxs[1], log=print)
+    print(_json.dumps({k: v for k, v in res.items() if k != "_debug"},
+                      indent=2, default=float))
 
 
 if __name__ == "__main__":

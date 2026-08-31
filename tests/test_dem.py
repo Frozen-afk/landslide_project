@@ -124,3 +124,48 @@ def test_change_volume_between_epochs():
     assert rel < 0.25, f"change fill {res['fill_volume_m3']:.3f} vs {truth:.3f}"
     assert res["datum"] == "prior_epoch"
     assert res["icp_rms_m"] < 0.05
+
+
+def test_change_marker_anchored_registration():
+    """Two epochs of a planar road (ICP would slide) sharing a physical
+    marker: the marker corners must give the exact transform instead."""
+    from landslide.change import change_volume
+    from tests.test_dem import _rotation  # noqa: F401 (self-import ok)
+
+    road_a, _ = _road_with_pile(r_half=2.0, pile_r=0.01, pile_h=0.0,
+                                step=0.25, seed=1)
+    # epoch B: same physical road, different arbitrary model frame; a pile
+    # sits where none was
+    R_mov = _rotation(np.radians(140), np.radians(35))
+    off = np.array([17.0, -42.0, 9.0])
+    road_b_local, truth = _road_with_pile(r_half=2.0, pile_r=0.9, pile_h=0.4,
+                                          step=0.25, seed=2)
+    road_b = road_b_local @ R_mov.T + off
+
+    # the physical marker (0.25 m square at the origin area) seen metric in
+    # each model's own frame
+    corner_l = np.array([[0.0, 0.0, 0.0], [0.25, 0.0, 0.0],
+                         [0.25, 0.25, 0.0], [0.0, 0.25, 0.0]])
+    corners_a = corner_l
+    corners_b = corner_l @ R_mov.T + off
+
+    class FakeCtx:
+        scale = 1.0
+
+        def cloud(self, dense=True):
+            return (self._pts, None)
+
+    a, b = FakeCtx(), FakeCtx()
+    a._pts, b._pts = road_a, road_b
+    a.scale_info = {"applied": True, "marker_corners_m": corners_a.tolist()}
+    b.scale_info = {"applied": True, "marker_corners_m": corners_b.tolist()}
+
+    lines = []
+    res = change_volume(a, b, log=lines.append)   # no up given, no ICP needed
+    assert res["registration"] == "marker", lines
+    rel = abs(res["fill_volume_m3"] - truth) / truth
+    assert rel < 0.25, f"change fill {res['fill_volume_m3']:.3f} vs {truth:.3f}"
+    assert res["icp_rms_m"] < 0.02   # corner residual, millimetres
+    # and the marker path wins even though the scene is a pure plane where
+    # ICP translation is unobservable
+    assert any("marker-anchored" in l for l in lines)

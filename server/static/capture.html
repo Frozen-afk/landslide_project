@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Capture helper — live photo quality</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #0b1622; color: #dce8f5;
+         margin: 0; padding: 1rem; }
+  h1 { font-size: 1.2rem; }
+  #video { width: 100%; max-width: 720px; border-radius: 8px; background: #000; }
+  .row { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; margin: .6rem 0; }
+  .pill { padding: .35rem .8rem; border-radius: 999px; font-weight: 600;
+          background: #223140; }
+  .ok { background: #14532d; } .warn { background: #713f12; } .bad { background: #7f1d1d; }
+  .note { color: #8fa8bf; font-size: .9rem; }
+  button { background: #1d4ed8; color: white; border: 0; border-radius: 6px;
+           padding: .5rem 1rem; font-size: 1rem; cursor: pointer; }
+  button:disabled { opacity: .5; }
+</style>
+</head>
+<body>
+<h1>📷 Capture helper — quality checks BEFORE you upload</h1>
+<p class="note">Point at the slope and sweep slowly left → right. The same
+quality gates the server applies (sharpness, exposure clipping, duplicates)
+run here live, so you can reshoot on the spot instead of failing after
+upload. Photos themselves are taken with your normal camera app.</p>
+<div class="row">
+  <button id="start">Start camera</button>
+  <span id="sharp" class="pill">sharpness —</span>
+  <span id="expo" class="pill">exposure —</span>
+  <span id="dup" class="pill">movement —</span>
+</div>
+<video id="video" autoplay playsinline muted></video>
+<p class="note" id="advice">Start the camera to begin.</p>
+<script>
+const $ = (id) => document.getElementById(id);
+let prevHash = null, prevSharp = null;
+
+// 3x3 Laplacian variance on a downscaled grayscale frame — the same metric
+// the server's import gate uses (throttled to ~5 fps for phone CPUs)
+function scoreFrame() {
+  const v = $("video");
+  if (!v.videoWidth) return;
+  const w = 160, h = Math.round(v.videoHeight / v.videoWidth * 160);
+  const c = new OffscreenCanvas(w, h);
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(v, 0, 0, w, h);
+  const d = ctx.getImageData(0, 0, w, h).data;
+  const g = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++)
+    g[i] = 0.299 * d[4*i] + 0.587 * d[4*i+1] + 0.114 * d[4*i+2];
+
+  // Laplacian variance
+  let sum = 0, sum2 = 0, n = 0;
+  for (let y = 1; y < h - 1; y++)
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      const lap = 4 * g[i] - g[i-1] - g[i+1] - g[i-w] - g[i+w];
+      sum += lap; sum2 += lap * lap; n++;
+    }
+  const mean = sum / n;
+  const sharp = sum2 / n - mean * mean;
+
+  // clipped fraction (histogram rails)
+  let clip = 0;
+  for (let i = 0; i < w * h; i++)
+    if (g[i] <= 2 || g[i] >= 253) clip++;
+  const clipFrac = clip / (w * h);
+
+  // 64-bit dhash vs previous frame (duplicate/movement)
+  let hash = 0n, bit = 0;
+  for (let y = 0; y < 8; y++)
+    for (let x = 0; x < 9; x++, bit++) {
+      const a = g[Math.floor(y * h / 8) * w + Math.floor((x + 1) * w / 10)];
+      const b = g[Math.floor(y * h / 8) * w + Math.floor(x * w / 10)];
+      if (a > b) hash |= (1n << BigInt(bit));
+    }
+  let ham = 0;
+  if (prevHash !== null) {
+    let x = hash ^ prevHash;
+    while (x) { ham += Number(x & 1n); x >>= 1n; }
+  }
+  prevHash = hash;
+
+  setPill($("sharp"), sharp, v0 => v0 > 60 ? ["sharp", "ok"]
+          : v0 > 20 ? ["soft — hold steadier", "warn"] : ["blurry!", "bad"], sharp);
+  setPill($("expo"), clipFrac, v => v > 0.3 ? ["clipped!", "bad"]
+          : v > 0.1 ? ["harsh light", "warn"] : ["exposure ok", "ok"], clipFrac);
+  setPill($("dup"), ham, v => prevSharp === null ? ["movement —"]
+          : v <= 2 ? ["no movement — step/sweep!", "warn"]
+          : v > 45 ? ["too fast — slow down", "warn"] : ["sweep speed ok", "ok"], ham);
+  prevSharp = sharp;
+
+  const adv = [];
+  if (sharp <= 20) adv.push("steady the phone (blur)");
+  if (clipFrac > 0.3) adv.push("avoid blown-out/shadowed framing");
+  if (ham !== null && ham <= 2) adv.push("keep the sweep moving slowly");
+  if (ham > 45) adv.push("slow down — frames too far apart");
+  $("advice").textContent = adv.length ? "⚠ " + adv.join(" · ")
+    : "✅ looking good — keep overlapping ~60-80% between frames";
+}
+
+function setPill(el, val, classify, raw) {
+  const [text, cls] = classify(val);
+  el.textContent = `${el.id === "sharp" ? "sharpness" : el.id === "expo" ? "exposure" : "movement"}: ${text}`;
+  el.className = "pill " + cls;
+}
+
+$("start").addEventListener("click", async () => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia(
+      { video: { facingMode: "environment", width: { ideal: 1280 } } });
+    $("video").srcObject = stream;
+    setInterval(scoreFrame, 200);
+    $("start").disabled = true;
+  } catch (e) {
+    $("advice").textContent = "camera unavailable: " + e.message;
+  }
+});
+</script>
+</body>
+</html>

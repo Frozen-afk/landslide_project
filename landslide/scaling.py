@@ -147,6 +147,11 @@ def aruco_scale(ctx: ReconCtx, side_m: float, dict_name: str = "auto",
         "reproj_px_mean": reproj_px_mean,
         "scale_rel_error": rel_err,
         "marker_px": {n: per_view[n].tolist() for n in views_with},
+        # metric corners of the marker IN THE MODEL FRAME: if the same
+        # physical marker is present in a second survey of the site, these
+        # four points anchor an exact rigid registration between the two
+        # reconstructions (both are metric) — no ICP guesswork needed
+        "marker_corners_m": (corners3d * scale).tolist(),
     }
     log(f"[scale] ArUco {best_dict} id={best_mid} in {len(views_with)} views; "
         f"sides(model)={np.round(sides, 3).tolist()} spread={spread:.3f}; "

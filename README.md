@@ -149,11 +149,23 @@ Workflow in the browser:
   and cut/fill works even where no clean rim exists. The rim datum stays
   available as a fallback (`remove` the DEM to go back).
 - **Two-epoch change monitoring** — `python -m landslide.cli change
-  JOB_A_DIR JOB_B_DIR` compares two surveys of the same site: epoch B is
-  rigidly registered onto epoch A with the same trimmed ICP (the changed
-  pile cannot bias the alignment), epoch A becomes the prior surface, and
-  the change volume is reported with the usual LoD significance gating.
-  Positive net = material added between surveys.
+  JOB_A_DIR JOB_B_DIR` compares two surveys of the same site. Registration
+  priority: a **shared physical ArUco marker** (each epoch's scale step
+  persists the marker's four metric corners, so the epoch-to-epoch rigid
+  transform is a closed-form Kabsch fit — exact, and immune to the planar
+  ICP sliding failure; a virtual marker-normal point resolves the coplanar
+  corner degeneracy) or, without a shared anchor, gravity-seeded trimmed
+  point-to-plane ICP (the changed pile is rejected from the correspondence
+  cut and cannot bias its own registration). Epoch A becomes the prior
+  surface; the change volume is reported with the usual LoD significance
+  gating. Positive net = material added between surveys.
+- **Live capture helper** (`/static/capture.html`) — the same quality
+  metrics the server applies (Laplacian sharpness, histogram clipping,
+  frame-to-frame difference hashing as a sweep-speed proxy) running
+  client-side on the live camera feed: "sharp / soft / blurry", "exposure
+  ok / clipped", "sweep speed ok / too fast / no movement" while you are
+  still standing at the slope, turning quality control from a post-upload
+  gate into guided capture.
 - **GPS georeferencing (annotation)** — photos carrying EXIF GPS are
   aligned to a local ENU frame after the metric scale is set; the job
   snapshot exposes the origin lat/lon, the GPS residual (a sanity metric —
@@ -257,6 +269,26 @@ python -m landslide.cli marker --side 0.25 --out aruco_marker.png
 - Textured surfaces (bare soil, rock, gravel) reconstruct far better than
   smooth grass or wet mud.
 
+## Benchmarks (synthetic scene, ground-truth volume 67.2 m³)
+
+One table so the scattered numbers reconcile. Same scene, same truth; runs
+vary a few points depending on which SfM/dense path wins and cache state.
+
+| Configuration | Metric | Result |
+| --- | --- | --- |
+| Full pipeline, photo tracing (e2e) | volume error vs truth | ~14% |
+| Full pipeline, ortho tracing (e2e) | volume error vs truth | ~4–6% |
+| Dense stereo @1280 px | volume error vs truth | ~18% |
+| Dense stereo @640 px (preview) | volume error vs truth | ~33% (5× faster) |
+| Degraded photos (shadow+blur+JPEG), before quality gate | registered images / usable points | 19/21, 63 pts (unusable) |
+| Degraded photos, after ladder + CLAHE attempt | registered images / points | 21/21, 899 pts |
+| S-curve road, paraboloid datum | pile volume error | >20% |
+| S-curve road, TPS membrane datum | pile volume error | <12% |
+| ICP registration on planar road (point-to-point) | ground alignment error | 0.28 m (slides) |
+| ICP registration, point-to-plane trimmed | ground alignment error | <0.05 m |
+| SfM mapping stage, 9 photos (GLOMAP vs incremental) | wall time | 28.5 s vs 10.9 s, equal quality |
+| SfM on 21 real 3000×2250 photos (threads capped at 4) | peak RAM | ~7.8 GB |
+
 ## Accuracy & limitations
 
 - The datum is a **plane** — best when the rim roughly follows a plane. For
@@ -264,7 +296,11 @@ python -m landslide.cli marker --side 0.25 --out aruco_marker.png
   the uncertainty (± σ·area is reported).
 - The dense cloud is CPU semi-dense stereo (SGBM on well-connected pairs with
   left/right consistency filtering), not full COLMAP CUDA MVS. Expect cm-level
-  noise per point on textured ground.
+  noise per point on textured ground. (pycolmap's `patch_match_stereo` binding
+  exists even in the CPU wheel but hard-fails at runtime: "Dense stereo
+  reconstruction requires CUDA" — on a CUDA machine,
+  `undistort_images() → patch_match_stereo() → stereo_fusion()` would be a
+  drop-in denser backend worth trying.)
 - Points floating above the surface are trimmed (`> max(1.5 m, 8σ)` above the
   datum) and near-vertical surfaces (walls, tree trunks, a marker board) are
   removed by a surface-normal filter before the volume integral.

@@ -250,13 +250,25 @@ def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
                                 len(ctx.dense["points"]) > 0) else "sparse")
     res["n_cloud_points"] = int(len(pts))
 
-    # propagated uncertainty: datum roughness over the footprint, plus the
-    # scale error acting multiplicatively on the volume (2-sigma)
+    # propagated uncertainty: T2.2's bootstrap CI when the rim datum ran one
+    # (net_volume_ci95_m3), widened by the scale error acting multiplicatively
+    # on the volume (2-sigma); falls back to the flat datum-roughness x area
+    # heuristic when no CI was computed (surface/DEM datum, thin rim)
     scale_rel = ctx.scale_info.get("scale_rel_error")
     if scale_rel:
         res["scale_rel_error"] = float(scale_rel)
+    net = res["net_volume_m3"]
+    ci = res.get("net_volume_ci95_m3")
+    if ci is not None:
+        lo, hi = ci
+        if scale_rel:
+            pad = 2.0 * scale_rel * abs(net)
+            lo, hi = lo - pad, hi + pad
+            res["net_volume_ci95_m3"] = [lo, hi]
+        res["est_volume_error_m3"] = float(max(net - lo, hi - net))
+    elif scale_rel:
         res["est_volume_error_m3"] = float(
-            res["datum_rms_m"] * res["area_m2"] + 2.0 * scale_rel * abs(res["net_volume_m3"]))
+            res["datum_rms_m"] * res["area_m2"] + 2.0 * scale_rel * abs(net))
     for w in ctx.scale_info.get("warnings") or []:
         res.setdefault("warnings", []).append(f"scale: {w}")
 

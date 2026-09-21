@@ -148,6 +148,20 @@ registered ≥ max(3, 0.9n). Final rejection if registered < 50 %. Each attempt 
 `database.db` and `sparse/`. Threads capped at 4 (2 for the 3200 px attempt) because
 pycolmap runs one SIFT extractor per thread; `MALLOC_ARENA_MAX=4` is set before import.
 
+**T2.4 matching/extraction options**: `guided_matching = True` on every attempt's
+`FeatureMatchingOptions` (re-verify matches via an estimated local affine/homography — more
+survivors under repeated structure and moderate viewpoint change, at extra matching cost).
+The `enhanced` (low-contrast) attempt also sets `sift.estimate_affine_shape` and
+`sift.domain_size_pooling` (several× slower extraction, confined to the already-most-expensive
+fallback). Both are `False` by default in pycolmap 4.1.1. Validated against the plan: this
+version's `IncrementalPipelineOptions` defaults already match the plan's recommended
+`min_num_matches=15` / `ba_refine_principal_point=False` (and `init_num_trials=200`, already
+generous) — no code change made there, since passing an options object that reproduces the
+defaults changes nothing. `loop_detection` for ≥30-photo sets (closed sweeps) was **not**
+enabled: it needs a vocabulary-tree file this repo doesn't bundle or fetch, untestable against
+the one 21-photo synthetic scene, and a bad enable would silently break large real sets rather
+than degrade gracefully.
+
 **`build_ctx`** (`:414`) converts the `pycolmap.Reconstruction` into `ReconCtx`:
 `views: {name → ImageView(R, t, K, dist, w, h, path)}`, `sparse (N,3)`, `sparse_colors`.
 `dist_coeffs` maps COLMAP models (SIMPLE_RADIAL, RADIAL, OPENCV, FULL_OPENCV) to OpenCV vectors.
@@ -303,10 +317,35 @@ Datum labels: `rim_plane`, `rim_quad`, `rim_tps`, `surface_plane`, `dem`, `prior
   (`local_roughness`) binned to the same grid → `σ_local`;
   `LoD(x,y) = 1.96·√(σ_datum² + σ_local²)`; `sig_area_frac` = share of area with
   `|h_tri| > LoD`; warning when `|net| < 1.96·σ·area`.
-* Uncertainty (`pipeline.measure`, `:231`): `est_volume_error_m3 = σ_datum·area + 2·scale_rel_error·|net|`.
+* **Raster DSM cross-check** (T2.1, `_raster_bin`/`_fill_small_holes`, `:461`): the same
+  `(u,v,h)` points are also binned to a per-cell median/MAD grid (cell from the cloud's own
+  average density, `sqrt(6 / (n/area))`, clipped `[0.05, 1.0] m`) and integrated independently
+  (`volume_raster_m3`). Gaps are filled only when enclosed by data on the SAME row or column
+  within the TIN's own `20×spacing` bridging radius (checked as 1-D row/column scans, not a
+  window sum — a window sum "sees" data on a wide solid block's far side without ever having
+  data past the gap, which reopens exactly the bridging bug this exists to catch); unfilled
+  gaps are `unmeasured_area_m2`, and a >10% disagreement with the TIN net is a warning. The
+  plan's original design made this raster the PRIMARY integrator; validated against this
+  codebase's real (multi-view-fused) synthetic benchmark, that regressed volume error from the
+  TIN's established 7–8% to 33–40% — real stereo clouds have locally sparse-but-continuous
+  patches (foreshortened terrain gets fewer T1.4 depth-consensus votes) that this raster
+  correctly refuses to bridge on principle, while the TIN's linear interpolation happens to
+  track a smooth natural surface well there. So the TIN stays primary; the raster is kept as
+  an independent diagnostic and as the (cheap, no-hole-fill `_raster_net`) resampling proxy
+  for the bootstrap CI below.
+* **Uncertainty** (T2.2, `bootstrap_volume_ci`, `:598`): when a rim datum was used, 50
+  bootstrap resamples of the rim points each refit the plane (and quadratic, if adopted —
+  never the TPS membrane, too expensive to refit 50×) and recompute the fast raster net; the
+  2.5/97.5 percentile spread **around that resample distribution's own median** (so the
+  raster's systematic gap from the TIN cancels out) becomes `(lo_offset, hi_offset)`, applied
+  around the primary TIN `net` as `net_volume_ci95_m3`. `pipeline.measure` widens it
+  symmetrically by the scale error and sets `est_volume_error_m3 = max(net−lo, hi−net)`;
+  falls back to the old `σ_datum·area + 2·scale_rel_error·|net|` heuristic when no CI was
+  computed (surface-fallback datum, <15 rim points, or too few valid resamples).
 
 `dem_volume` (`:303`) shares the TIN / bridging / slope / LoD machinery but uses
-`h = z_surface − DEM(x,y)`; requires ≥60 % of the region on the DEM.
+`h = z_surface − DEM(x,y)`; requires ≥60 % of the region on the DEM. No raster cross-check or
+bootstrap CI (no rim to resample).
 
 ### 3.8 Prior DEM and change monitoring — `dem.py`, `change.py`
 
@@ -399,6 +438,8 @@ reproj_px_max, angle_deg, scale_rel_error, warnings[]`.
 ### 5.5 Result dict (`prism_volume` / `dem_volume` + `measure` additions)
 ```
 net_volume_m3 cut_volume_m3 fill_volume_m3 area_m2
+volume_raster_m3? (T2.1 cross-check, prism_volume only) unmeasured_area_m2 (prism_volume only)
+net_volume_ci95_m3? [lo, hi] (T2.2, prism_volume only, rim datum + ≥15 rim points)
 datum ∈ {rim_plane, rim_quad, rim_tps, surface_plane, dem, prior_epoch}
 datum_rms_m est_volume_error_m3 n_points n_rim_points n_rim_outliers n_high_dropped n_low_dropped
 mean_height_m max_depth_m max_height_m

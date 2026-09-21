@@ -349,12 +349,30 @@ def _run_attempt(photos_dir: Path, workdir: Path, n: int, matcher: str,
             fo.sift.edge_threshold = edge
         except Exception:
             pass
+    if enhanced:
+        # T2.4: affine-shape estimation + domain-size pooling recover more
+        # keypoints under the viewpoint change and washed-out contrast this
+        # fallback attempt exists for; several times slower per image, which
+        # is why it's confined to the already-most-expensive last resort.
+        try:
+            fo.sift.estimate_affine_shape = True
+            fo.sift.domain_size_pooling = True
+        except Exception:
+            pass
     pycolmap.extract_features(database_path=str(db_path), image_path=str(img_dir),
                               extraction_options=fo)
 
     matching = pycolmap.FeatureMatchingOptions()
     try:
         matching.num_threads = min(SFM_THREADS, os.cpu_count() or 1)
+    except Exception:
+        pass
+    try:
+        # T2.4: re-verify matches guided by an estimated local affine/
+        # homography instead of raw ratio-test correspondences — more
+        # matches survive on repeated structure and moderate viewpoint
+        # change, at some extra matching cost on every attempt.
+        matching.guided_matching = True
     except Exception:
         pass
     if matcher == "exhaustive":

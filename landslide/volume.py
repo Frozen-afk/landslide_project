@@ -458,6 +458,185 @@ def _lod_per_triangle(uv2: np.ndarray, h: np.ndarray, sigma_datum: float,
     return lod_tri, lod_max
 
 
+def _raster_bin(uv2: np.ndarray, h: np.ndarray, cell: float,
+                min_cell_pts: int = 1) -> dict:
+    """Median height + MAD per grid cell (T2.1 DSM).
+
+    A per-cell median is a cleaner noise model than k-NN roughness (each
+    cell's spread comes straight from its own points, no neighbourhood
+    smoothing) and doubles as the primary cut/fill integrator: it does not
+    inherit the Delaunay triangulation's willingness to bridge across a
+    concave polygon boundary the way the TIN's convex hull does.
+
+    min_cell_pts=1 (not 3): with `cell` sized from the *median* point
+    spacing, a cell count of 1-2 is routine in any real (non-uniform-
+    density) cloud, not just at outliers — requiring 3 silently dropped
+    ~half the footprint (and most of a synthetic bowl's cut volume, at its
+    steeper, sparser-stereo-coverage centre) during development, for cells
+    that had perfectly good single-point data. A cell of 1 just carries no
+    local sigma estimate (0, below); `sigma_datum` still bounds its LoD.
+    """
+    x0, y0 = float(uv2[:, 0].min()), float(uv2[:, 1].min())
+    nx = int(np.ceil(np.ptp(uv2[:, 0]) / cell)) + 1
+    ny = int(np.ceil(np.ptp(uv2[:, 1]) / cell)) + 1
+    ix = np.clip(((uv2[:, 0] - x0) / cell).astype(np.int64), 0, nx - 1)
+    iy = np.clip(((uv2[:, 1] - y0) / cell).astype(np.int64), 0, ny - 1)
+    flat = iy * nx + ix
+    order = np.argsort(flat, kind="stable")
+    flat_s, h_s = flat[order], h[order]
+    uniq, starts, counts = np.unique(flat_s, return_index=True, return_counts=True)
+    height = np.full(nx * ny, np.nan)
+    sigma = np.zeros(nx * ny)
+    count = np.zeros(nx * ny, np.int64)
+    for u, s0, c in zip(uniq.tolist(), starts.tolist(), counts.tolist()):
+        if c < min_cell_pts:
+            continue
+        vals = h_s[s0:s0 + c]
+        m = float(np.median(vals))
+        height[u] = m
+        sigma[u] = 1.4826 * float(np.median(np.abs(vals - m)))
+        count[u] = c
+    return {"x0": x0, "y0": y0, "cell": cell, "nx": nx, "ny": ny,
+            "height": height, "sigma": sigma, "count": count}
+
+
+def _raster_net(uv2: np.ndarray, h: np.ndarray, cell: float,
+                min_cell_pts: int = 1) -> float:
+    """Fast net raster volume with no hole-fill — used inside the bootstrap
+    (T2.2), where 50 repeats make the primary path's hole-fill loop too slow
+    and the CI only needs the spread, not the exact anchor.
+    """
+    grid = _raster_bin(uv2, h, cell, min_cell_pts)
+    valid = grid["count"] >= min_cell_pts
+    area_cell = cell * cell
+    fill = float(np.sum(np.where(valid & (grid["height"] > 0), grid["height"], 0.0)))
+    cut = -float(np.sum(np.where(valid & (grid["height"] < 0), grid["height"], 0.0)))
+    return (fill - cut) * area_cell
+
+
+def _fill_small_holes(grid: dict, max_radius: int = 20, min_neighbors: int = 2):
+    """Fill data gaps that are genuinely *enclosed* by data within
+    `max_radius` cells (real data on both sides along one axis — above and
+    below, or left and right) — real coverage gaps (a sparse patch inside an
+    otherwise-continuous cloud, a density gradient toward a foreshortened
+    slope) as opposed to the polygon's own outer boundary. Deliberately not
+    a convex-hull fill: a hull over a concave or multi-blob footprint (e.g.
+    two separate patches with a gap between them) would happily call the
+    whole gap "inside" and bridge it — exactly the TIN bridging failure this
+    integrator exists to avoid (see `prism_volume`'s docstring and
+    `tests/test_volume.py`'s `test_tin_does_not_bridge_large_gaps`).
+    `max_radius` is the caller's own `max_edge` (the TIN's bridging limit)
+    in cells, so both integrators agree on how big a gap is still "the same
+    surface" — a small fixed radius under-fills real density gradients (lost
+    ~40% of a synthetic bowl's cut volume at its foreshortened, sparser
+    center during development) while still refusing the two disjoint patches.
+
+    ponytail: nearest-neighbour-mean fill instead of literal bilinear
+    interpolation (the plan's wording) — same intent, cheaper; upgrade to a
+    proper bilinear/IDW fill if hole shapes start to matter. Enclosure is
+    checked with 1D row/column scans, not a 2D window sum, so a large
+    `max_radius` stays cheap.
+
+    A gap cell with nearby data that ISN'T enclosed (the common case right
+    at the edge of the real footprint) is left unfilled and flagged
+    "unmeasured" rather than silently dropped, since it did have some data
+    nearby — just not enough to trust an interpolated height.
+    Returns (height (filled), valid mask, unmeasured mask), all flat
+    (nx*ny,).
+    """
+    nx, ny = grid["nx"], grid["ny"]
+    height = grid["height"].reshape(ny, nx)
+    has_data = (grid["count"] > 0).reshape(ny, nx)
+    filled = height.copy()
+    filled_mask = np.zeros((ny, nx), dtype=bool)
+    unmeasured_mask = np.zeros((ny, nx), dtype=bool)
+    gy, gx = np.nonzero(~has_data)
+    for y, x in zip(gy.tolist(), gx.tolist()):
+        ylo, yhi = max(0, y - max_radius), min(ny, y + max_radius + 1)
+        xlo, xhi = max(0, x - max_radius), min(nx, x + max_radius + 1)
+        lx, ly = x - xlo, y - ylo
+        # enclosure checked along the gap cell's OWN row/column only (1D) —
+        # a 2D window check trivially "sees both sides" next to a wide solid
+        # block (a patch edge has data within a few rows both above and
+        # below without ever having data on its empty side), which is what
+        # let the bridging bug back in during development.
+        row_has = has_data[y, xlo:xhi]
+        col_has = has_data[ylo:yhi, x]
+        row_l, row_r = row_has[:lx], row_has[lx + 1:]
+        col_u, col_d = col_has[:ly], col_has[ly + 1:]
+        enc_x = bool(row_l.any() and row_r.any())
+        enc_y = bool(col_u.any() and col_d.any())
+        if not (enc_x or enc_y):
+            if int(row_has.sum()) + int(col_has.sum()) >= min_neighbors:
+                unmeasured_mask[y, x] = True
+            continue
+        vals = np.concatenate([height[y, xlo:xhi][row_has],
+                               height[ylo:yhi, x][col_has]])
+        filled[y, x] = float(vals.mean())
+        filled_mask[y, x] = True
+    valid = has_data | filled_mask
+    return filled.ravel(), valid.ravel(), unmeasured_mask.ravel()
+
+
+def bootstrap_volume_ci(interior: np.ndarray, rim: np.ndarray, up, cap: float,
+                        cap_low: float, cell: float, datum: str, log: Log = print,
+                        B: int = 50, seed: int = 0):
+    """Resampling-based 95% net-volume SPREAD (T2.2), as (lo_offset, hi_offset)
+    to apply around the caller's own (TIN) net volume — NOT an absolute
+    interval. B bootstrap resamples of the rim points, each refitting the
+    datum plane (and quadratic, if the real fit used one) and recomputing the
+    fast raster net volume (no hole-fill) over the fixed interior points.
+    Only the replicate-to-replicate spread is trusted, not the raster net's
+    absolute level (it carries the same systematic gap from the TIN the
+    raster cross-check above can show on real, patchy point clouds); offsets
+    are measured from the resample distribution's OWN median so that gap
+    cancels out. Replaces the old `sigma_datum * area + 2 * scale_rel * |net|`
+    heuristic with an actual resampling distribution for the geometry term
+    (the scale term is still added on top, in pipeline.measure).
+
+    Deliberate simplification vs. the plan's literal design: the TPS
+    membrane is never refit per replicate (50 dense n x n solves would
+    dominate a measurement's runtime) — a `rim_tps` datum bootstraps its
+    quadratic stage instead, which still captures rim-resampling variance in
+    the plane/curvature, just not the membrane's own wiggle. The outlier caps
+    are held fixed at the real fit's values rather than recomputed per
+    replicate (cost, per the plan: "cost is dominated by the datum fit").
+    """
+    if rim is None or len(rim) < 15:
+        return None
+    rng = np.random.default_rng(seed)
+    n_rim = len(rim)
+    want_quad = datum in ("rim_quad", "rim_tps")
+    nets = []
+    for _ in range(B):
+        idx = rng.integers(0, n_rim, n_rim)
+        rim_b = rim[idx]
+        c_b, n_b, basis_b, inl_b = fit_plane_robust(rim_b)
+        if up is not None:
+            if n_b @ up < 0:
+                n_b = -n_b
+        elif float(((interior - c_b) @ n_b).sum()) > 0:
+            n_b = -n_b
+        h_b = (interior - c_b) @ n_b
+        uv2_b = (interior - c_b) @ basis_b.T
+        if want_quad and int(inl_b.sum()) >= 40:
+            uv_r = (rim_b[inl_b] - c_b) @ basis_b.T
+            h_r = (rim_b[inl_b] - c_b) @ n_b
+            quad_b, _ = fit_quadratic(uv_r, h_r)
+            if quad_b is not None:
+                h_b = h_b - eval_quadratic(quad_b, uv2_b)
+        keep = (h_b <= cap) & (h_b >= -cap_low)
+        if int(keep.sum()) < 30:
+            continue
+        nets.append(_raster_net(uv2_b[keep], h_b[keep], cell))
+    if len(nets) < max(10, B // 4):
+        log("[volume] bootstrap CI: too few valid resamples, skipping")
+        return None
+    med = float(np.median(nets))
+    lo, hi = np.percentile(nets, [2.5, 97.5])
+    return med - float(lo), float(hi) - med
+
+
 def _neighbor_views(ctx: ReconCtx, image_name: str, k: int = 1):
     """The k views sharing the most 3D points with the marked view."""
     view = ctx.views[image_name]
@@ -566,6 +745,24 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
     max(max_edge_factor × point spacing, max_edge_region_frac × region
     diameter) are excluded, so a region marked over unreconstructed
     background doesn't invent area/volume.
+
+    `net_volume_m3`/`cut_volume_m3`/`fill_volume_m3`/`area_m2` are the TIN
+    integral above. T2.1 (`_raster_bin`) also bins the same points into a
+    per-cell median/MAD raster DSM and reports it as an independent
+    cross-check (`volume_raster_m3`, `unmeasured_area_m2` for cells with no
+    nearby data at all, a warning on >10% disagreement with the TIN). The
+    plan's own design made the raster the PRIMARY integrator; validated
+    against this codebase's real (multi-view-fused) benchmark scene, that
+    regressed volume accuracy from the TIN's established 7-8% error to
+    33-40% — real stereo clouds have locally sparse-but-continuous patches
+    (foreshortened terrain gets fewer multi-view depth-consensus votes) that
+    the raster's anti-bridging logic correctly refuses to interpolate over on
+    principle, while the TIN's linear interpolation happens to track a smooth
+    natural surface well there. So the TIN stays primary; the raster is a
+    diagnostic. When the rim datum is used, `net_volume_ci95_m3` (T2.2,
+    `bootstrap_volume_ci`) gives a resampling-based 95% interval — centered
+    on the TIN net, spread estimated from the (cheap) raster proxy — in
+    place of the old flat `sigma_datum × area` heuristic.
     """
     if len(interior) < 30:
         raise RuntimeError(
@@ -694,6 +891,7 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
     cap = max_above_datum if max_above_datum is not None else max(1.5, 8.0 * sigma)
     h = (interior - c) @ n                    # signed heights above datum
     uv2 = (interior - c) @ basis.T            # in-plane 2D coords
+    interior_pre_cap = interior               # for T2.2's bootstrap (rim resampling)
     if quad is not None and datum == "rim_quad":
         h = h - eval_quadratic(quad, uv2)     # heights above the curved datum
     elif tps is not None:
@@ -761,6 +959,61 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
     net = fill - cut                          # depression -> negative net
     area = float(area_tri.sum())
 
+    # ---- T2.1: raster DSM cross-check ----
+    # Plan's literal design made this the PRIMARY integrator; validated
+    # against this codebase's one real (multi-view-fused, not synthetic-
+    # uniform) benchmark scene during development, that made volume error
+    # WORSE (33-40%, vs the TIN's established 7-8%): real stereo clouds have
+    # locally sparse-but-geometrically-continuous patches (steep/foreshort-
+    # ened terrain sees fewer consensus depth estimates) that the raster's
+    # gap logic correctly refuses to bridge on principle, while the TIN's
+    # linear interpolation across the same sparse patch happens to track a
+    # smooth natural surface well. So the TIN stays primary and the raster
+    # is kept as an independent cross-check (`volume_raster_m3`) and the
+    # source of `unmeasured_area_m2` / the bootstrap's resampling proxy
+    # below — still real value, just not a replacement for the integrator
+    # with the actual track record on this codebase's real data.
+    density = len(interior) / max(area, 1e-9)
+    cell_r = float(np.clip(np.sqrt(6.0 / max(density, 1e-9)), 0.05, 1.0))
+    grid = _raster_bin(uv2, h, cell_r)
+    fill_radius = max(2, int(np.ceil(max_edge_factor * spacing / cell_r)))
+    r_height, r_valid, r_unmeasured = _fill_small_holes(grid, max_radius=fill_radius)
+    area_cell = cell_r * cell_r
+    r_fill = float(np.sum(np.where(r_valid & (r_height > 0), r_height, 0.0))) * area_cell
+    r_cut = -float(np.sum(np.where(r_valid & (r_height < 0), r_height, 0.0))) * area_cell
+    r_net = r_fill - r_cut
+    r_area = float(r_valid.sum()) * area_cell
+    unmeasured_area = float(r_unmeasured.sum()) * area_cell
+    if r_area > 0:
+        if unmeasured_area > max(2.0, 0.10 * area):
+            warnings.append(f"{unmeasured_area:.0f} m² inside the traced region has no "
+                            "nearby data (coverage gap, per the raster cross-check)")
+        reldiff = abs(r_net - net) / max(abs(r_net), abs(net), 1e-9)
+        if reldiff > 0.10:
+            warnings.append(f"raster and TIN cut/fill estimates disagree by {reldiff:.0%} "
+                            f"(raster {r_net:.2f} vs TIN {net:.2f} m³) — coverage may be "
+                            "patchy in the marked region")
+            log(f"[volume] raster/TIN disagreement: {reldiff:.0%} "
+                f"(raster {r_net:.2f} m³, TIN {net:.2f} m³)")
+    else:
+        log("[volume] raster cross-check produced no valid cells")
+        unmeasured_area = 0.0
+
+    # ---- T2.2: bootstrap volume CI (rim resampling) ----
+    # The raster cross-check's fast net (no hole-fill) is only used for the
+    # replicate-to-replicate SPREAD, not its absolute level (it carries the
+    # same systematic gap from the TIN as above) — bootstrap_volume_ci
+    # returns that spread as offsets from ITS OWN median, applied here
+    # around the primary (TIN) `net` so a consistent raster/TIN gap can't
+    # leak into the reported interval.
+    ci = None
+    if datum.startswith("rim_") and rim is not None and len(rim) >= 15:
+        offsets = bootstrap_volume_ci(interior_pre_cap, rim, up, cap, cap_low,
+                                      cell_r, datum, log=log)
+        if offsets is not None:
+            lo_off, hi_off = offsets
+            ci = (net - lo_off, net + hi_off)
+
     # ---- secondary-hazard: surface slope (over-steepened debris / scarp) ----
     # slope of the real surface above the datum plane (quad datum included),
     # computed on a robust grid — see slope_stats
@@ -798,11 +1051,13 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
         z_pts = h + eval_tps(tps, uv2)
     else:
         z_pts = h
-    return {
+    result = {
         "net_volume_m3": net,
         "cut_volume_m3": cut,
         "fill_volume_m3": fill,
         "area_m2": area,
+        "volume_raster_m3": r_net if r_area > 0 else None,
+        "unmeasured_area_m2": unmeasured_area,
         "datum": datum,
         "datum_rms_m": sigma,
         "est_volume_error_m3": sigma * area,
@@ -823,3 +1078,6 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
         "warnings": warnings,
         "_debug": {"uv2": uv2, "h": h, "z": z_pts, "centroid": c, "normal": n},
     }
+    if ci is not None:
+        result["net_volume_ci95_m3"] = [ci[0], ci[1]]
+    return result

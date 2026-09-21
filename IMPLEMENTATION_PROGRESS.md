@@ -139,3 +139,86 @@ specified, with the simplifications noted per-item below.
   cloud (`ctx.dense` is still `{"points", "colors"}` — adding a weights array
   would also mean updating the `.npz` cache read/write, which is T2.1's job
   per the plan ("weights n_consistent from T1.4") and out of scope here.
+
+---
+
+# Tier 2 implementation progress (accuracy core)
+
+Tracks `implementation_plan.md` Part C, step 7 (T2.1, T2.2). Per instructions: Tier 2
+accuracy improvements only, Tier 3 not started.
+
+## Validation against current repo (post-Tier-1)
+
+Re-checked T2.1/T2.2's prerequisites against the code as it stood after Tier 1
+(commit `0f25372` plus the uncommitted Tier 1 diff already in the working tree)
+before implementing:
+
+- **T2.1**: confirmed `volume.prism_volume` still integrated purely via the Delaunay/TIN
+  (`scipy.spatial.Delaunay` + per-triangle prism sum); no raster/cell binning existed
+  anywhere in the file. Confirmed the plan's assumption that T1.4's `n_consistent`
+  per-point weight isn't persisted (noted as T2.1's job in the Tier 1 section above) —
+  still true; **not** threaded through in this pass either (see "Not done" below).
+- **T2.2**: confirmed `pipeline.measure` still used the flat
+  `σ_datum·area + 2·scale_rel_error·|net|` heuristic with no resampling.
+
+No plan-vs-code mismatches in the *starting point*. One mismatch surfaced during
+implementation and changed the design (see T2.1's status note): the plan's own
+acceptance criterion for T2.1 ("analytic bowl with injected noise and 5% outliers →
+raster error < TIN error") only exercises a clean, uniformly-sampled synthetic cloud;
+run against this repo's one *real* (multi-view-fused, non-uniform-density) benchmark
+scene, a raster-as-primary integrator regressed volume error from the TIN's established
+7–8% to 33–40%. That's not a corner case to special-case around — it's the actual data
+this codebase measures — so the design was adjusted (below) rather than shipped as
+specified.
+
+## Status
+
+| Item | Status | Notes |
+| --- | --- | --- |
+| T2.1 Raster DSM cut/fill | done, design adjusted | New `volume._raster_bin` (per-cell median + MAD, cell from the cloud's own average density `sqrt(6/(n/area))` clipped `[0.05,1.0] m` — *not* `2.5×spacing`, which starves to <2 pts/cell on non-Poisson real clouds) and `_fill_small_holes` (gaps filled only when enclosed by data on the SAME row or column, within the TIN's own `20×spacing` bridging radius — a 2-D window-sum enclosure test was tried first and reopened the exact bridging bug `test_tin_does_not_bridge_large_gaps` exists to catch, since a wide solid block "sees" data on both sides of a window near its own edge without ever having data past the gap). **Design deviation from the plan**: the plan makes this raster the *primary* integrator with the TIN kept as a cross-check; validated against the real synthetic benchmark (not just the adversarial two-patch unit test), that direction regressed volume accuracy 4–5× (see Validation above) — real stereo clouds have locally sparse-but-continuous patches (foreshortened terrain, fewer T1.4 depth-consensus votes) that a principled anti-bridging raster correctly refuses to interpolate over, while the TIN's linear interpolation happens to track the smooth natural surface there. So the **TIN stays primary** (byte-identical to pre-Tier-2 output — all of `tests/test_volume.py`'s original tight tolerances pass unchanged); the raster is reported as `volume_raster_m3` (a genuine independent cross-check, warns at >10% disagreement) and `unmeasured_area_m2`, and its fast (`_raster_net`, no hole-fill) form is reused as T2.2's resampling proxy. |
+| T2.2 Bootstrap volume uncertainty | done, one deliberate simplification | New `volume.bootstrap_volume_ci`: 50 resamples of the rim points, each refitting the robust plane (and the quadratic stage, if the real fit adopted one) and recomputing the fast raster net over the *fixed* interior points; returns `(lo_offset, hi_offset)` from the **resample distribution's own median** (not absolute percentiles) so the raster's systematic gap from the TIN — real per the T2.1 finding above — cancels out instead of leaking into the reported interval. `prism_volume` applies the offsets around the primary TIN `net` as `net_volume_ci95_m3`; `pipeline.measure` widens it by the scale error and sets `est_volume_error_m3 = max(net−lo, hi−net)`, falling back to the old flat heuristic when no CI was computed (surface-fallback datum, <15 rim points, or too few valid resamples survived the outlier caps). **Simplification vs. the plan**: the TPS membrane is never refit per replicate (50 dense n×n solves would dominate measurement runtime); a `rim_tps` datum bootstraps its quadratic stage instead — still captures rim-resampling variance in the plane/curvature, not the membrane's own wiggle. Outlier caps are held fixed at the real fit's values (plan: "cost is dominated by the datum fit"). |
+| T2.4 SfM matching/extraction options | done, partially — validated mostly already-default | Checked pycolmap 4.1.1's actual defaults before changing anything (`ToolSearch`-free — a plain interactive check): `IncrementalPipelineOptions.min_num_matches` is already `15`, `ba_refine_principal_point` already `False`, `init_num_trials` already `200` — the plan's recommended values for all three, already the library default. No code added for that bullet (passing an explicit options object that reproduces the defaults would be a no-op, not a fix). `guided_matching` and `sift.estimate_affine_shape`/`domain_size_pooling` *were* `False` by default and are now enabled (`sfm._run_attempt`) — `guided_matching` on every attempt, affine/DSP only on the already-most-expensive `enhanced` (low-contrast) fallback attempt, matching the plan's placement. Validated with a from-scratch (cache-cleared) reconstruction + full e2e suite, not just the cached reconstruction: 21/21 images still register, all 5 `test_e2e_synth.py` tests pass. |
+
+## Not done (out of scope for this pass)
+
+- **T2.4's `loop_detection`** (sequential matcher, ≥30-photo sets): not enabled. It
+  needs a vocabulary-tree file (`SequentialPairingOptions.vocab_tree_path`) this repo
+  doesn't bundle or fetch, and the one synthetic scene has 21 photos — under the
+  plan's own ≥30 threshold — so there is no way to test it in this pass. A bad enable
+  would silently degrade or break large real sets rather than fail loudly; left for
+  whoever adds ≥30-photo test coverage (part of T3.3's still-missing preset harness).
+- **T2.4's learned-features fallback** (ALIKED/DISK + LightGlue via kornia, gated on
+  `torch` availability): the plan itself marks this "optional extra" — descoped along
+  with the rest of T2.4's non-actionable bullet (see status table).
+- **T2.3 (datum ladder hygiene — `datum_pts is rim` → explicit `datum_source` enum,
+  `RBFInterpolator` for the TPS)**: not started. Its own acceptance criterion is
+  "identical volumes on `tests/test_volume.py` fixtures" — i.e. it is explicitly a
+  no-behavior-change refactor (G12/G13 maintainability, not accuracy), so it falls
+  outside "Tier 2 accuracy improvements" as instructed for this pass.
+- **T2.5 (optional `DenseBackend` / OpenMVS interface)**: not started, per the plan's
+  own stated condition — "only worth doing if T1.4 does not reach the accuracy
+  target" — and Tier 1's own progress notes already recorded that target as met
+  (≤8% photo-mode error on the one validated scene).
+- T1.4's `n_consistent` per-point weight still isn't persisted on the dense cloud
+  (see the Tier 1 section above); T2.1's raster cross-check uses an unweighted
+  per-cell median instead, a deliberate simplification (see T2.1's status note) —
+  weighting is a plumbing change across the `.npz` cache format and every `ctx.dense`
+  consumer, not required for the raster's median-based robustness.
+
+## Test results (final)
+
+- `pytest -q -k "not e2e"`: 117 passed, 0 failed — every existing test passes
+  unchanged (the TIN stays primary, so `net_volume_m3`/`cut_volume_m3`/
+  `fill_volume_m3`/`area_m2` are byte-identical to pre-Tier-2 for every caller that
+  doesn't look at the new `volume_raster_m3`/`net_volume_ci95_m3` keys).
+- `pytest -q tests/test_e2e_synth.py`: 5 passed, twice — once against the existing
+  cached reconstruction, once from a fully-cleared `data/synth/work/` (validates
+  T2.4's matching-option changes against a *fresh* SfM run, not just cached poses).
+  Fresh-run numbers: 21/21 images registered, photo-mode cut 75.7 m³ vs 67.2 m³ truth
+  (12.6%), ortho-mode 66.2 m³ (1.5%) — consistent with Tier 1's recorded 7–8%/~1%
+  family (single-run variance from a from-scratch SfM+dense rebuild, not a regression;
+  the TIN integrator itself is unchanged code).
+- `architecture.md` updated to match: `_raster_bin`/`_fill_small_holes` cross-check
+  design (including the row/column-vs-window enclosure fix), `bootstrap_volume_ci`'s
+  median-relative offset design, new result-dict keys, T2.4's matching-option changes
+  and the already-default findings.

@@ -4,4 +4,5 @@ __pycache__/
 .venv/
 .pytest_cache/
 data/synth/work/
+data/bench/*/work/
 .claude

@@ -222,3 +222,78 @@ specified.
   design (including the row/column-vs-window enclosure fix), `bootstrap_volume_ci`'s
   median-relative offset design, new result-dict keys, T2.4's matching-option changes
   and the already-default findings.
+
+---
+
+# Tier 3 implementation progress (platform, UI, validation)
+
+Tracks `implementation_plan.md` Part C, steps 11–14 plus the T3.3 harness step (order 2,
+originally scoped to run *before* Tier 1 but never built — see Tier 1's own "Not done").
+Per instructions: Tier 3 platform and validation only. T3.4 (real-photo regression set)
+is explicitly "ongoing" in the plan and needs field photos this environment doesn't have
+— not started, no code to write for it yet.
+
+## Validation against current repo (post-Tier-2)
+
+Re-checked T3.1/T3.2/T3.3's prerequisites against the code as it stood after Tier 2
+(commit `adc60ba` plus the working tree) before implementing: confirmed `server/main.py`
+was still the single 642-line file described in Part A.3 (S1–S7), `server/static/app.js`
+was still the single 725-line monolith described in Part A.4 (F1–F6, with F1/F3/F4/F5
+already resolved by T0.7 per Tier 0's notes), and `tools/synth.py` was still the single
+21-view `arc`-only generator described in T3.3 with no `--preset` flag. No plan-vs-code
+mismatches found.
+
+This tier was implemented as three parallel, file-disjoint work items (server backend /
+frontend / synthetic-data harness don't share files) and stopped on request before their
+own verification passes finished — see each item's "not (re-)verified" note below. The
+user will run the test suite themselves rather than this session re-running it.
+
+## Status
+
+| Item | Status | Notes |
+| --- | --- | --- |
+| T3.1 Process isolation + progress streaming (S2–S5) | done, one deviation, one unresolved test | `server/main.py` split into `server/jobs.py` (`Job`, `JOBS`/`_photo_cache` registries, persistence, lazy ctx reload), `server/routes.py` (all HTTP handlers, `APIRouter`), `server/worker.py` (picklable top-level functions for the three heavy stages), `server/executor.py` (lazy `ProcessPoolExecutor(max_workers=2)` + `Manager().Queue()` log drain + `BrokenProcessPool` recovery). `server/main.py` is now a ~40-line entrypoint; `server.main:app` import path is unchanged (`run_server.sh`/README still work unmodified). **S2**: reconstruction/measure/ortho now run in worker processes that reload their own `ReconCtx` from the on-disk COLMAP cache and re-apply `scale_info`/`dem_info` passed as plain dicts — never the live `Job`/`ReconCtx` object, matching the plan's "job directory as the only shared state." A crashed worker (`os._exit`, segfault) no longer takes the server down; the executor is recreated and the job is marked `error`. **S3**: `set_status` and the `/measure`/`/ortho` busy-check-and-set are now atomic under `job.lock`, closing a real check-then-act race (two concurrent POSTs could previously both see "not busy"). **S5**: new `GET /api/jobs/{id}/events` SSE tail, additive — the polling snapshot endpoint is unchanged. **S4, design deviation**: rather than the plan's literal "return 202 while reloading," `GET /api/jobs/{id}` now kicks off `Job.start_ctx_reload()` in a background thread (idempotent per job) and returns the normal 200 snapshot immediately with a `ctx_loading` flag — same non-blocking effect, smaller diff than a real async resume state machine. Since workers reload their own ctx, routes no longer call `job.ensure_ctx()` before submitting measure/ortho; replaced with a cheap `job.reconstructable` filesystem check so a bad job still 409s synchronously instead of failing inside the worker. `tests/test_server.py` (new, 13 cases) covers validation errors, 404s, the scale-required gate, the busy-409 atomicity fix, and a **real** (not mocked) crash-recovery test using `os._exit(1)`. **Not resolved**: one run of the full suite showed 12 passed / 1 failed (`test_worker_crash_is_isolated_and_pool_recovers` — the crash callback didn't fire inside a 30 s deadline while three CPU-heavy sibling forks were running SfM concurrently on the same machine); this was not re-run in isolation before the session was told to stop testing, so it's unconfirmed whether this is contention or a real bug in `executor.py`'s crash path — flagged as the first thing to check before trusting T3.1. |
+| T3.2 Frontend modernisation (F2, F6; F1/F3/F4/F5 already done by T0.7) | done | `server/static/app.js` replaced by ES modules under `server/static/js/`: `state.js`, `api.js`, `coords.js` (dependency-free pixel/zoom/pan math), `canvas.js` (interaction), `steps/{upload,scale,mark,result}.js`, `main.js`. Loaded via `<script type="module">` in `index.html`, no bundler. **F2**: mouse-wheel/pinch zoom, drag-to-pan, vertex drag, edge-click insert, Delete/Backspace to remove the selected vertex, Escape to deselect — all new. **Keyboard shortcuts**: Delete/Backspace, Escape, per above. **Artifacts/uncertainty**: results panel now shows all three artifacts (`overlay.jpg`/`heightmap.png`/`slopemap.png`) plus the T2.2 `net_volume_ci95_m3` 95% CI next to net volume when present (falls back to `est_volume_error_m3` otherwise, mirroring `pipeline.py`'s own fallback) and the T2.1 `volume_raster_m3`/`unmeasured_area_m2` cross-check row. **Coordinate-chain test, no new dependency**: `tests/test_coords.mjs` (`node --test`, 8/8 passing) exercises `coords.js` directly — deliberately skipped jsdom/Playwright (plan's suggested tools) since this repo had zero JS dependencies before and the transform math is DOM-free by construction; a stdlib-only test is the smaller, equally-valid diff. **Descoped**: the magnifier for manual-scale clicks (plan's own "optional") — zoom/pan already gives precise click placement, a separate magnifier would be new code for marginal gain. **Verification gap**: `node --check` passed on every module, the coordinate test passed, and a live-server smoke test confirmed every module path serves 200 — but no interaction (zoom/pinch/vertex-drag) has been exercised in a real browser; this needs a manual click-through before trusting the UX. |
+| T3.3 Validation harness (camera-path presets) | done, partially benchmarked | `tools/synth.py --preset {arc,oblique60,descending,collinear,nadir,sparse8,lowtex,distorted}`; `arc` (default) reproduces the pre-existing cached scene numerically identically (poses/K/polygon to 1e-12; pixel colors differ by ≤1 from a projection-math refactor, not a behavior change) — `tests/test_e2e_synth.py` still passes unmodified. `tools/benchmark.py` runs SfM→scale→dense→measure per preset and emits a Markdown table (registered views, scale error, photo/ortho volume error, cloud RMS to the GT surface, runtime, peak RSS via stdlib `resource`), degrading gracefully per-column rather than crashing the whole row on a bad preset. `tests/test_e2e_presets.py` (`@pytest.mark.slow`, `pytest.ini` registers the marker, excluded from `-k "not e2e"` same as the existing e2e suite): 4 real tests actually run and passing before the session was stopped (`sparse8` × 2, `nadir` × 2, see §7.1 of `architecture.md` for the numbers), 5 honestly `pytest.mark.skip`'d (`oblique60`, `descending`, `collinear`, `lowtex`, `distorted` — generator code-complete and each individually verified to render + pass its GT-polygon-in-frame check, but not run through the full SfM+dense+measure pipeline before time ran out) rather than guessed at, per the "don't weaken tests to pass" instruction. Two real findings from actually running presets: `sparse8`'s naive "45% overlap" yaw-span formula from the plan only registered 2/8 images — retuned empirically to 64° for 8/8 (documented in a `synth.py` comment); `nadir` reveals a genuine scene-design gap — the synthetic marker is a **vertical** board, near-invisible to a straight-down camera, so `nadir`'s scale is badly wrong (40.5% off) for a reason unrelated to anything T3.3 was asked to fix (the plan frames T3.3 as characterizing current behavior on bad geometry, not fixing it). |
+
+## Not done (out of scope for this pass)
+
+- T3.1's SSE endpoint is not yet consumed by the frontend (T3.2 kept the existing 1.2 s
+  poll loop) — server and UI were built by parallel, independently-scoped work items;
+  wiring the client to `GET …/events` is the obvious next step.
+- T3.1's one failing/unconfirmed test (`test_worker_crash_is_isolated_and_pool_recovers`)
+  needs a clean, uncontended re-run before the crash-recovery claim is fully trusted.
+- T3.2's zoom/pan/vertex-edit interactions have not been exercised in a real browser.
+- Five of T3.3's eight presets (`oblique60`, `descending`, `collinear`, `lowtex`,
+  `distorted`) have working generators but no pinned regression thresholds yet — their
+  tests are honest skips, not guesses. `arc` was not re-run through `tools/benchmark.py`
+  itself (already covered by the pre-existing `test_e2e_synth.py`, confirmed unaffected).
+- T3.3's `nadir` preset exposes that the synthetic scene's marker geometry (vertical
+  board) doesn't suit a true nadir/drone camera path — left as a documented limitation,
+  not fixed (would mean redesigning the synthetic marker placement, out of scope here).
+- T3.4 (real-photo regression set): not started — needs field photos + a reference
+  volume this environment doesn't have.
+- No `git commit` was made by any of this pass's work — all changes are in the working
+  tree, left for the user to review/commit.
+
+## Test results (final)
+
+**Not run to completion in this session** — the user asked mid-pass to stop running
+tests ("i can do the testing myself") and the three parallel work items were told to
+stop and report their state rather than finish their own verification. What's known:
+- `tests/test_server.py`: one completed run showed 12 passed / 1 failed under heavy
+  concurrent CPU load from sibling work (see T3.1's status note above) — not re-verified.
+- `tests/test_e2e_presets.py`: 4 passed / 5 skipped, from real runs (see T3.3's status
+  note and `architecture.md` §7.1 for the actual numbers observed).
+- `tests/test_e2e_synth.py`: confirmed passing after the `synth.py` preset refactor
+  (needed to prove `arc`'s default behavior is unchanged).
+- Fast suite (`pytest -q -k "not e2e"`) and the rest of `tests/test_pipeline_regressions.py`
+  etc.: not re-run after T3.1's file split; a plain import check
+  (`python -c "import server.main; from server.jobs import Job, JOBS; from server import
+  routes, worker, executor, schemas"`) passed cleanly, but that only proves the module
+  graph is wired correctly, not that behavior is preserved.
+
+**Recommended before trusting this tier**: `pytest -q -k "not e2e"`, then
+`pytest -q tests/test_server.py` alone (to rule out the CPU-contention theory for its one
+failure), then `pytest -q tests/test_e2e_synth.py`, then selectively un-skip and run the
+remaining five `test_e2e_presets.py` cases.

@@ -64,7 +64,7 @@ GIL in C++, so two jobs run concurrently on the `ThreadPoolExecutor(max_workers=
 | 6. Measure | `POST …/measure` | `pipeline.measure` → `volume.prism_volume` or `volume.dem_volume` | result dict, artifacts |
 | 7. Change (CLI only) | `landslide.cli change A B` | `change.change_volume` | change result JSON |
 
-### 1.2 Job state machine (`server/main.py`)
+### 1.2 Job state machine (`server/jobs.py`, `server/routes.py`)
 
 ```
  created ──▶ reconstructing ──▶ ready ◀──▶ measuring
@@ -76,9 +76,33 @@ GIL in C++, so two jobs run concurrently on the `ThreadPoolExecutor(max_workers=
 ```
 
 Persistence: every status change writes `state.json` atomically (`Job.save_state`,
-`server/main.py:106`). On startup `_load_persisted_jobs` reattaches job directories;
+`server/jobs.py`). On startup `_load_persisted_jobs` reattaches job directories;
 jobs interrupted mid-SfM become `error`, finished models become `ready`. The `ReconCtx`
-is rebuilt lazily from the COLMAP cache on first touch (`Job.ensure_ctx`, `:142`).
+is rebuilt lazily from the COLMAP cache on first touch (`Job.ensure_ctx`); `GET
+/api/jobs/{id}` never blocks on this reload — it kicks off `Job.start_ctx_reload()` in a
+background thread (idempotent, guarded so a second poll doesn't start a second reload)
+and returns immediately with `ctx_loading: true/false` in the snapshot (T3.1/S4).
+
+**Process isolation (T3.1/S2, `server/worker.py` + `server/executor.py`).** The three
+heavy/crash-prone stages — reconstruction, dense+measure, dense+ortho — run in a shared
+`ProcessPoolExecutor(max_workers=2)` (`server/executor.py`), not the request/event-loop
+process. Each worker function is a plain top-level, picklable call (`job_id`, paths, and
+plain dicts for `scale_info`/`dem_info`/the measure spec — never the live `Job` or
+`ReconCtx`, which aren't picklable); it reloads its own `ReconCtx` from the on-disk COLMAP
+cache (`reconstruct(reuse=True)`) and re-applies scale/DEM before doing its work — the job
+directory is the only shared state, per the plan's own framing. Workers push log lines to
+a `multiprocessing.Manager().Queue()`; a background thread in the parent drains it into
+the right `Job.log`. If a worker process dies outright (segfault, `os._exit`), that job's
+future raises/`BrokenProcessPool`; the executor is recreated (lock-guarded) so the pool
+recovers for the next submission, and the dead job is marked `error` instead of losing the
+whole server. `tests/test_server.py::test_worker_crash_is_isolated_and_pool_recovers`
+drives this with a worker that calls `os._exit(1)` for real — not mocked.
+
+**Progress streaming (T3.1/S5).** `GET /api/jobs/{id}/events` (SSE, `text/event-stream`)
+tails `Job.log` as it grows and closes once status reaches `ready`/`error`, replaying the
+last few lines on connect. Additive — the polling snapshot endpoint is unchanged and still
+the resume-after-refresh path; the frontend does not yet consume SSE (T3.2 kept the
+existing poll loop, see §6).
 
 ---
 
@@ -102,12 +126,17 @@ is rebuilt lazily from the COLMAP cache on first touch (`Job.ensure_ctx`, `:142`
 | `landslide/pipeline.py` | 349 | photo import + culling, `measure` (ground-frame photo selection with image-plane fallback), `run_spec` |
 | `landslide/cli.py` | 120 | `run`, `marker`, `spec-template`, `change` |
 | `landslide/mkmarker.py` | 61 | printable ArUco marker PNG + exact-size HTML |
-| `server/main.py` | 642 | FastAPI routes, Job class, LRU caches, persistence |
+| `server/main.py` | ~40 | thin entrypoint: `FastAPI` app, lifespan, no-cache middleware, static mount, includes `routes.router` |
+| `server/jobs.py` | ~250 | `Job` class, `JOBS`/`_photo_cache` LRU registries, persistence, lazy ctx reload |
+| `server/routes.py` | ~420 | all `@router` HTTP handlers (T3.1 split out of the old `server/main.py`) |
+| `server/worker.py` | ~90 | picklable top-level functions run inside the process-pool workers (T3.1/S2) |
+| `server/executor.py` | ~80 | lazy `ProcessPoolExecutor` + log-queue drain thread + `BrokenProcessPool` recovery (T3.1/S2) |
 | `server/schemas.py` | 33 | Pydantic request models (scale, measure) |
-| `server/static/app.js` | 725 | UI state, canvas tracing, polling, result rendering |
+| `server/static/js/main.js` + `coords.js`/`state.js`/`api.js`/`canvas.js`/`steps/*.js` | ~1.1k | ES-module frontend (T3.2, replaces the old monolithic `app.js`): `coords.js` is dependency-free pixel/zoom/pan math (unit-tested from Node, see `tests/test_coords.mjs`); `canvas.js` adds wheel/pinch zoom, pan, vertex drag/insert/delete over T0.7's pointer-event tracing |
 | `server/static/capture.html` | 123 | client-side live capture quality helper |
-| `tools/synth.py` | 268 | synthetic ground-truth scene generator |
-| `tests/` | ~2.4k | 122 tests: unit (geometry, volume, scaling, dem, densify, up, ground, enhance, segment, geo, import, ortho) + slow e2e |
+| `tools/synth.py` | ~430 | synthetic ground-truth scene generator; `--preset` (T3.3): `arc` (default, unchanged), `oblique60`, `descending`, `collinear`, `nadir`, `sparse8`, `lowtex`, `distorted` |
+| `tools/benchmark.py` | ~190 | T3.3 harness: SfM→scale→dense→measure per preset, Markdown table (registered views, scale/volume error, cloud RMS, runtime, peak RSS) |
+| `tests/` | ~2.7k | unit + slow e2e (`-k "not e2e"` for the fast set) plus `test_server.py` (API, TestClient), `test_e2e_presets.py` (`@pytest.mark.slow`, T3.3 presets), `test_coords.mjs` (Node, frontend coordinate math) |
 
 Dependencies (`requirements.txt`): fastapi, uvicorn, python-multipart, pycolmap 4.1.1,
 opencv-python-headless 5.0, numpy 2.5, scipy 1.18, pillow, matplotlib, requests, pytest.
@@ -376,7 +405,7 @@ bootstrap CI (no rim to resample).
 
 ---
 
-## 4. HTTP API — `server/main.py`
+## 4. HTTP API — `server/routes.py` (mounted by `server/main.py`)
 
 All bodies are JSON unless noted; scale and measure bodies are typed Pydantic models
 (`server/schemas.py`: `ArucoScaleRequest`, `ManualScaleRequest`, `MeasureRequest`) so
@@ -388,7 +417,8 @@ malformed input is rejected with a 422 instead of crashing inside numpy. Errors 
 | `GET /` | — | `index.html` | |
 | `POST /api/jobs` | multipart `files[]` (3–200 images, ≤80 MB each, ext in `IMAGE_EXTS`) | `{"id": "<YYYYMMDD-HHMMSS-hex6>"}`; SfM starts in background | 400 count/type/size/import |
 | `GET /api/jobs` | — | `[{id, status, created, n_photos, has_result}]` newest first | |
-| `GET /api/jobs/{id}` | — | job snapshot (see §5.6); triggers lazy ctx reload when `ready` | 404 |
+| `GET /api/jobs/{id}` | — | job snapshot (see §5.6); starts a non-blocking background ctx reload when `ready` and not yet loaded (`ctx_loading` in the snapshot) | 404 |
+| `GET /api/jobs/{id}/events` | — | SSE (`text/event-stream`) tail of `job.log`, closes at terminal status (T3.1/S5) | 404 |
 | `GET /api/jobs/{id}/photo/{name}?w=1400` | `w` max width | `image/jpeg` (LRU cached) | 404, 500 decode |
 | `POST /api/jobs/{id}/scale/aruco` | `{"side_m": 0.25, "dict": "auto", "id": null}` | `scale_info` (aruco keys, without `marker_px`) | 400 (no marker, <2 views, degenerate), 409 job error |
 | `POST /api/jobs/{id}/scale/manual` | `{"length_m": 1.0, "a": {"image", "p1":[x,y], "p2":[x,y]}, "b": {…}}` | `scale_info` (manual keys) | 400 gates |
@@ -453,7 +483,8 @@ artifacts: [overlay.jpg, heightmap.png, slopemap.png, pointcloud.ply?]
 ```
 
 ### 5.6 Job snapshot (`GET /api/jobs/{id}`)
-`id, status, error, created, log[-60:], reconstructable, ortho, images[{name,width,height,points}],
+`id, status, error, created, log[-60:], reconstructable, ctx_loading, ortho,
+images[{name,width,height,points}],
 scale, geo{origin_llh, n_fixes, gps_residual_median_m, gps_scale_vs_marker}|null, result?`.
 
 ### 5.7 CLI spec (`cli.TEMPLATE`, `pipeline.run_spec`)
@@ -467,28 +498,46 @@ scale, geo{origin_llh, n_fixes, gps_residual_median_m, gps_scale_vs_marker}|null
 
 ---
 
-## 6. Frontend — `server/static/app.js`
+## 6. Frontend — `server/static/js/` (T3.2, ES modules, no bundler)
 
-* Single global `state` object: `jobId, images, scale, ortho, manual{a,b}, markImg,
-  traceMode, polygon[], polygonClosed, lastResult`.
-* **Canvas coordinate chain** (`setupCanvas`, `:40`): photos are served at ≤1400 px; the
-  canvas draws at `displayW`. `k = stored_width / min(1400, stored_width)`.
-  Click → `canvas px × (canvas.width / rect.width) ÷ view.scale × k` = stored-photo px
-  (`toOriginal`). Decorators draw in stored px scaled by `view.scale / k`. Ortho canvas
-  uses `k = 1` so polygons are in ortho pixels.
-* Tracing modes: click-to-add vertex, Undo, Close (≥3 vertices), Clear, Freehand
-  (pointerdown/pointermove/pointerup, `touch-action: none`; thinned to ≤500 vertices) —
-  Pointer Events, so touch tracing works on the phones the photos come from. Canvas backing
-  store is sized once per image load (`loadURL`/`load`), not reallocated every `draw()` call.
-* Auto-detect fills `state.polygon` from the largest returned region.
-* Polling (`poll`, `:132`): 1.2 s `setTimeout` loop until status leaves
-  `reconstructing|measuring|orthorectifying` (and `images` are present).
-* Result table (`showResult`, `:470`): volumes, area, depth, datum name (all six `datum`
-  values named), uncertainty, swell factor rows, warnings box, `overlay.jpg`,
-  `heightmap.png` and `slopemap.png` (cache-busted).
-* Job list chips, delete, resume via `localStorage["lsv-last-job"]`.
+Replaces the old monolithic `app.js` (717 lines, global state, no tests) with plain
+browser-native ES modules loaded via `<script type="module" src="js/main.js">`:
+
+* `state.js` — the module-scoped equivalent of the old global `state` object
+  (`jobId, images, scale, ortho, manual{a,b}, markImg, traceMode, polygon[],
+  polygonClosed, lastResult`).
+* `api.js` — fetch wrappers for every backend route in §4.
+* `coords.js` — **dependency-free** pixel/zoom/pan/rotation math (no DOM, no `window`,
+  no `canvas`): image px ↔ display px round-trips under an arbitrary zoom/pan state.
+  Imported by `canvas.js` for real interaction and directly by
+  `tests/test_coords.mjs` (`node --test`, 8 cases) — the coordinate-chain test the plan
+  asked for, without pulling in jsdom/Playwright for a repo that has no other JS
+  dependency.
+* `canvas.js` — drawing + interaction on the marking canvases: T0.7's Pointer Events
+  tracing (click-to-add vertex, Undo, Close, Clear, Freehand, touch-capable) plus T3.2's
+  additions — mouse-wheel/pinch zoom, drag-to-pan, vertex drag, edge-click insert,
+  Delete/Backspace to remove the selected vertex, Escape to deselect/cancel. Canvas
+  backing store still only resizes on image load (T0.7), not per redraw.
+* `steps/{upload,scale,mark,result}.js` — one module per workflow step, mirroring the
+  original file's own section structure.
+* Auto-detect fills `state.polygon` from the largest returned region (unchanged).
+* Polling loop (unchanged behavior, moved into `steps/`): 1.2 s `setTimeout` until status
+  leaves `reconstructing|measuring|orthorectifying`. SSE (`GET …/events`, §1.2/§4) exists
+  server-side but is **not yet adopted client-side** — left as the obvious next step,
+  not done in this pass.
+* Result panel: volumes, area, depth, datum name, swell factor, warnings, and now (T3.2)
+  the T2.2 bootstrap `net_volume_ci95_m3` as a 95% CI next to net volume when present
+  (falling back to the flat `est_volume_error_m3` otherwise, mirroring `pipeline.py`'s
+  own fallback) plus the T2.1 `volume_raster_m3`/`unmeasured_area_m2` cross-check row;
+  all three artifacts (`overlay.jpg`, `heightmap.png`, `slopemap.png`), cache-busted.
+* Job list chips, delete, resume via `localStorage["lsv-last-job"]` (unchanged).
 * `capture.html`: independent page running Laplacian variance, clip fraction and dHash
-  on the live camera at ~5 fps to coach capture quality.
+  on the live camera at ~5 fps to coach capture quality (unchanged, not part of T3.2).
+* **Not done**: a magnifier for manual-scale point placement (plan's optional item) —
+  skipped, zoom/pan on the manual-scale canvas already gives precise click placement.
+  None of the new zoom/pan/vertex-edit interactions have been exercised in a real
+  browser — verified only via `node --check` on every module, the `node --test`
+  coordinate suite, and an HTTP smoke test (every module path serves 200).
 
 ---
 
@@ -501,3 +550,32 @@ horizontal arc (radius 26 m, height 7 m, yaw −48°…48°), 1200×900 px, f = 
 camera-centre Umeyama scale, manual scale within 2 % of ArUco, cut volume within 30 % of
 truth in both photo and ortho modes. README-reported results: ~14 % (photo tracing),
 ~4–6 % (ortho tracing), 1280 px stereo ~18 %, 640 px ~33 %.
+
+### 7.1 Camera-path preset harness (T3.3)
+
+`tools/synth.py --preset {arc,oblique60,descending,collinear,nadir,sparse8,lowtex,
+distorted}` parameterizes the camera path, terrain texture amplitude, and (for
+`distorted`) per-vertex Brown-Conrady radial distortion (k1=−0.15) applied before
+rasterization; `arc` is the default and reproduces the original single-scene generator
+exactly (poses/K/polygon match the pre-existing cached `ground_truth.json` to 1e-12).
+`tools/benchmark.py --presets <names> --out <dir>` runs SfM→scale→dense→measure per
+preset and emits a Markdown table (registered views, scale error vs. camera-centre
+Umeyama, photo/ortho volume error, cloud RMS to the analytic GT surface, runtime, peak
+RSS via `resource.getrusage`), degrading a single column to `n/a: <reason>` rather than
+failing the whole row when one preset misbehaves.
+
+`tests/test_e2e_presets.py` (`@pytest.mark.slow`, registered in `pytest.ini`, excluded
+from the default `-k "not e2e"` fast run same as `test_e2e_synth.py`) pins real,
+observed thresholds for the presets actually benchmarked before this pass ended:
+
+| preset | registered | scale err | photo vol err | ortho vol err | cloud RMS | note |
+| --- | --- | --- | --- | --- | --- | --- |
+| sparse8 | 8/8 | 0.05 % | 22.7 % | 11.2 % | 0.36 m | plan's naive 45%-overlap formula gave `yaw_span=160°` (2/8 registered); retuned to 64° (8°/step) for 8/8 |
+| nadir | 21/21 | 40.5 % (known-bad) | 24.5 % | 56.9 % | 43.75 m | the scene's ArUco board is **vertical** (see `MARKER`), near-invisible to a straight-down camera — a real, documented gap (needs a horizontal ground marker for true nadir sets), not something T3.3 was scoped to fix |
+
+`oblique60`, `descending`, `collinear`, `lowtex`, `distorted` have working generator code
+and a GT-polygon-in-frame check, but were not run to completion before this pass was
+told to stop — their `test_e2e_presets.py` cases are `pytest.mark.skip`'d with the exact
+command to un-skip once benchmarked (each full run costs several CPU-minutes of
+SfM+dense+measure). Un-skip and pin thresholds as the next step before trusting those
+five presets' numbers.

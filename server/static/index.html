@@ -80,7 +80,9 @@
   <h2>3 · Mark the landslide</h2>
   <p class="note">Draw the boundary ON THE RIM — the ring just outside your polygon is used
   as the undisturbed-ground datum for the volume. The top-down view has no perspective
-  distortion and is the most accurate way to trace.</p>
+  distortion and is the most accurate way to trace. Scroll/pinch to zoom, drag empty
+  space to pan, drag a point to move it, click an edge to insert a point, click a point
+  then press Delete to remove it.</p>
   <div class="row">
     <label>trace on
       <select id="trace-mode">
@@ -99,6 +101,7 @@
     <button id="poly-close" class="primary" disabled>Close polygon</button>
     <button id="poly-clear">Clear</button>
     <button id="poly-free">Freehand: off</button>
+    <button id="view-reset">Reset view</button>
     <span id="freehand-note" class="note"></span>
   </div>
   <p id="auto-note" class="note"></p>
@@ -139,6 +142,6 @@
 </section>
 </main>
 
-<script src="/static/app.js?v=6"></script>
+<script type="module" src="/static/js/main.js?v=1"></script>
 </body>
 </html>

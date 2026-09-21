@@ -1,7 +1,9 @@
 """Memory-bounding behaviour of the densify stage (no SfM needed)."""
 import numpy as np
 
-from landslide.densify import _cap_voxel, surface_filter, voxel_downsample
+from landslide.densify import (StereoConfig, _cap_voxel, _fuse_depth_candidates,
+                               _pair_geometry_ok, surface_filter, voxel_downsample)
+from landslide.sfm import ImageView
 
 
 def _scene(n_ground=4000, n_wall=400, seed=0):
@@ -48,3 +50,73 @@ def test_voxel_downsample_uniform_grid():
     assert len(p) <= 1000 and len(p) == len(c)
     # one representative per occupied cell, positions inside the hull
     assert p.dtype == np.float64 and c.dtype == np.uint8
+
+
+# ---------- T1.3: pair-selection geometry gate ----------
+
+K = np.array([[800.0, 0, 320], [0, 800.0, 240], [0, 0, 1]])
+DIST = np.zeros(5)
+
+
+def _view_looking_at(name, iid, center, look_at):
+    f = np.asarray(look_at, np.float64) - np.asarray(center, np.float64)
+    f /= np.linalg.norm(f)
+    ref = np.array([0.0, 0.0, 1.0]) if abs(f[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+    right = np.cross(f, ref)
+    right /= np.linalg.norm(right)
+    down = np.cross(f, right)
+    R = np.vstack([right, down, f])
+    t = -R @ np.asarray(center, np.float64)
+    return ImageView(name=name, image_id=iid, camera_id=1, R=R, t=t, K=K,
+                     dist=DIST, width=640, height=480, path=None)
+
+
+def test_pair_geometry_gate_rejects_near_duplicate_and_too_wide_baseline():
+    scene = np.array([0.0, 0.0, 0.0])
+    med = 8.0
+    cfg = StereoConfig()
+    good_a = _view_looking_at("a", 1, (8.0, -1.0, 0.0), scene)
+    good_b = _view_looking_at("b", 2, (8.0, 1.0, 0.0), scene)     # ~14° convergence
+    dup = _view_looking_at("dup", 3, (8.0, -0.98, 0.0), scene)    # ~same spot as a
+    wide = _view_looking_at("wide", 4, (-8.0, 0.0, 0.0), scene)   # opposite side
+
+    base_ab = float(np.linalg.norm(good_a.center - good_b.center))
+    assert _pair_geometry_ok(good_a, good_b, base_ab, med, scene, cfg, True)
+
+    base_dup = float(np.linalg.norm(good_a.center - dup.center))
+    assert not _pair_geometry_ok(good_a, dup, base_dup, med, scene, cfg, True)
+
+    base_wide = float(np.linalg.norm(good_a.center - wide.center))
+    assert not _pair_geometry_ok(good_a, wide, base_wide, med, scene, cfg, True)
+    # relaxed (baseline/depth-ratio only) gate is more permissive: the
+    # near-duplicate pair fails on baseline alone regardless, but flipping
+    # off the angle checks must not make it MORE restrictive
+    assert _pair_geometry_ok(good_a, good_b, base_ab, med, scene, cfg, False)
+
+
+# ---------- T1.4: multi-view depth-consensus fusion ----------
+
+def test_fuse_depth_candidates_picks_largest_agreeing_cluster():
+    # 3 candidates at one pixel: two agree near z=10, one outlier at z=14
+    Z = np.array([[[10.0]], [[10.05]], [[14.0]]])
+    STEP = np.full_like(Z, 0.01)
+    fused, which, count = _fuse_depth_candidates(Z, STEP)
+    assert count[0, 0] == 2
+    assert which[0, 0] in (0, 1)
+    assert abs(fused[0, 0] - 10.025) < 1e-9
+
+
+def test_fuse_depth_candidates_all_nan_gives_zero_count():
+    Z = np.full((3, 2, 2), np.nan)
+    STEP = np.full_like(Z, 0.01)
+    _, _, count = _fuse_depth_candidates(Z, STEP)
+    assert (count == 0).all()
+
+
+def test_fuse_depth_candidates_single_candidate_self_agrees():
+    Z = np.array([[[5.0]]])
+    STEP = np.array([[[0.01]]])
+    fused, which, count = _fuse_depth_candidates(Z, STEP)
+    assert count[0, 0] == 1
+    assert which[0, 0] == 0
+    assert fused[0, 0] == 5.0

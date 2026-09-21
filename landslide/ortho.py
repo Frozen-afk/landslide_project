@@ -64,7 +64,7 @@ def render_orthophoto(ctx: ReconCtx, up=None, max_side: int = 1400,
         raise RuntimeError("too few 3D points for an orthophoto — the "
                            "reconstruction is too sparse")
     if up is None:
-        up = estimate_up(ctx.views, ctx.sparse)
+        up = estimate_up(ctx.views, ctx.sparse, log=log)
     e1, e2 = ground_basis(up)
     u, v, h = pts @ e1, pts @ e2, pts @ up
 
@@ -97,26 +97,25 @@ def render_orthophoto(ctx: ReconCtx, up=None, max_side: int = 1400,
     return img, meta
 
 
-def select_region_ortho(ctx: ReconCtx, meta: dict, polygon_px,
-                        rim_inner_m: float | None = None,
+def select_region_world(ctx: ReconCtx, e1: np.ndarray, e2: np.ndarray,
+                        world_polygon, rim_inner_m: float | None = None,
                         rim_outer_m: float | None = None,
-                        log: Log = print):
-    """Interior/rim masks of the cloud from a polygon drawn on the orthophoto.
+                        log: Log = print, dense: bool = True):
+    """Interior/rim masks of the cloud from a polygon already in true ground
+    (e1, e2) coordinates — no pixel grid, no parallax.
 
-    The rim band is an annulus in true ground units outside the traced line,
-    wide enough to hold many cloud points but clear of debris the user may
-    have clipped with a slightly-inward trace. Band defaults adapt to the
-    cloud's point spacing.
+    Shared by `select_region_ortho` (polygon traced on the top-down render)
+    and `landslide.ground`'s ray-cast ground-frame selection (polygon traced
+    on an oblique photo, then cast onto a ground DSM). The rim band is an
+    annulus in true ground units outside the traced line, wide enough to
+    hold many cloud points but clear of debris the user may have clipped
+    with a slightly-inward trace. Band defaults adapt to the cloud's point
+    spacing.
     """
-    pts, _ = ctx.cloud(dense=True)
+    pts, _ = ctx.cloud(dense=dense)
     pts = np.asarray(pts, np.float64) * ctx.scale
-    e1 = np.asarray(meta["e1"], np.float64)
-    e2 = np.asarray(meta["e2"], np.float64)
     uv = np.column_stack([pts @ e1, pts @ e2])
-
-    poly = np.asarray(polygon_px, np.float64)
-    world = np.column_stack([meta["u0"] + poly[:, 0] * meta["res"],
-                             meta["v0"] + poly[:, 1] * meta["res"]])
+    world = np.asarray(world_polygon, np.float64)
 
     if rim_outer_m is None or rim_inner_m is None:
         sub = uv[:: max(1, len(uv) // 20000)]
@@ -130,8 +129,22 @@ def select_region_ortho(ctx: ReconCtx, meta: dict, polygon_px,
     interior = points_in_polygon(uv, world)
     d = ring_distance(uv, world)
     rim = (d >= rim_inner_m) & (d <= rim_outer_m) & ~interior
-    log(f"[ortho] region: {int(interior.sum())} points inside, "
+    log(f"[ground] region: {int(interior.sum())} points inside, "
         f"{int(rim.sum())} in the rim band "
         f"[{rim_inner_m:.2f}, {rim_outer_m:.2f}] m outside the line")
     return interior, rim, {"rim_inner_m": float(rim_inner_m),
                            "rim_outer_m": float(rim_outer_m)}
+
+
+def select_region_ortho(ctx: ReconCtx, meta: dict, polygon_px,
+                        rim_inner_m: float | None = None,
+                        rim_outer_m: float | None = None,
+                        log: Log = print, dense: bool = True):
+    """Interior/rim masks of the cloud from a polygon drawn on the orthophoto."""
+    e1 = np.asarray(meta["e1"], np.float64)
+    e2 = np.asarray(meta["e2"], np.float64)
+    poly = np.asarray(polygon_px, np.float64)
+    world = np.column_stack([meta["u0"] + poly[:, 0] * meta["res"],
+                             meta["v0"] + poly[:, 1] * meta["res"]])
+    return select_region_world(ctx, e1, e2, world, rim_inner_m, rim_outer_m,
+                               log=log, dense=dense)

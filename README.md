@@ -10,8 +10,8 @@ integrates the volume between the landslide surface (a polygon you draw on
 one photo) and an undisturbed-ground datum fitted to the polygon rim.
 
 Validated end-to-end on a synthetic scene with known ground truth:
-scale error < 3 %, volume error ≈ 12 % on a 67 m³ bowl
-(`tests/test_e2e_synth.py`).
+scale error < 2 %, volume error ≈ 1–8 % on a 67 m³ bowl (ortho tracing ~1 %,
+photo tracing ~8 %; `tests/test_e2e_synth.py`).
 
 ## Quick start
 
@@ -64,12 +64,19 @@ Workflow in the browser:
   logged with its reason plus a one-line summary ("quality gate: 2 blurry,
   1 over/under-exposed — 18 of 21 photos kept"). Culling is conservative:
   at most half the upload, ≥ 3 photos always survive.
+- **Ground-frame photo tracing** — a polygon drawn on an oblique photo is
+  cast onto a top-down digital surface model of the reconstructed cloud
+  (ray-marched from each traced vertex), so photo-mode selection happens in
+  true ground coordinates instead of image pixels — no perspective parallax,
+  no need to trace on the orthophoto to get an unbiased region. Falls back
+  to projecting the cloud into the photo when the ray-cast can't resolve
+  most of the boundary (steep oblique angle, or too sparse a cloud).
 - **Top-down orthophoto tracing** — optionally render the scaled cloud as a
   bird's-eye orthophoto (with scale bar) and trace the boundary there.
   Pixel coordinates map directly to ground coordinates, so a line drawn over
   background terrain can no longer accidentally enclose far-away points the
-  way it can on an oblique photo. End-to-end on the synthetic scene this
-  halves the volume error vs photo tracing (6% vs 14%).
+  way it can on an oblique photo. It also stays reliable when the cloud is
+  too sparse for the ground-frame ray-cast above to resolve the boundary.
 - **Curved datum (paraboloid)** — the rim datum is a robustly-fitted plane by
   default, automatically upgraded to a second-order surface when the rim
   residual shows real curvature (road crowns, hillsides, switchbacks), with
@@ -276,10 +283,10 @@ vary a few points depending on which SfM/dense path wins and cache state.
 
 | Configuration | Metric | Result |
 | --- | --- | --- |
-| Full pipeline, photo tracing (e2e) | volume error vs truth | ~14% |
-| Full pipeline, ortho tracing (e2e) | volume error vs truth | ~4–6% |
-| Dense stereo @1280 px | volume error vs truth | ~18% |
-| Dense stereo @640 px (preview) | volume error vs truth | ~33% (5× faster) |
+| Full pipeline, photo tracing (e2e, ground-frame or image-plane fallback) | volume error vs truth | ~8% |
+| Full pipeline, ortho tracing (e2e) | volume error vs truth | ~1% |
+| Dense stereo @1280 px | volume error vs truth | ~18%¹ |
+| Dense stereo @640 px (preview) | volume error vs truth | ~33%¹ (5× faster) |
 | Degraded photos (shadow+blur+JPEG), before quality gate | registered images / usable points | 19/21, 63 pts (unusable) |
 | Degraded photos, after ladder + CLAHE attempt | registered images / points | 21/21, 899 pts |
 | S-curve road, paraboloid datum | pile volume error | >20% |
@@ -288,6 +295,11 @@ vary a few points depending on which SfM/dense path wins and cache state.
 | ICP registration, point-to-plane trimmed | ground alignment error | <0.05 m |
 | SfM mapping stage, 9 photos (GLOMAP vs incremental) | wall time | 28.5 s vs 10.9 s, equal quality |
 | SfM on 21 real 3000×2250 photos (threads capped at 4) | peak RAM | ~7.8 GB |
+
+¹ Single-pair stereo-width comparison, measured before the multi-view depth
+fusion (Tier 1) replaced the per-pair union; not yet re-benchmarked under the
+new pipeline, where each reference image's depth is a cross-neighbour
+consensus rather than one pair's raw output.
 
 ## Accuracy & limitations
 

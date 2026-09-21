@@ -178,7 +178,8 @@ def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
         if not ortho:
             raise ValueError("mode='ortho' needs the orthophoto metadata "
                              "(render it first)")
-        interior, rim, rinfo = select_region_ortho(ctx, ortho, polygon, log=log)
+        interior, rim, rinfo = select_region_ortho(ctx, ortho, polygon, log=log,
+                                                   dense=dense)
         up = np.asarray(ortho["up"], np.float64)
         if dem is not None:
             R, t, surface = dem
@@ -195,10 +196,31 @@ def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
     elif mode == "photo":
         if image_name not in ctx.views:
             raise ValueError(f"image '{image_name}' is not part of the reconstruction")
-        view, uv, interior, rim = select_region(ctx, image_name, polygon,
+        view = ctx.views[image_name]
+        up = estimate_up(ctx.views, ctx.sparse, log=log)
+
+        # ground-frame selection (T1.2): cast the traced polygon onto a
+        # ground DSM instead of projecting the cloud into the photo, so
+        # photo-mode tracing is as parallax-free as ortho-mode tracing.
+        # Falls back to the image-plane projection when the ray-cast can't
+        # resolve most of the boundary (steep oblique angle, thin cloud).
+        ground = None
+        try:
+            from .ground import select_region_ground
+            ground = select_region_ground(ctx, image_name, polygon, up=up, log=log,
+                                          dense=dense)
+        except Exception as e:
+            log(f"[measure] ground-frame selection failed ({e}); "
+                "falling back to image-plane selection")
+        if ground is not None:
+            interior, rim, ginfo = ground
+            region_method = "ground_frame"
+        else:
+            _, _, interior, rim = select_region(ctx, image_name, polygon,
                                                 rim_px, rim_inner_px,
                                                 extra_views=1)
-        up = estimate_up(ctx.views, ctx.sparse)
+            region_method = "image_projection"
+
         if dem is not None:
             R, t, surface = dem
             from .volume import dem_volume
@@ -211,6 +233,10 @@ def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
                                log=log, up=up)
             res["mode"] = "photo"
             res["image"] = image_name
+        res["region_method"] = region_method
+        if region_method == "ground_frame":
+            res["rim_band_m"] = [ginfo["rim_inner_m"], ginfo["rim_outer_m"]]
+        else:
             res["rim_band_px"] = [rim_px * 0.5 if rim_inner_px is None else rim_inner_px,
                                   (rim_px * 0.5 if rim_inner_px is None else rim_inner_px) + rim_px]
     else:

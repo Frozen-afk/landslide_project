@@ -52,10 +52,10 @@ def test_stale_dense_cache_is_rejected(tmp_path, monkeypatch):
     np.savez_compressed(cache, points=np.ones((5, 3)), colors=np.ones((5, 3)),
                         fingerprint="bbbbbbbb")   # written by a different pose set
 
-    monkeypatch.setattr(densify_mod, "select_pairs", lambda ctx, max_pairs=30: [])
-    out = dense_cloud(ctx, log=lambda *_: None)
+    # ctx.views is empty, so dense_cloud has nothing to fuse regardless —
     # a trusted cache would have loaded the 5 stale points; a rejected one
-    # falls through to "no usable stereo pairs" and returns empty
+    # falls through to "no registered views" and returns empty
+    out = dense_cloud(ctx, log=lambda *_: None)
     assert len(out["points"]) == 0
 
 

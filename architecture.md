@@ -24,7 +24,8 @@ current tree). For the upgrade roadmap see `implementation_plan.md`.
  │      │                                                                   │
  │      ├─▶ sfm.py       COLMAP SfM via pycolmap, retry ladder, ReconCtx    │
  │      ├─▶ scaling.py   ArUco / manual metric scale                        │
- │      ├─▶ densify.py   pairwise rectified SGBM → fused semi-dense cloud   │
+ │      ├─▶ densify.py   multi-view SGBM depth fusion → semi-dense cloud   │
+ │      ├─▶ ground.py    ray-cast photo polygon → ground-frame selection   │
  │      ├─▶ ortho.py     top-down orthophoto + ground-coordinate selection  │
  │      ├─▶ volume.py    rim datum (plane/quad/TPS) + 2.5D prism integral   │
  │      ├─▶ dem.py       prior-DEM import, trimmed point-to-plane ICP       │
@@ -85,11 +86,12 @@ is rebuilt lazily from the COLMAP cache on first touch (`Job.ensure_ctx`, `:142`
 
 | Module | Lines | Responsibility |
 | --- | --- | --- |
-| `landslide/sfm.py` | 480 | pycolmap wrapper; retry ladder; `ImageView`/`ReconCtx` data classes; covisibility graph |
-| `landslide/densify.py` | 357 | stereo pair selection, rectified SGBM, fusion, outlier/normal filters, up-vector |
-| `landslide/scaling.py` | 296 | ArUco multi-view and manual two-view metric scale with quality gates |
-| `landslide/volume.py` | 775 | region selection (photo mode), robust datum fitting, prism volume, DEM differencing, LoD, slope stats |
-| `landslide/ortho.py` | 137 | top-down raster render; region selection in ground coordinates |
+| `landslide/sfm.py` | 505 | pycolmap wrapper; retry ladder; `ImageView`/`ReconCtx` data classes; covisibility graph |
+| `landslide/densify.py` | 691 | `StereoConfig`; geometry-gated neighbour selection; per-reference multi-view depth-consensus fusion; outlier/normal filters; scene-based up-vector |
+| `landslide/ground.py` | 181 | ray-cast a photo-mode polygon onto a ground DSM for parallax-free region selection |
+| `landslide/scaling.py` | 394 | ArUco multi-view (with per-view outlier rejection, squareness fit, PnP cross-check) and manual two-view metric scale, quality gates |
+| `landslide/volume.py` | 825 | region selection (photo mode), robust datum fitting, prism volume, DEM differencing, LoD, slope stats |
+| `landslide/ortho.py` | 150 | top-down raster render; region selection in ground coordinates (shared `select_region_world`) |
 | `landslide/dem.py` | 212 | DEM loaders, IDW surface, trimmed point-to-plane ICP |
 | `landslide/change.py` | 124 | two-epoch registration (marker Kabsch or ICP) + change volume |
 | `landslide/geo.py` | 175 | EXIF GPS parsing, ENU frame, Umeyama alignment (annotation only) |
@@ -97,7 +99,7 @@ is rebuilt lazily from the COLMAP cache on first touch (`Job.ensure_ctx`, `:142`
 | `landslide/enhance.py` | 59 | CLAHE + unsharp radiometric enhancement |
 | `landslide/segment.py` | 234 | Roboflow REST client, mask → polygon extraction |
 | `landslide/viz.py` | 132 | overlay, height map, slope hazard map |
-| `landslide/pipeline.py` | 325 | photo import + culling, `measure`, `run_spec` |
+| `landslide/pipeline.py` | 349 | photo import + culling, `measure` (ground-frame photo selection with image-plane fallback), `run_spec` |
 | `landslide/cli.py` | 120 | `run`, `marker`, `spec-template`, `change` |
 | `landslide/mkmarker.py` | 61 | printable ArUco marker PNG + exact-size HTML |
 | `server/main.py` | 642 | FastAPI routes, Job class, LRU caches, persistence |
@@ -105,7 +107,7 @@ is rebuilt lazily from the COLMAP cache on first touch (`Job.ensure_ctx`, `:142`
 | `server/static/app.js` | 725 | UI state, canvas tracing, polling, result rendering |
 | `server/static/capture.html` | 123 | client-side live capture quality helper |
 | `tools/synth.py` | 268 | synthetic ground-truth scene generator |
-| `tests/` | ~1.9k | 73 tests: unit (geometry, volume, scaling, dem, densify, enhance, segment, geo, import, ortho) + slow e2e |
+| `tests/` | ~2.4k | 122 tests: unit (geometry, volume, scaling, dem, densify, up, ground, enhance, segment, geo, import, ortho) + slow e2e |
 
 Dependencies (`requirements.txt`): fastapi, uvicorn, python-multipart, pycolmap 4.1.1,
 opencv-python-headless 5.0, numpy 2.5, scipy 1.18, pillow, matplotlib, requests, pytest.
@@ -159,8 +161,19 @@ selection and photo-mode neighbour lookup.
 `cv2.aruco.ArucoDetector` for each dictionary in `["DICT_6X6_250","DICT_5X5_100","DICT_4X4_50","DICT_7X7_250","DICT_ARUCO_ORIGINAL"]`
 (or the one requested), `cornerSubPix` refine, pick the `(dict, id)` seen in most views
 (need ≥2). Corners are undistorted to normalised coordinates and triangulated jointly by
-DLT over all observing views (`geometry.triangulate_dlt`). `scale = side_m / mean(4 sides)`.
-Relative error = `clip(max(side_spread, mean_reproj_px / mean_px_side), 0.5 %, 50 %)`.
+DLT over all observing views (`geometry.triangulate_dlt`). **Per-view outlier rejection**
+(T1.5, needs ≥3 views): reproject the triangulated corners into every detecting view; a
+view whose mean residual exceeds 3× the median across views is dropped and the
+triangulation is refit on the rest (`dropped_views` in `scale_info`). **Squareness fit**
+(`_fit_square_side`): rather than the mean of the four (independently noisy) triangulated
+edge lengths, a similarity-Procrustes fit of a unit square onto the corners projected into
+their own best-fit plane gives `scale = side_m / square_side` — one bad corner drags this
+less than it drags a raw edge (each edge shares 2 of the 4 corners; the fit uses all four
+against a rigid template). **PnP cross-check** (`_pnp_scale_estimate`): per detecting view,
+`cv2.solvePnP` with the marker's known metric geometry recovers an independent camera-to-marker
+scale estimate that shares no computation with the triangulation path; `pnp_scale_estimates`
+and `pnp_scale_spread` are reported (warning above 10%) as a second opinion, not folded into
+the primary scale. Relative error = `clip(max(side_spread, mean_reproj_px / mean_px_side), 0.5 %, 50 %)`.
 `scale_info` also stores `marker_corners_m` (metric corners) for later two-epoch registration.
 
 **Manual** (`manual_scale`, `:190`): two endpoints clicked in two different photos →
@@ -169,47 +182,88 @@ positive depth in both cameras; warnings at 8 px, 1.5°, <50 px reference length
 
 ### 3.4 Semi-dense stereo — `densify.py`
 
-1. **Pair selection** (`select_pairs`, `:39`): covisibility ≥25 tracks, baseline within
-   `[0.10, 1.5] × median sparse depth of view a`, sort by covisibility, greedy with ≤2 pairs
-   per image, ≤30 pairs total.
-2. **Per pair** (`stereo_pair`, `:78`): load both images at ≤`stereo_width` (1280 default,
-   640 preview), crop to common size, `cv2.stereoRectify(alpha=0, CALIB_ZERO_DISPARITY)`
-   from relative pose `R_rel = R_b·R_aᵀ`, `t_rel = t_b − R_rel·t_a`; swap the pair if the
-   baseline comes out negative. Disparity window from the 1st/99th percentile of view a's
-   sparse depths: `min_disp = floor(f·B/z_max) − 8`, `numDisparities` rounded to 16, clipped
-   to [16, 320]. `StereoSGBM` (block 5, P1=200, P2=3200, uniqueness 10, speckle 300/3,
-   mode HH4) run left→right and right→left; keep pixels with `|d_R(x−d_L) + d_L| ≤ 1.5`.
-   `reprojectImageTo3D(Q)` → rectified-camera frame → `x_cam = x_rect·R1` → world.
-3. **Fusion** (`dense_cloud`, `:270`): voxel = `sparse extent / 900` (model units);
-   each pair is voxel-downsampled immediately, all merged and downsampled again;
-   statistical outlier removal (k=10, 2σ, 2 iterations); **support clip** — drop points
-   farther than `max(5·voxel, 2·sparse spacing, 2 % extent)` from any sparse point;
-   cap at 2.5 M points by growing the voxel (`_cap_voxel`); **surface-normal filter**
-   (`surface_filter`, k=16 PCA normals in 300 k chunks) keeps points whose normal is within
-   ~75° of `up`; store float32; cache to `work/dense_<w>_<fp>.npz`, keyed to a
-   fingerprint of the sparse reconstruction (sorted per-image poses + point
-   count) so a rerun that lands on a different SfM attempt or pose set can't
-   silently reuse a cloud from the old frame.
-4. **Up vector** (`estimate_up`, `:205`): normal of the least-squares plane through camera
-   centres, sign chosen so it points from the sparse centroid toward the cameras.
+`StereoConfig` (dataclass) holds every pair-geometry threshold and SGBM knob in one place.
+
+1. **Geometry-gated neighbour selection** (T1.3, `_pair_geometry_ok`): beyond the baseline
+   ratio `[0.10, 1.5] × median sparse depth`, a candidate pair must have a convergence angle
+   between optical axes in `[4°, 35°]`, a ray angle at the scene centroid in `[3°, 30°]`, and
+   a `cv2.stereoRectify` shear (rotation angle of `R1` from identity) ≤40° — too small either
+   angle gives noisy/ill-conditioned depth, too large breaks the block matcher's
+   fronto-parallel assumption or forces a heavy rectification warp. Shared by two consumers:
+   `select_pairs` (a global greedy pair list with a `per_image` cap and a `max_pairs` budget,
+   plus a baseline-only rescue pass for images the gate leaves with zero pairs — kept as a
+   standalone, independently-testable utility) and `_neighbors_for_view` (T1.4's per-reference
+   top-`fusion_k` neighbour list, with its own relaxed rescue when the strict gate finds none).
+2. **Multi-view depth fusion** (T1.4, `dense_cloud` → `_depth_map_for_view`, the main
+   accuracy lever): for every registered image acting as reference, up to `fusion_k` (4)
+   geometry-gated neighbours each produce an independent depth estimate via rectified SGBM
+   (`stereo_pair`: `cv2.stereoRectify(alpha=0, CALIB_ZERO_DISPARITY)`, disparity window from
+   the 1st/99th percentile of the reference view's sparse depths, `StereoSGBM` block 5,
+   P1=200, P2=3200, uniqueness 10, speckle 300/3, mode HH4, run left→right and right→left,
+   keep pixels with `|d_R(x−d_L) + d_L| ≤ 1.5`). Each neighbour's resulting world points are
+   **re-projected through the reference camera's own distortion model** (`ImageView.project`)
+   onto the reference's native pixel grid — equivalent to, and simpler than, inverting the
+   rectification remap. `_fuse_depth_candidates` then takes a per-pixel consensus over the
+   `fusion_k` candidate depths: two agree within `max(1% of depth, 2× the one-disparity depth
+   step Z²/(f·B))`; a pixel's value is the mean of its largest mutually-agreeing cluster,
+   kept only when that cluster has ≥2 members (≥1 — self-agreement — when the reference has
+   only one usable neighbour at all). This replaces the old fixed-global-pair-list union with
+   depth that two independent viewpoints actually agree on.
+3. **Per-reference/global fusion** (`dense_cloud`, unchanged mechanics): each reference
+   image's fused points are voxel-downsampled immediately (voxel = `sparse extent / 900`,
+   model units) as they're produced, then all merged and downsampled again; statistical
+   outlier removal (k=10, 2σ, 2 iterations); **support clip** — drop points farther than
+   `max(5·voxel, 2·sparse spacing, 2 % extent)` from any sparse point; cap at 2.5 M points by
+   growing the voxel (`_cap_voxel`); **surface-normal filter** (`surface_filter`, k=16 PCA
+   normals in 300 k chunks) keeps points whose normal is within ~75° of `up`; store float32;
+   cache to `work/dense_<w>_<fp>.npz`, keyed to a fingerprint of the sparse reconstruction
+   (sorted per-image poses + point count) so a rerun that lands on a different SfM attempt or
+   pose set can't silently reuse a cloud from the old frame. Consensus-gated fusion trades
+   raw point count for per-point confidence — the fused cloud is smaller than the old
+   per-pair union but its points are cross-neighbour-confirmed.
+4. **Up vector** (T1.1, `estimate_up`): two candidates — the normal of the dominant plane of
+   the sparse cloud itself (`_scene_plane_up`, via `volume.fit_plane_ransac`) and the normal
+   of the plane through camera centres (`_camera_plane_up`, the old method, tied to the
+   photographer's path rather than the scene). The scene plane wins when the cameras are
+   collinear (2nd/1st singular value of their spread < 0.10 — the camera-plane normal is
+   otherwise arbitrary within the path's null space) or the two candidates agree within 20°;
+   on genuine disagreement, whichever normal more of the cloud's own local surfaces call
+   "ground-like" (`surface_filter` vote) wins. Degenerate scenes (no clear dominant plane)
+   fall back to the camera-plane estimate.
 
 ### 3.5 Region selection
 
-**Photo mode** (`volume.select_region`, `:475`): project the whole cloud into the marked view
-(`ImageView.project` uses `cv2.projectPoints` with distortion, returning depth too); points
-with `depth <= 0` are dropped, and a coarse per-view z-buffer (`_front_surface_mask`, 4px
-raster cells, keeps points within 2% of median depth of the nearest depth in their cell)
-excludes points that project inside the polygon but sit behind the visible surface (terrain
-behind a ridge, a marker board behind the debris) before `interior` = `points_in_polygon`
-(matplotlib `Path.contains_points`) is evaluated; `rim` = ring distance to polygon edges in
-`[inner, inner + rim_px]` (default inner = rim_px/2 = 6 px, rim_px = 12 px) and not interior.
-`extra_views=1` (set by `measure`) ANDs the mask across the marked view and its most-covisible
-neighbour (poor-man's space carving).
+**Photo mode, ground-frame (T1.2, primary path)** — `ground.select_region_ground`: the traced
+polygon is cast OUT of the photo onto a top-down DSM instead of projecting the cloud INTO the
+photo. `ground.build_dsm` rasters the metric cloud's highest point per cell (cell = 2.5×
+point spacing, `estimate_cell_size`); `cast_polygon_to_ground` densifies each polygon edge
+into ≤25 px segments, builds a world-space camera ray per (densified) vertex
+(`undistort_normalized` → direction → `d_cam @ R`), and marches it outward from the
+(scale-corrected) camera center to find where its height first crosses at-or-below the DSM's
+surface height at the ray's own (u, v) — a linear-interpolated crossing between the two
+bracketing samples. Vertices whose ray never crosses (open sky, off the reconstructed
+footprint) are dropped; the ground polygon is handed to `ortho.select_region_world` (shared
+with ortho-mode tracing) for the interior/rim masks in true ground coordinates — no
+parallax, same rim-annulus-in-metres treatment as ortho mode. Falls back to the legacy
+image-plane method below when the ray-cast resolves under 70% of the (densified) vertices
+(steep oblique angle, or too sparse a cloud for the DSM to have continuous coverage).
+
+**Photo mode, image-plane fallback** (`volume.select_region`, `:497`): project the whole
+cloud into the marked view (`ImageView.project` uses `cv2.projectPoints` with distortion,
+returning depth too); points with `depth <= 0` are dropped, and a coarse per-view z-buffer
+(`_front_surface_mask`, 4px raster cells, keeps points within 2% of median depth of the
+nearest depth in their cell) excludes points that project inside the polygon but sit behind
+the visible surface (terrain behind a ridge, a marker board behind the debris) before
+`interior` = `points_in_polygon` (matplotlib `Path.contains_points`) is evaluated; `rim` =
+ring distance to polygon edges in `[inner, inner + rim_px]` (default inner = rim_px/2 = 6 px,
+rim_px = 12 px) and not interior. `extra_views=1` (set by `measure`) ANDs the mask across the
+marked view and its most-covisible neighbour (poor-man's space carving).
 
 **Ortho mode** (`ortho.py`): `render_orthophoto` projects the metric cloud onto the ground
 basis `(e1, e2) ⟂ up`, `res = span / 1400 px`, keeps the highest point per pixel, draws a
 scale bar, writes `ortho.json` with `u0, v0, res, e1, e2, up`. `select_region_ortho` maps
-polygon pixels to ground metres and builds the rim annulus in metres:
+polygon pixels to ground metres and calls the shared `select_region_world` (also T1.2's
+ground-frame photo path), which builds the rim annulus in metres:
 `inner = clip(6·spacing, 0.08, 0.5)`, `outer = clip(30·spacing, 0.4, 2.5)`.
 
 ### 3.6 Datum fitting — `volume.py`
@@ -350,7 +404,8 @@ datum_rms_m est_volume_error_m3 n_points n_rim_points n_rim_outliers n_high_drop
 mean_height_m max_depth_m max_height_m
 max_slope_deg mean_slope_deg area_steep_m2
 lod_m lod_max_m sig_area_frac warnings[]
-mode ∈ {photo, ortho}  image?  rim_band_px[2]?  rim_band_m[2]?
+mode ∈ {photo, ortho}  image?  region_method ∈ {ground_frame, image_projection}?
+rim_band_px[2]?  rim_band_m[2]?
 polygon_px scale scale_method scale_rel_error cloud ∈ {dense, sparse} n_cloud_points
 artifacts: [overlay.jpg, heightmap.png, slopemap.png, pointcloud.ply?]
 (change_volume adds icp_rms_m, registration ∈ {marker, icp})

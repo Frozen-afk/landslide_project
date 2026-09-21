@@ -36,6 +36,17 @@ Severity: **H** = produces a wrong number silently or blocks a real use-case;
 | G12 | L | `landslide/volume.py:234` | TPS builds a dense `n×n` distance matrix (n ≤ 4000): ~130 MB for `D2` plus `K`, `A` (n+3)², ≈ 400 MB peak, `np.linalg.solve` O(n³). | Acceptable today, but blocks raising `max_pts` and runs on every measurement with a curved rim. |
 | G13 | L | `landslide/volume.py:589, 604, 609` (`datum_pts is rim`) | Identity comparisons to decide whether the datum came from the rim; `rim` is rebound at `:572`, keeping it consistent only by care. | Fragile under refactor; any copy breaks the branch silently. |
 
+**Tier 1 resolution status** (see `IMPLEMENTATION_PROGRESS.md` for detail):
+G3 fixed by T1.2 (ground-frame ray-cast selection, `landslide/ground.py`, with the old
+projection kept as a documented fallback). G4 fixed by T1.1 (`densify.estimate_up` now scene-
+plane-first). G6 fixed by T1.3 (`_pair_geometry_ok` convergence/ray-angle/shear gates).
+G7 fixed by T1.4 (`_depth_map_for_view`/`_fuse_depth_candidates`: cross-neighbour depth
+consensus, ≥2-of-k agreement required). G9 fixed by T1.5 (per-view outlier rejection,
+squareness Procrustes fit, PnP cross-check in `scaling.aruco_scale`). G10 (rim-band pixel
+width) is unaffected in the image-plane fallback path but no longer the primary photo-mode
+mechanism now that T1.2's ground-frame selection uses a metric rim band by default. G13 not
+touched (Tier 2 scope, `datum_source` refactor is T2.3).
+
 ### A.2 Robustness to camera geometry (why "bad angle" hurts today)
 
 * **Pose recovery** (`sfm.py`): SIFT + exhaustive/sequential matching is fine for the
@@ -302,13 +313,13 @@ A `data/real/` folder (git-ignored, downloadable) with 2–3 field sets and a re
 | Order | Item | Effort | Depends on | Acceptance metric |
 | --- | --- | --- | --- | --- |
 | 1 | T0.1–T0.8 | 1–2 d | — | all existing tests pass; new regression tests pass; UI usable on touch |
-| 2 | T3.3 harness | 1–2 d | T0 | table produced for 8 presets; baseline numbers recorded in README |
-| 3 | T1.1 up vector | 1 d | T3.3 | `up` within 5° on all presets |
-| 4 | T1.2 ground-frame selection | 2 d | T1.1 | photo-mode volume error within 2 pts of ortho mode on `arc`, `oblique60` |
-| 5 | T1.3 pair selection + `StereoConfig` | 0.5 d | — | no pair >35° convergence; `sparse8` gets ≥1 pair per image |
-| 6 | T1.4 multi-view fusion | 3–4 d | T1.3 | cloud RMS to GT < 2 cm @1280; volume error ≤ 8 % on `arc`, ≤ 12 % on `oblique60`; dense time ≤ 3× today |
-| 7 | T2.1 raster volume + T2.2 bootstrap | 2 d | T1.4 | raster error ≤ TIN error on noisy bowl; CI contains truth on all presets |
-| 8 | T1.5 scale hardening | 1–2 d | — | scale error < 1 % with one injected bad detection |
+| 2 | T3.3 harness | 1–2 d | T0 | **not done** — only the existing single `arc` preset was used to validate Tier 1; no `oblique60`/`collinear`/`descending`/`sparse8`/etc. presets exist yet, so those per-preset acceptance numbers below are unverified |
+| 3 | T1.1 up vector | 1 d | T3.3 | **done** — verified on synthetic collinear/arc cases (`tests/test_up.py`), not on the full preset set (no harness) |
+| 4 | T1.2 ground-frame selection | 2 d | T1.1 | **done** — photo-mode e2e error 7–8% vs ortho's ~1% on the `arc` scene (within target); ray-cast geometry unit-verified exactly (`tests/test_ground.py`); `oblique60` untested |
+| 5 | T1.3 pair selection + `StereoConfig` | 0.5 d | — | **done** — gate unit-tested (`tests/test_densify.py`); `sparse8`/`oblique60` untested (no harness) |
+| 6 | T1.4 multi-view fusion | 3–4 d | T1.3 | **done**, target partially met — volume error ≤8% on `arc` (photo 7–8%, ortho ~1%, both under target); dense-stage time ~1.4× (well under the 3× budget); cloud-RMS-to-GT not directly measured (no per-point GT distance check in the harness); consensus fusion trades raw point count for confidence (~6.3k vs ~11.7k pre-T1.4 points on this scene) |
+| 7 | T2.1 raster volume + T2.2 bootstrap | 2 d | T1.4 | not started (Tier 2) |
+| 8 | T1.5 scale hardening | 1–2 d | — | **done**, partially — per-view outlier rejection, squareness fit and PnP cross-check implemented and unit-tested; multi-reference/multi-marker support (`scale_info["references"]`, UI "add another reference") explicitly out of scope for this pass (new API/UI surface, not just geometry) |
 | 9 | T2.3 datum refactor | 1 d | T2.1 | identical volumes on `tests/test_volume.py` fixtures; TPS peak RAM < 100 MB |
 | 10 | T2.4 SfM options (+ optional learned features) | 1–3 d | T3.3 | `sparse8`, `lowtex` register ≥ 90 % of views |
 | 11 | T3.1 process isolation + SSE | 2 d | T0.6 | server survives a killed worker; API tests green |

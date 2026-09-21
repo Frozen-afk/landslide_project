@@ -70,6 +70,53 @@ def detect_marker_corners(gray, s: float, dict_name: str,
     return out
 
 
+def _fit_square_side(corners3d: np.ndarray) -> float:
+    """Model-unit side length of the rigid square that best explains the
+    four triangulated corners (similarity Procrustes fit to a unit square),
+    used instead of the mean of four independently-noisy edge lengths so a
+    single off corner (motion blur, a grazing-angle detection) can't drag
+    the scale as hard as it drags one edge.
+    """
+    c = corners3d.mean(axis=0)
+    _, _, Vt = np.linalg.svd(corners3d - c, full_matrices=False)
+    basis = Vt[:2]                              # best-fit plane's in-plane axes
+    uv = (corners3d - c) @ basis.T              # (4, 2) planar coordinates
+    template = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
+    uv_c = uv - uv.mean(axis=0)
+    t_c = template - template.mean(axis=0)
+    denom = float((t_c ** 2).sum())
+    if denom <= 0:
+        return 0.0
+    _, S, _ = np.linalg.svd(uv_c.T @ t_c)
+    return float(S.sum() / denom)
+
+
+def _pnp_scale_estimate(view: ImageView, corners_px: np.ndarray, side_m: float,
+                        corners3d_model: np.ndarray) -> float | None:
+    """Independent per-view scale estimate: solvePnP recovers the camera's
+    METRIC distance to the marker from its known real-world side length
+    alone; the ratio to the model-unit distance (from the joint-DLT
+    triangulation) is a scale estimate that shares no computation with the
+    primary one, so the spread across views is a genuine cross-check.
+    """
+    obj = np.array([[0.0, 0.0, 0.0], [side_m, 0.0, 0.0],
+                    [side_m, side_m, 0.0], [0.0, side_m, 0.0]])
+    try:
+        ok, rvec, tvec = cv2.solvePnP(
+            obj, corners_px.reshape(-1, 1, 2).astype(np.float64), view.K, view.dist)
+    except cv2.error:
+        return None
+    if not ok:
+        return None
+    R_pnp, _ = cv2.Rodrigues(rvec)
+    cam_center_m = -(R_pnp.T @ tvec).ravel()
+    dist_m = float(np.linalg.norm(cam_center_m - obj.mean(axis=0)))
+    dist_model = float(np.linalg.norm(view.center - corners3d_model.mean(axis=0)))
+    if dist_model <= 1e-12 or not np.isfinite(dist_m) or dist_m <= 0:
+        return None
+    return dist_m / dist_model
+
+
 def _triangulate_pixels(observations, ctx_views: dict[str, ImageView]):
     """observations: list of (view_name, (N,2) pixels) -> (N,3) world."""
     views = []
@@ -125,6 +172,32 @@ def aruco_scale(ctx: ReconCtx, side_m: float, dict_name: str = "auto",
     corners3d = _triangulate_pixels(obs, ctx.views)   # (4,3)
     if not np.isfinite(corners3d).all():
         raise RuntimeError("marker triangulation produced nonfinite corners")
+
+    # per-view outlier rejection: a single mis-ID'd or motion-blurred
+    # detection can drag every corner if it's just averaged in, so views
+    # whose reprojection is far worse than the pack are dropped and the
+    # triangulation is refit on the rest (needs >=3 views to safely drop one
+    # and still have >=2 left for triangulation).
+    dropped_views: list[str] = []
+    if len(views_with) >= 3:
+        resid_per_view = {}
+        for n in views_with:
+            uv, depth = ctx.views[n].project(corners3d)
+            if np.isfinite(depth).all() and np.all(depth > 0) and np.isfinite(uv).all():
+                resid_per_view[n] = float(np.linalg.norm(uv - per_view[n], axis=1).mean())
+        if len(resid_per_view) >= 3:
+            med = float(np.median(list(resid_per_view.values())))
+            bad = [n for n, r in resid_per_view.items() if med > 0 and r > 3 * med]
+            if bad and len(views_with) - len(bad) >= 2:
+                dropped_views = bad
+                views_with = [n for n in views_with if n not in bad]
+                obs = [(n, per_view[n]) for n in views_with]
+                corners3d = _triangulate_pixels(obs, ctx.views)
+                if not np.isfinite(corners3d).all():
+                    raise RuntimeError("marker triangulation produced nonfinite corners")
+                log(f"[scale] dropping {len(bad)} view(s) with outlier marker "
+                    f"reprojection ({', '.join(bad)}) and refitting")
+
     sides = [float(np.linalg.norm(corners3d[i] - corners3d[(i + 1) % 4]))
              for i in range(4)]
     sides = np.array(sides)
@@ -132,6 +205,12 @@ def aruco_scale(ctx: ReconCtx, side_m: float, dict_name: str = "auto",
     if mean_side <= 0 or not np.isfinite(mean_side):
         raise RuntimeError("marker triangulation degenerated")
     spread = float(sides.std() / mean_side)
+    # squareness-enforced side length: a rigid-square Procrustes fit to the
+    # four corners, less sensitive to one noisy corner than a plain mean of
+    # four edges (each edge shares 2 of the 4 possibly-noisy corners).
+    square_side = _fit_square_side(corners3d)
+    if square_side <= 0 or not np.isfinite(square_side):
+        raise RuntimeError("marker triangulation degenerated")
 
     # reprojection residual of the triangulated corners -> scale uncertainty
     reproj, px_side = [], []
@@ -152,7 +231,18 @@ def aruco_scale(ctx: ReconCtx, side_m: float, dict_name: str = "auto",
         raise RuntimeError("marker reprojection quality is not finite or degenerated")
     rel_err = _clip_rel(max(spread, reproj_px_mean / mean_px_side))
 
-    scale = float(side_m / mean_side)
+    # per-view PnP cross-check: an independent scale estimate per view that
+    # shares no computation with the joint-DLT one above; reported, not used
+    # in the primary scale, so a bug in one path doesn't silently mask itself
+    pnp_scales = []
+    for n in views_with:
+        est = _pnp_scale_estimate(ctx.views[n], per_view[n], side_m, corners3d)
+        if est is not None:
+            pnp_scales.append(est)
+    pnp_spread = (float(np.std(pnp_scales) / np.mean(pnp_scales))
+                  if len(pnp_scales) >= 2 else 0.0)
+
+    scale = float(side_m / square_side)
     if not np.isfinite(scale) or scale <= 0:
         raise RuntimeError("marker scale must be finite and positive")
     ctx.scale = scale
@@ -164,6 +254,9 @@ def aruco_scale(ctx: ReconCtx, side_m: float, dict_name: str = "auto",
         "reproj_px_mean": reproj_px_mean,
         "scale_rel_error": rel_err,
         "marker_px": {n: per_view[n].tolist() for n in views_with},
+        "dropped_views": dropped_views,
+        "pnp_scale_estimates": pnp_scales,
+        "pnp_scale_spread": pnp_spread,
         # metric corners of the marker IN THE MODEL FRAME: if the same
         # physical marker is present in a second survey of the site, these
         # four points anchor an exact rigid registration between the two
@@ -172,11 +265,16 @@ def aruco_scale(ctx: ReconCtx, side_m: float, dict_name: str = "auto",
     }
     log(f"[scale] ArUco {best_dict} id={best_mid} in {len(views_with)} views; "
         f"sides(model)={np.round(sides, 3).tolist()} spread={spread:.3f}; "
+        f"square-fit side={square_side:.4g}; "
         f"reproj={reproj_px_mean:.2f}px; scale={scale:.6g} m/unit "
-        f"(±{rel_err * 100:.1f}%)")
+        f"(±{rel_err * 100:.1f}%); PnP cross-check spread={pnp_spread * 100:.1f}%")
     if spread > 0.05:
         log("[scale] warning: corner sides differ >5% — marker may be blurred "
             "or seen at a grazing angle")
+    if pnp_spread > 0.10:
+        log("[scale] warning: per-view PnP scale cross-check spread "
+            f"{pnp_spread * 100:.0f}% — the marker geometry may not be a "
+            f"clean flat square of the stated side length")
     return ctx.scale_info
 
 

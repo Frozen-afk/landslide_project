@@ -75,8 +75,12 @@ def _triangulate_pixels(observations, ctx_views: dict[str, ImageView]):
     views = []
     n = len(observations[0][1])
     for name, pixels in observations:
+        if not np.isfinite(pixels).all():
+            raise ValueError("reference pixel coordinates must be finite")
         v = ctx_views[name]
         uv = undistort_normalized(pixels, v.K, v.dist)
+        if not np.isfinite(uv).all():
+            raise RuntimeError("reference undistortion produced nonfinite coordinates")
         assert len(uv) == n
         views.append((v.R, v.t, uv))
     return triangulate_dlt(views)
@@ -89,8 +93,8 @@ def aruco_scale(ctx: ReconCtx, side_m: float, dict_name: str = "auto",
     dict_name="auto" tries every known dictionary and keeps the marker seen
     in the most views (you may not know which marker you printed).
     """
-    if side_m <= 0:
-        raise ValueError("marker side must be positive")
+    if not np.isfinite(side_m) or side_m <= 0:
+        raise ValueError("marker side must be finite and positive")
     if dict_name != "auto" and dict_name not in ARUCO_DICTS:
         raise ValueError(f"unknown ArUco dict {dict_name}")
     dicts = _available_dicts(dict_name)
@@ -119,6 +123,8 @@ def aruco_scale(ctx: ReconCtx, side_m: float, dict_name: str = "auto",
 
     obs = [(n, per_view[n]) for n in views_with]
     corners3d = _triangulate_pixels(obs, ctx.views)   # (4,3)
+    if not np.isfinite(corners3d).all():
+        raise RuntimeError("marker triangulation produced nonfinite corners")
     sides = [float(np.linalg.norm(corners3d[i] - corners3d[(i + 1) % 4]))
              for i in range(4)]
     sides = np.array(sides)
@@ -130,14 +136,25 @@ def aruco_scale(ctx: ReconCtx, side_m: float, dict_name: str = "auto",
     # reprojection residual of the triangulated corners -> scale uncertainty
     reproj, px_side = [], []
     for n in views_with:
-        uv, _ = ctx.views[n].project(corners3d)
+        uv, depth = ctx.views[n].project(corners3d)
+        if not np.isfinite(depth).all() or np.any(depth <= 0):
+            raise RuntimeError("marker corners must be in front of every observing "
+                               "camera with finite positive depth")
+        if not np.isfinite(uv).all():
+            raise RuntimeError("marker reprojection produced nonfinite coordinates")
         reproj.append(np.linalg.norm(uv - per_view[n], axis=1))
         px_side.append(np.linalg.norm(np.diff(np.vstack(
             [per_view[n], per_view[n][:1]]), axis=0), axis=1).mean())
     reproj_px_mean = float(np.concatenate(reproj).mean())
-    rel_err = _clip_rel(max(spread, reproj_px_mean / float(np.mean(px_side))))
+    mean_px_side = float(np.mean(px_side))
+    if (not np.isfinite([spread, reproj_px_mean, mean_px_side]).all()
+            or mean_px_side <= 0):
+        raise RuntimeError("marker reprojection quality is not finite or degenerated")
+    rel_err = _clip_rel(max(spread, reproj_px_mean / mean_px_side))
 
     scale = float(side_m / mean_side)
+    if not np.isfinite(scale) or scale <= 0:
+        raise RuntimeError("marker scale must be finite and positive")
     ctx.scale = scale
     ctx.scale_info = {
         "applied": True, "method": "aruco", "dict": best_dict,
@@ -182,8 +199,8 @@ def manual_scale(ctx: ReconCtx, spec_a: dict, spec_b: dict, length_m: float,
     wrong. A tiny viewing-ray angle means the two photos are near-duplicates
     and the triangulated depth — hence the scale — is ill-conditioned.
     """
-    if length_m <= 0:
-        raise ValueError("reference length must be positive")
+    if not np.isfinite(length_m) or length_m <= 0:
+        raise ValueError("reference length must be finite and positive")
     for spec in (spec_a, spec_b):
         if spec["image"] not in ctx.views:
             raise ValueError(f"unknown image {spec['image']}")
@@ -199,6 +216,8 @@ def manual_scale(ctx: ReconCtx, spec_a: dict, spec_b: dict, length_m: float,
         views.append(ctx.views[spec["image"]])
         clicked.append(px)
     pts = _triangulate_pixels(obs, ctx.views)         # (2,3)
+    if not np.isfinite(pts).all():
+        raise RuntimeError("reference triangulation produced nonfinite endpoints")
     model_len = float(np.linalg.norm(pts[0] - pts[1]))
     if not np.isfinite(model_len) or model_len < 1e-9:
         raise RuntimeError("triangulation of the reference segment failed — "
@@ -207,10 +226,19 @@ def manual_scale(ctx: ReconCtx, spec_a: dict, spec_b: dict, length_m: float,
     # --- quality gate -----------------------------------------------------
     reproj = []
     for v, px in zip(views, clicked):
-        uv, _ = v.project(pts)
+        uv, depth = v.project(pts)
+        # A point behind a camera can still have zero reprojection residual.
+        if not np.isfinite(depth).all() or np.any(depth <= 0):
+            raise RuntimeError("reference endpoints must be in front of both "
+                               "cameras with finite positive depth - re-click "
+                               "the SAME two physical points in both photos")
+        if not np.isfinite(uv).all():
+            raise RuntimeError("reference reprojection produced nonfinite coordinates")
         reproj.append(np.linalg.norm(uv - px, axis=1))
     reproj = np.concatenate(reproj)
     reproj_mean, reproj_max = float(reproj.mean()), float(reproj.max())
+    if not np.isfinite([reproj_mean, reproj_max]).all():
+        raise RuntimeError("reference reprojection error must be finite")
 
     angle_deg = float("inf")
     ca, cb = views[0].center, views[1].center
@@ -218,6 +246,8 @@ def manual_scale(ctx: ReconCtx, spec_a: dict, spec_b: dict, length_m: float,
         ra, rb = ca - X, cb - X
         cosang = float(np.clip(ra @ rb /
                                (np.linalg.norm(ra) * np.linalg.norm(rb)), -1, 1))
+        if not np.isfinite(cosang):
+            raise RuntimeError("reference viewing-ray angle must be finite")
         angle_deg = min(angle_deg, float(np.degrees(np.arccos(cosang))))
 
     if reproj_mean > 15.0 or reproj_max > 40.0:
@@ -232,6 +262,8 @@ def manual_scale(ctx: ReconCtx, spec_a: dict, spec_b: dict, length_m: float,
             "clearly different positions")
 
     px_len = float(np.mean([np.linalg.norm(px[0] - px[1]) for px in clicked]))
+    if not np.isfinite(px_len):
+        raise RuntimeError("reference pixel length must be finite")
     rel_err = _clip_rel(reproj_mean / max(px_len, 1e-6))
 
     warnings: list[str] = []
@@ -246,6 +278,8 @@ def manual_scale(ctx: ReconCtx, spec_a: dict, spec_b: dict, length_m: float,
                         "longer reference or a closer photo for accurate scale")
 
     scale = float(length_m / model_len)
+    if not np.isfinite(scale) or scale <= 0:
+        raise RuntimeError("reference scale must be finite and positive")
     ctx.scale = scale
     ctx.scale_info = {
         "applied": True, "method": "manual", "length_m": float(length_m),

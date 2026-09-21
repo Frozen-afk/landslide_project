@@ -68,8 +68,9 @@ def test_aruco_scale_accuracy(ctx, synth):
 
 def test_manual_scale_matches_aruco(ctx, synth):
     from landslide.scaling import aruco_scale, manual_scale
-    if not ctx.scale_info.get("applied"):
+    if ctx.scale_info.get("method") != "aruco":
         aruco_scale(ctx, side_m=synth["marker"]["side"], log=print)
+    aruco_scale_before = ctx.scale
     side = synth["marker"]["side"]
     corners = np.array(synth["marker"]["corners_world"])   # (4,3)
     K = np.array(synth["K"])
@@ -83,7 +84,7 @@ def test_manual_scale_matches_aruco(ctx, synth):
         specs.append({"image": name,
                       "p1": uv[0].tolist(), "p2": uv[1].tolist()})
     info = manual_scale(ctx, specs[0], specs[1], length_m=side, log=print)
-    assert abs(info["scale"] - ctx.scale) / ctx.scale < 0.02
+    assert abs(info["scale"] - aruco_scale_before) / aruco_scale_before < 0.02
 
 
 def test_volume_end_to_end(ctx, synth):

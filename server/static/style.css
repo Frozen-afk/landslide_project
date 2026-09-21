@@ -45,6 +45,7 @@ label.inline { display: inline-flex; align-items: center; gap: 6px; }
 canvas {
   max-width: 100%; border: 1px solid #34435a; border-radius: 8px;
   cursor: crosshair; display: block; margin-top: 8px; background: #000;
+  touch-action: none;
 }
 .manual-row { display: flex; gap: 18px; flex-wrap: wrap; }
 .manual-row > div { flex: 1 1 320px; }

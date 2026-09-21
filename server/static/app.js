@@ -47,8 +47,6 @@ function setupCanvas(canvas) {
   canvas.draw = function (decorator) {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     if (!view.img) return;
-    canvas.width = view.img.naturalWidth * view.scale;
-    canvas.height = view.img.naturalHeight * view.scale;
     ctx.drawImage(view.img, 0, 0, canvas.width, canvas.height);
     // decorators receive points in STORED px: stored -> canvas = scale / k
     if (decorator) decorator(ctx, view.scale / (view.k || 1));
@@ -61,6 +59,11 @@ function setupCanvas(canvas) {
     img.onload = () => {
       view.img = img;
       view.scale = Math.min(1, displayW / img.naturalWidth);
+      // canvas backing-store size is set once per image load, not per draw:
+      // a full width/height reassignment reallocates the buffer, which is
+      // wasteful during freehand tracing (a draw per mousemove sample)
+      canvas.width = img.naturalWidth * view.scale;
+      canvas.height = img.naturalHeight * view.scale;
       canvas.draw(canvas.decorator);
     };
     img.src = url;
@@ -474,7 +477,10 @@ function showResult(r) {
   const datumNames = {
     rim_plane: "plane fitted to the rim",
     rim_quad: "curved surface (paraboloid) fitted to the rim",
+    rim_tps: "membrane surface (thin-plate spline) fitted to the rim",
     surface_plane: "region surface itself (no rim!)",
+    dem: "prior-survey DEM",
+    prior_epoch: "earlier-epoch surface (change detection)",
   };
   const rows = [
     ["net volume (fill − cut)", `${r.net_volume_m3.toFixed(1)} m³`],
@@ -515,6 +521,7 @@ function showResult(r) {
   const bust = `?t=${Date.now()}`;
   $("img-overlay").src = `/api/jobs/${state.jobId}/artifact/overlay.jpg${bust}`;
   $("img-height").src = `/api/jobs/${state.jobId}/artifact/heightmap.png${bust}`;
+  $("img-slope").src = `/api/jobs/${state.jobId}/artifact/slopemap.png${bust}`;
   $("step-result").scrollIntoView({ behavior: "smooth" });
 }
 
@@ -628,14 +635,15 @@ window.addEventListener("DOMContentLoaded", async () => {
       : "";
     resetPolygon();
   });
-  markCanvas.addEventListener("mousedown", (ev) => {
+  markCanvas.addEventListener("pointerdown", (ev) => {
     if (!freehand || state.polygonClosed) return;
     ev.preventDefault();
+    markCanvas.setPointerCapture(ev.pointerId);
     fhDragging = true;
     state.polygon = [markCanvas.toOriginal(ev)];
     markCanvas.draw(markCanvas.decorator);
   });
-  markCanvas.addEventListener("mousemove", (ev) => {
+  markCanvas.addEventListener("pointermove", (ev) => {
     if (!fhDragging) return;
     const p = markCanvas.toOriginal(ev);
     const q = state.polygon[state.polygon.length - 1];
@@ -644,7 +652,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     state.polygon.push(p);
     markCanvas.draw(markCanvas.decorator);
   });
-  window.addEventListener("mouseup", () => {
+  window.addEventListener("pointerup", () => {
     if (!fhDragging) return;
     fhDragging = false;
     if (state.polygon.length >= 3) {

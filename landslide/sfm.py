@@ -178,6 +178,7 @@ class ReconCtx:
     scale: float = 1.0                # meters per model unit
     scale_info: dict = field(default_factory=dict)
     dense: dict | None = None         # {'points': (M,3), 'colors': (M,3)} model units
+    fingerprint: str = ""             # identifies this pose set; see build_ctx
 
     @property
     def scaled(self) -> bool:
@@ -444,7 +445,31 @@ def build_ctx(rec: pycolmap.Reconstruction, photos_dir: Path,
         except Exception:
             cols = np.full_like(pts, 128.0)
     return ReconCtx(rec=rec, views=views, sparse=pts, sparse_colors=cols,
-                    photos_dir=Path(photos_dir), workdir=Path(workdir))
+                    photos_dir=Path(photos_dir), workdir=Path(workdir),
+                    fingerprint=_recon_fingerprint(rec))
+
+
+def _recon_fingerprint(rec: pycolmap.Reconstruction) -> str:
+    """Identifies the current pose set (frame + registered images).
+
+    A dense-cloud cache built from one reconstruction is garbage in any other
+    frame (a rerun that lands on a different SfM attempt, a different subset
+    of registered images, or a bundle-adjustment nudge). Hashed over sorted
+    per-image poses plus the sparse point count so a stale cache is detected
+    instead of silently reused.
+    """
+    import hashlib
+    h = hashlib.sha1()
+    for image_id in sorted(rec.images):
+        img = rec.images[image_id]
+        if not _prop(img, "has_pose"):
+            continue
+        cfw = _prop(img, "cam_from_world")
+        h.update(img.name.encode())
+        h.update(np.asarray(cfw.rotation.matrix(), np.float64).tobytes())
+        h.update(np.asarray(cfw.translation, np.float64).tobytes())
+    h.update(str(len(rec.points3D)).encode())
+    return h.hexdigest()[:8]
 
 
 def image_metadata(ctx: ReconCtx) -> list[dict]:

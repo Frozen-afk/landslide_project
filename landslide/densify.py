@@ -90,8 +90,6 @@ def stereo_pair(va: ImageView, vb: ImageView, sparse: np.ndarray,
     w = min(img_a.shape[1], img_b.shape[1])
     img_a, img_b = img_a[:h, :w], img_b[:h, :w]
     Ka, Kb = Ka.copy(), Kb.copy()
-    Ka[0, 0] *= w / (2.0 * Ka[0, 2]); Ka[1, 1] *= h / (2.0 * Ka[1, 2])
-    Kb[0, 0] *= w / (2.0 * Kb[0, 2]); Kb[1, 1] *= h / (2.0 * Kb[1, 2])
 
     R_rel = vb.R @ va.R.T
     t_rel = (vb.t - R_rel @ va.t).reshape(3, 1)   # OpenCV 5 wants a column
@@ -274,15 +272,16 @@ def dense_cloud(ctx: ReconCtx, log: Log = print, max_pairs: int = 30,
     stereo_width sets the SGBM working resolution (see stereo_pair): 1280
     for finals, 640 for ~5x-faster previews at reduced accuracy.
     """
-    cache = ctx.workdir / ("dense.npz" if stereo_width == 1280
-                           else f"dense_{stereo_width}.npz")
+    cache = ctx.workdir / f"dense_{stereo_width}_{ctx.fingerprint}.npz"
     if ctx.dense is not None and not force:
         return ctx.dense
     if cache.exists() and not force:
         z = np.load(cache)
-        ctx.dense = {"points": z["points"], "colors": z["colors"]}
-        log(f"[dense] loaded cache: {len(ctx.dense['points'])} points")
-        return ctx.dense
+        if "fingerprint" in z and str(z["fingerprint"]) == ctx.fingerprint:
+            ctx.dense = {"points": z["points"], "colors": z["colors"]}
+            log(f"[dense] loaded cache: {len(ctx.dense['points'])} points")
+            return ctx.dense
+        log("[dense] cached cloud is from a different reconstruction, rebuilding")
 
     pairs = select_pairs(ctx, max_pairs=max_pairs)
     if not pairs:
@@ -351,7 +350,7 @@ def dense_cloud(ctx: ReconCtx, log: Log = print, max_pairs: int = 30,
     # ~1e-7 relative error is microns — invisible to volume integration
     pts = pts.astype(np.float32)
     ctx.dense = {"points": pts, "colors": cols}
-    np.savez_compressed(cache, points=pts, colors=cols)
+    np.savez_compressed(cache, points=pts, colors=cols, fingerprint=ctx.fingerprint)
     log(f"[dense] fused cloud: {len(pts)} points "
         f"(voxel {voxel:.4g}, scene extent {extent:.3g})")
     return ctx.dense

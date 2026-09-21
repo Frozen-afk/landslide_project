@@ -10,7 +10,7 @@ import numpy as np
 from PIL import Image, ImageOps
 
 from .densify import dense_cloud, estimate_up
-from .sfm import IMAGE_EXTS, ReconCtx, count_photos, reconstruct
+from .sfm import IMAGE_EXTS, ReconCtx, reconstruct
 from .volume import prism_volume, select_region
 from .viz import draw_overlay, draw_overlay_image, heat_slope, heat_topdown
 
@@ -127,7 +127,10 @@ def import_photos(sources: Iterable[Path], photos_dir: Path, max_side: int = 300
                                     max(1, round(im.height * s))),
                                    Image.LANCZOS)
                 name = f"{i:03d}_{src.stem}.jpg"
-                im.save(photos_dir / name, "JPEG", quality=jpeg_quality)
+                # keep EXIF (focal length, sensor model) so COLMAP seeds a real
+                # focal prior instead of defaulting to 1.2x the image diagonal
+                im.save(photos_dir / name, "JPEG", quality=jpeg_quality,
+                        exif=im.getexif().tobytes())
                 names.append(name)
                 metrics.append((*_photo_metrics(im), src))
         except Exception as e:
@@ -144,12 +147,6 @@ def import_photos(sources: Iterable[Path], photos_dir: Path, max_side: int = 300
     capture_gps([s for i, s in enumerate(sources) if i not in drop], kept,
                 photos_dir, log=log)
     return kept
-
-
-def ensure_reconstruction(photos_dir, workdir, log=print) -> ReconCtx:
-    if not count_photos(Path(photos_dir)):
-        raise ValueError(f"no photos in {photos_dir}")
-    return reconstruct(photos_dir, workdir, log=log)
 
 
 def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
@@ -199,7 +196,8 @@ def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
         if image_name not in ctx.views:
             raise ValueError(f"image '{image_name}' is not part of the reconstruction")
         view, uv, interior, rim = select_region(ctx, image_name, polygon,
-                                                rim_px, rim_inner_px)
+                                                rim_px, rim_inner_px,
+                                                extra_views=1)
         up = estimate_up(ctx.views, ctx.sparse)
         if dem is not None:
             R, t, surface = dem
@@ -292,7 +290,7 @@ def run_spec(spec: dict, log=print) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     work = out_dir / "work"
 
-    ctx = ensure_reconstruction(photos_dir, work, log=log)
+    ctx = reconstruct(photos_dir, work, reuse=True, log=log)
 
     sc = spec["scale"]
     if sc["method"] == "aruco":

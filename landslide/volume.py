@@ -472,6 +472,28 @@ def _neighbor_views(ctx: ReconCtx, image_name: str, k: int = 1):
     return [by_id[i] for _, i in scored[:k]]
 
 
+def _front_surface_mask(u: np.ndarray, depth: np.ndarray, width: int, height: int,
+                        cell_px: int = 4) -> np.ndarray:
+    """Coarse z-buffer occlusion test: keep points near the nearest depth in
+    their raster cell, drop points that project into the polygon but sit
+    behind the visible surface (e.g. terrain behind a hill, a marker board
+    behind the debris).
+    """
+    n = len(u)
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+    med = float(np.median(depth))
+    tol = max(0.02 * med, 1e-9)
+    nx = max(1, int(np.ceil(width / cell_px)) + 1)
+    ny = max(1, int(np.ceil(height / cell_px)) + 1)
+    ix = np.clip((u[:, 0] / cell_px).astype(np.int64), 0, nx - 1)
+    iy = np.clip((u[:, 1] / cell_px).astype(np.int64), 0, ny - 1)
+    flat = iy * nx + ix
+    front_depth = np.full(nx * ny, np.inf)
+    np.minimum.at(front_depth, flat, depth)
+    return depth <= front_depth[flat] + tol
+
+
 def select_region(ctx: ReconCtx, image_name: str, polygon, rim_px: float = 12.0,
                   rim_inner_px: float | None = None, extra_views: int = 0):
     """Split the cloud into interior/rim by projecting into the marked photo.
@@ -480,6 +502,12 @@ def select_region(ctx: ReconCtx, image_name: str, polygon, rim_px: float = 12.0,
     slightly inside the debris edge, so the band starts `rim_inner_px` out
     (default half the band width) to avoid sampling fallen material as
     "undisturbed ground".
+
+    Points behind the marked view's visible surface are excluded by a coarse
+    per-view z-buffer (`_front_surface_mask`) before the polygon test, so a
+    background object that merely projects inside the polygon line (terrain
+    behind a hill on an oblique photo) is not integrated as if it were the
+    debris surface.
 
     With extra_views > 0 the polygon mask is ANDed across the marked view and
     its most-covisible neighbours (poor-man's space carving): background
@@ -495,19 +523,23 @@ def select_region(ctx: ReconCtx, image_name: str, polygon, rim_px: float = 12.0,
     ring = np.ones(len(pts), dtype=bool)
     uv = None
     for i, v in enumerate(views):
-        u, _ = v.project(pts)
+        u, depth = v.project(pts)
         if i == 0:
             uv = u
-        finite = np.isfinite(u).all(axis=1)
+        finite = np.isfinite(u).all(axis=1) & (depth > 0)
         inside = np.zeros(len(pts), dtype=bool)
         near = np.zeros(len(pts), dtype=bool)
         if finite.any():
-            inside[finite] = points_in_polygon(u[finite], polygon)
-            # looser ring band in the secondary views: parallax shifts edge
-            # points between views, the band must not shave the rim itself
-            m = 1.0 if i == 0 else 2.0
-            d = ring_distance(u[finite], polygon)
-            near[finite] = (d >= inner * m) & (d <= (inner + rim_px) * m)
+            idx = np.flatnonzero(finite)
+            front = _front_surface_mask(u[idx], depth[idx], v.width, v.height)
+            visible = idx[front]
+            if len(visible):
+                inside[visible] = points_in_polygon(u[visible], polygon)
+                # looser ring band in the secondary views: parallax shifts edge
+                # points between views, the band must not shave the rim itself
+                m = 1.0 if i == 0 else 2.0
+                d = ring_distance(u[visible], polygon)
+                near[visible] = (d >= inner * m) & (d <= (inner + rim_px) * m)
         interior &= inside
         ring &= near
     rim = ring & ~interior
@@ -666,12 +698,29 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
         h = h - eval_quadratic(quad, uv2)     # heights above the curved datum
     elif tps is not None:
         h = h - eval_tps(tps, uv2)            # heights above the membrane
+    # cut depth is unbounded in principle (a scarp can legitimately run many
+    # meters below the datum) while fill above the datum rarely does, so the
+    # low-side cap widens to the region's own height spread (Tukey's 3xIQR
+    # extreme-outlier fence) instead of reusing the tight rim-noise cap —
+    # a stereo floater a few cm below sparse, real ground is still rejected,
+    # a genuine deep depression is not.
+    if max_above_datum is not None:
+        cap_low = cap
+    else:
+        iqr = float(np.percentile(h, 75) - np.percentile(h, 25))
+        cap_low = max(cap, 3.0 * abs(iqr))
     dropped = h > cap
+    dropped_low = h < -cap_low
     if dropped.any():
         log(f"[volume] dropping {int(dropped.sum())} points floating >{cap:.2f} m "
             f"above the datum (stereo outliers / background objects)")
-        interior = interior[~dropped]
-        h = h[~dropped]
+    if dropped_low.any():
+        log(f"[volume] dropping {int(dropped_low.sum())} points >{cap_low:.2f} m "
+            f"below the datum (stereo floaters below the surface)")
+    keep = ~(dropped | dropped_low)
+    if not keep.all():
+        interior = interior[keep]
+        h = h[keep]
     uv2 = (interior - c) @ basis.T            # in-plane 2D coords
 
     tri = Delaunay(uv2)
@@ -761,6 +810,7 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
         "n_rim_points": int(len(rim)) if rim is not None else 0,
         "n_rim_outliers": int((~inliers).sum()) if datum_pts is rim else 0,
         "n_high_dropped": int(dropped.sum()),
+        "n_low_dropped": int(dropped_low.sum()),
         "mean_height_m": float(h.mean()),
         "max_depth_m": float(-h.min()) if len(h) else 0.0,
         "max_height_m": float(h.max()) if len(h) else 0.0,

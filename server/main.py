@@ -40,6 +40,7 @@ from landslide.densify import dense_cloud  # noqa: E402
 from landslide.pipeline import import_photos, measure  # noqa: E402
 from landslide.scaling import aruco_scale, manual_scale  # noqa: E402
 from landslide.sfm import IMAGE_EXTS, count_photos, image_metadata, reconstruct  # noqa: E402
+from server.schemas import ArucoScaleRequest, ManualScaleRequest, MeasureRequest  # noqa: E402
 
 DATA_DIR = PROJECT_ROOT / "data" / "jobs"
 STATIC_DIR = Path(__file__).parent / "static"
@@ -405,12 +406,12 @@ def _attach_geo(job: Job) -> None:
 
 
 @app.post("/api/jobs/{job_id}/scale/aruco")
-def scale_aruco(job_id: str, spec: dict):
+def scale_aruco(job_id: str, spec: ArucoScaleRequest):
     job = _get_ready_job(job_id)
     try:
-        info = aruco_scale(job.ctx, side_m=float(spec.get("side_m", 0.25)),
-                           dict_name=spec.get("dict", "auto"),
-                           marker_id=spec.get("id"), log=job.say)
+        info = aruco_scale(job.ctx, side_m=spec.side_m,
+                           dict_name=spec.dict_name,
+                           marker_id=spec.id, log=job.say)
         job.scale_info = {k: v for k, v in info.items() if k != "marker_px"}
         _attach_geo(job)
         job.save_state()
@@ -421,11 +422,11 @@ def scale_aruco(job_id: str, spec: dict):
 
 
 @app.post("/api/jobs/{job_id}/scale/manual")
-def scale_manual(job_id: str, spec: dict):
+def scale_manual(job_id: str, spec: ManualScaleRequest):
     job = _get_ready_job(job_id)
     try:
-        a, b = spec["a"], spec["b"]
-        info = manual_scale(job.ctx, a, b, float(spec["length_m"]), log=job.say)
+        info = manual_scale(job.ctx, spec.a.model_dump(), spec.b.model_dump(),
+                            spec.length_m, log=job.say)
         job.scale_info = info
         _attach_geo(job)
         job.save_state()
@@ -493,19 +494,17 @@ def _job_dem(job: Job):
 
 
 @app.post("/api/jobs/{job_id}/measure")
-def run_measure(job_id: str, spec: dict):
+def run_measure(job_id: str, spec: MeasureRequest):
     job = JOBS.get(job_id)
     if job is None:
         raise HTTPException(404, "unknown job")
     if job.status in ("measuring", "orthorectifying"):
         raise HTTPException(409, "the server is busy on this job")
-    polygon = spec.get("polygon") or []
-    if len(polygon) < 3:
+    if len(spec.polygon) < 3:
         raise HTTPException(400, "polygon needs at least 3 points")
     if not (job.scale_info or {}).get("applied"):
         raise HTTPException(400, "set the scale (reference object) first")
-    mode = spec.get("mode", "photo")
-    if mode == "ortho" and not job.ortho:
+    if spec.mode == "ortho" and not job.ortho:
         raise HTTPException(400, "generate the top-down view first")
     job.ensure_ctx()
     with job.lock:
@@ -516,12 +515,13 @@ def run_measure(job_id: str, spec: dict):
     return {"queued": True}
 
 
-def _run_measure(job: Job, spec: dict):
+def _run_measure(job: Job, spec: MeasureRequest):
     try:
-        res = measure(job.ctx, spec.get("image"), spec["polygon"],
-                      dense=bool(spec.get("dense", True)),
-                      rim_px=float(spec.get("rim_px", 12.0)),
-                      mode=spec.get("mode", "photo"),
+        res = measure(job.ctx, spec.image, spec.polygon,
+                      dense=spec.dense,
+                      rim_px=spec.rim_px,
+                      rim_inner_px=spec.rim_inner_px,
+                      mode=spec.mode,
                       ortho=job.ortho,
                       dem=_job_dem(job),
                       artifacts_dir=job.dir / "artifacts", log=job.say)

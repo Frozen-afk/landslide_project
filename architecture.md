@@ -40,7 +40,7 @@ current tree). For the upgrade roadmap see `implementation_plan.md`.
                                                     ▼
  data/jobs/<job_id>/
    photos/           EXIF-normalised JPEGs (000_name.jpg …), gps.json
-   work/             database.db, sparse/0/, dense.npz (or dense_<w>.npz), enhanced/
+   work/             database.db, sparse/0/, dense_<w>_<fingerprint>.npz, enhanced/
    artifacts/        ortho.jpg, ortho.json, overlay.jpg, heightmap.png, slopemap.png, pointcloud.ply
    state.json        status, error, log tail, scale_info, result, ortho meta, dem_info
    dem.xyz           uploaded prior DEM (optional)
@@ -57,7 +57,7 @@ GIL in C++, so two jobs run concurrently on the `ThreadPoolExecutor(max_workers=
 | 1. Upload | `POST /api/jobs` | `pipeline.import_photos` | `photos/*.jpg`, `gps.json` |
 | 2. Reconstruct | auto after upload (executor) | `sfm.reconstruct` | `work/database.db`, `work/sparse/`, `ReconCtx` |
 | 3. Scale | `POST …/scale/aruco` or `…/scale/manual` | `scaling.aruco_scale` / `manual_scale` | `ctx.scale`, `scale_info` |
-| 4a. Ortho (optional) | `POST …/ortho` | `densify.dense_cloud` → `ortho.render_orthophoto` | `dense.npz`, `ortho.jpg`, `ortho.json` |
+| 4a. Ortho (optional) | `POST …/ortho` | `densify.dense_cloud` → `ortho.render_orthophoto` | `dense_<w>_<fp>.npz`, `ortho.jpg`, `ortho.json` |
 | 4b. Prior DEM (optional) | `POST …/dem` | `dem.load_dem` → `dem.align_to_dem` | `dem.xyz`, `dem_info` (R, t, rms) |
 | 5. Mark | browser canvas | `app.js` polygon state | polygon in stored-photo px or ortho px |
 | 6. Measure | `POST …/measure` | `pipeline.measure` → `volume.prism_volume` or `volume.dem_volume` | result dict, artifacts |
@@ -101,7 +101,8 @@ is rebuilt lazily from the COLMAP cache on first touch (`Job.ensure_ctx`, `:142`
 | `landslide/cli.py` | 120 | `run`, `marker`, `spec-template`, `change` |
 | `landslide/mkmarker.py` | 61 | printable ArUco marker PNG + exact-size HTML |
 | `server/main.py` | 642 | FastAPI routes, Job class, LRU caches, persistence |
-| `server/static/app.js` | 717 | UI state, canvas tracing, polling, result rendering |
+| `server/schemas.py` | 33 | Pydantic request models (scale, measure) |
+| `server/static/app.js` | 725 | UI state, canvas tracing, polling, result rendering |
 | `server/static/capture.html` | 123 | client-side live capture quality helper |
 | `tools/synth.py` | 268 | synthetic ground-truth scene generator |
 | `tests/` | ~1.9k | 73 tests: unit (geometry, volume, scaling, dem, densify, enhance, segment, geo, import, ortho) + slow e2e |
@@ -185,18 +186,25 @@ positive depth in both cameras; warnings at 8 px, 1.5°, <50 px reference length
    farther than `max(5·voxel, 2·sparse spacing, 2 % extent)` from any sparse point;
    cap at 2.5 M points by growing the voxel (`_cap_voxel`); **surface-normal filter**
    (`surface_filter`, k=16 PCA normals in 300 k chunks) keeps points whose normal is within
-   ~75° of `up`; store float32; cache to `work/dense.npz` (`dense_<w>.npz` for non-1280).
+   ~75° of `up`; store float32; cache to `work/dense_<w>_<fp>.npz`, keyed to a
+   fingerprint of the sparse reconstruction (sorted per-image poses + point
+   count) so a rerun that lands on a different SfM attempt or pose set can't
+   silently reuse a cloud from the old frame.
 4. **Up vector** (`estimate_up`, `:205`): normal of the least-squares plane through camera
    centres, sign chosen so it points from the sparse centroid toward the cameras.
 
 ### 3.5 Region selection
 
 **Photo mode** (`volume.select_region`, `:475`): project the whole cloud into the marked view
-(`ImageView.project` uses `cv2.projectPoints` with distortion); `interior` =
-`points_in_polygon` (matplotlib `Path.contains_points`); `rim` = ring distance to polygon
-edges in `[inner, inner + rim_px]` (default inner = rim_px/2 = 6 px, rim_px = 12 px) and not
-interior. Optional `extra_views` ANDs masks across covisible neighbours (never enabled by
-`measure`).
+(`ImageView.project` uses `cv2.projectPoints` with distortion, returning depth too); points
+with `depth <= 0` are dropped, and a coarse per-view z-buffer (`_front_surface_mask`, 4px
+raster cells, keeps points within 2% of median depth of the nearest depth in their cell)
+excludes points that project inside the polygon but sit behind the visible surface (terrain
+behind a ridge, a marker board behind the debris) before `interior` = `points_in_polygon`
+(matplotlib `Path.contains_points`) is evaluated; `rim` = ring distance to polygon edges in
+`[inner, inner + rim_px]` (default inner = rim_px/2 = 6 px, rim_px = 12 px) and not interior.
+`extra_views=1` (set by `measure`) ANDs the mask across the marked view and its most-covisible
+neighbour (poor-man's space carving).
 
 **Ortho mode** (`ortho.py`): `render_orthophoto` projects the metric cloud onto the ground
 basis `(e1, e2) ⟂ up`, `res = span / 1400 px`, keeps the highest point per pixel, draws a
@@ -227,7 +235,10 @@ Datum labels: `rim_plane`, `rim_quad`, `rim_tps`, `surface_plane`, `dem`, `prior
 
 ### 3.7 Volume integration — `volume.prism_volume` (`:517`)
 
-* Heights `h = (p − c)·n − datum(u,v)`; drop points with `h > max(1.5 m, 8σ)` (floaters).
+* Heights `h = (p − c)·n − datum(u,v)`; drop points with `h > max(1.5 m, 8σ)` (floaters
+  above); drop points with `h < −max(high_cap, 3×IQR(h))` (floaters below — the low-side cap
+  widens to the region's own height spread so a genuine deep cut isn't clipped like a stray
+  stereo point would be).
 * `scipy.spatial.Delaunay` on (u,v); per triangle `V = area × mean(h_vertices)`.
 * **Bridging cull**: drop triangles with any edge `> max(20 × median spacing, 0.5 × region
   diameter)`; warn when >5 % of area is dropped.
@@ -267,15 +278,17 @@ Datum labels: `rim_plane`, `rim_quad`, `rim_tps`, `surface_plane`, `dem`, `prior
 | Context LRU | `MAX_LOADED_CTX = 2`, `_evict_ctx` skips busy jobs, `gc.collect()` | 2 clouds in RAM |
 | Photo thumbnail LRU | `_photo_cache`, `MAX_PHOTO_CACHE = 150` | encoded JPEG bytes |
 | Executor | `ThreadPoolExecutor(2)` | 2 concurrent heavy jobs |
-| Dense cache | `work/dense.npz` / `dense_<w>.npz` (compressed) | rebuilt only with `force=True` |
+| Dense cache | `work/dense_<w>_<fp>.npz` (compressed) | rebuilt only with `force=True` or a fingerprint mismatch |
 | Log tail | `Job.log[-400:]` persisted, `[-60:]` in snapshots | |
 
 ---
 
 ## 4. HTTP API — `server/main.py`
 
-All bodies are JSON unless noted; request bodies are accepted as untyped `dict`
-(no Pydantic models). Errors return `{"detail": "<message>"}`.
+All bodies are JSON unless noted; scale and measure bodies are typed Pydantic models
+(`server/schemas.py`: `ArucoScaleRequest`, `ManualScaleRequest`, `MeasureRequest`) so
+malformed input is rejected with a 422 instead of crashing inside numpy. Errors return
+`{"detail": "<message>"}`.
 
 | Method & path | Body / params | Response | Errors |
 | --- | --- | --- | --- |
@@ -333,7 +346,7 @@ reproj_px_max, angle_deg, scale_rel_error, warnings[]`.
 ```
 net_volume_m3 cut_volume_m3 fill_volume_m3 area_m2
 datum ∈ {rim_plane, rim_quad, rim_tps, surface_plane, dem, prior_epoch}
-datum_rms_m est_volume_error_m3 n_points n_rim_points n_rim_outliers n_high_dropped
+datum_rms_m est_volume_error_m3 n_points n_rim_points n_rim_outliers n_high_dropped n_low_dropped
 mean_height_m max_depth_m max_height_m
 max_slope_deg mean_slope_deg area_steep_m2
 lod_m lod_max_m sig_area_frac warnings[]
@@ -368,12 +381,15 @@ scale, geo{origin_llh, n_fixes, gps_residual_median_m, gps_scale_vs_marker}|null
   (`toOriginal`). Decorators draw in stored px scaled by `view.scale / k`. Ortho canvas
   uses `k = 1` so polygons are in ortho pixels.
 * Tracing modes: click-to-add vertex, Undo, Close (≥3 vertices), Clear, Freehand
-  (mousedown/mousemove/mouseup; thinned to ≤500 vertices). Mouse events only.
+  (pointerdown/pointermove/pointerup, `touch-action: none`; thinned to ≤500 vertices) —
+  Pointer Events, so touch tracing works on the phones the photos come from. Canvas backing
+  store is sized once per image load (`loadURL`/`load`), not reallocated every `draw()` call.
 * Auto-detect fills `state.polygon` from the largest returned region.
 * Polling (`poll`, `:132`): 1.2 s `setTimeout` loop until status leaves
   `reconstructing|measuring|orthorectifying` (and `images` are present).
-* Result table (`showResult`, `:470`): volumes, area, depth, datum name, uncertainty,
-  swell factor rows, warnings box, `overlay.jpg` and `heightmap.png` (cache-busted).
+* Result table (`showResult`, `:470`): volumes, area, depth, datum name (all six `datum`
+  values named), uncertainty, swell factor rows, warnings box, `overlay.jpg`,
+  `heightmap.png` and `slopemap.png` (cache-busted).
 * Job list chips, delete, resume via `localStorage["lsv-last-job"]`.
 * `capture.html`: independent page running Laplacian variance, clip fraction and dHash
   on the live camera at ~5 fps to coach capture quality.

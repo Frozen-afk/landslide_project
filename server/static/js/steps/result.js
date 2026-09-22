@@ -12,6 +12,12 @@ const datumNames = {
   prior_epoch: "earlier-epoch surface (change detection)",
 };
 
+const statusLabels = {
+  ok: "ok — gates passed",
+  indicative: "indicative — see reasons below",
+  rejected: "rejected — see reasons below",
+};
+
 export function showResult(r) {
   $("step-result").classList.remove("hidden");
   state.lastResult = r;
@@ -26,7 +32,14 @@ export function showResult(r) {
     ? `${ci[0].toFixed(1)} – ${ci[1].toFixed(1)} m³ (95% CI)`
     : `± ${r.est_volume_error_m3.toFixed(0)} m³`;
 
-  const rows = [
+  const rows = [];
+  // G8: status/reasons (A3) up front — a confident number with no coverage
+  // or calibration context is exactly what let past runs hide a 40-60%
+  // unobserved void behind a "1.7% error" (see REMAINING_ACCURACY_PLAN.md).
+  if (r.status) {
+    rows.push(["status", statusLabels[r.status] || r.status]);
+  }
+  rows.push(
     ["net volume (fill − cut)", `${r.net_volume_m3.toFixed(1)} m³`],
     ["cut (depression below rim)", `${r.cut_volume_m3.toFixed(1)} m³`],
     ["fill (material above rim)", `${r.fill_volume_m3.toFixed(1)} m³`],
@@ -35,7 +48,21 @@ export function showResult(r) {
     ["datum", datumNames[r.datum] || r.datum],
     ["datum rms residual", `${r.datum_rms_m.toFixed(2)} m`],
     ["net volume uncertainty", uncertainty],
-  ];
+  );
+  if (typeof r.cut_upper_m3 === "number" && r.bridged_area_m2 > 0) {
+    rows.push(["cut, upper bound (unmeasured area at max depth)",
+              `${r.cut_upper_m3.toFixed(1)} m³`]);
+  }
+  if (r.region_method) {
+    rows.push(["region selection", r.region_method]);
+  }
+  if (typeof r.coverage_frac === "number") {
+    rows.push(["coverage of traced region", `${(r.coverage_frac * 100).toFixed(0)}%`
+      + (r.largest_void_m2 ? ` (largest gap ${r.largest_void_m2.toFixed(1)} m²)` : "")]);
+  }
+  if (typeof r.hit_frac === "number") {
+    rows.push(["ray-cast hit fraction", `${(r.hit_frac * 100).toFixed(0)}%`]);
+  }
   if (typeof r.volume_raster_m3 === "number") {
     rows.push(["raster cross-check (independent)", `${r.volume_raster_m3.toFixed(1)} m³`]);
   }
@@ -57,7 +84,8 @@ export function showResult(r) {
   $("result-table").innerHTML =
     "<table>" + rows.map((x) => `<tr><td>${x[0]}</td><td><b>${x[1]}</b></td></tr>`).join("") + "</table>";
 
-  const warns = r.warnings || [];
+  const reasons = r.reasons || [];
+  const warns = (r.status && r.status !== "ok" ? reasons : []).concat(r.warnings || []);
   const wb = $("result-warnings");
   if (warns.length) {
     wb.classList.remove("hidden");

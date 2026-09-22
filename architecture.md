@@ -278,18 +278,35 @@ positive depth in both cameras; warnings at 8 px, 1.5°, <50 px reference length
 
 **Photo mode, ground-frame (T1.2, primary path)** — `ground.select_region_ground`: the traced
 polygon is cast OUT of the photo onto a top-down DSM instead of projecting the cloud INTO the
-photo. `ground.build_dsm` rasters the metric cloud's highest point per cell (cell = 2.5×
-point spacing, `estimate_cell_size`); `cast_polygon_to_ground` densifies each polygon edge
-into ≤25 px segments, builds a world-space camera ray per (densified) vertex
-(`undistort_normalized` → direction → `d_cam @ R`), and marches it outward from the
-(scale-corrected) camera center to find where its height first crosses at-or-below the DSM's
-surface height at the ray's own (u, v) — a linear-interpolated crossing between the two
-bracketing samples. Vertices whose ray never crosses (open sky, off the reconstructed
-footprint) are dropped; the ground polygon is handed to `ortho.select_region_world` (shared
-with ortho-mode tracing) for the interior/rim masks in true ground coordinates — no
-parallax, same rim-annulus-in-metres treatment as ortho mode. Falls back to the legacy
-image-plane method below when the ray-cast resolves under 70% of the (densified) vertices
-(steep oblique angle, or too sparse a cloud for the DSM to have continuous coverage).
+photo. `ground.build_dsm` rasters the metric cloud's MEDIAN point height per cell (RC2/A2 —
+was max-height, which sat 0.4-0.6 m above real ground on any slope/texture, shifting the
+ray-cast hit 1.2-1.7 m toward the camera at a typical 19° elevation); the cell size
+(`estimate_cell_size`) is `clip(4×median point spacing, 0.1, 0.5)` m (RC2/A2 — the earlier
+"grow the cell until the DSM's own occupied-cell fraction clears 50%" design measured
+occupancy over the cloud's BOUNDING BOX, not its real footprint, so the cell always grew to
+its 2 m hard cap on every 21-view preset regardless of the cloud's actual 3-5 cm point
+spacing). `ground.fill_dsm_holes` then fills each empty cell from its nearest cell WITH data
+(`scipy.ndimage.distance_transform_edt`), but only within 2 m — a gap wider than that is a
+genuine coverage hole and stays a hole so the ray-cast still reports it as a miss.
+`cast_polygon_to_ground` densifies each polygon edge into ≤25 px segments, builds a
+world-space camera ray per (densified) vertex (`undistort_normalized` → direction →
+`d_cam @ R`), and marches it outward from the (scale-corrected) camera center in `cell / 2`
+steps (tied to the DSM's own resolution) to find where its height first crosses at-or-below
+the DSM's surface height at the ray's own (u, v) — a linear-interpolated crossing between the
+two bracketing valid samples, tolerant of a residual NaN run of up to 8 cells between them.
+Returns `(ground_polygon, hit_frac, longest_miss_run)` — `longest_miss_run` (G5) is the
+longest CIRCULAR run of consecutive missed vertices, which a flat `hit_frac` hides (e.g.
+descending misses in two runs of 6 and 5 rather than scattered singletons — one whole stretch
+of the boundary closes across a gap). Vertices whose ray never crosses (open sky, off the
+reconstructed footprint, or a gap wider than the tolerance) are dropped; the ground polygon is
+handed to `ortho.select_region_world` (shared with ortho-mode tracing) for the interior/rim
+masks in true ground coordinates — no parallax, same rim-annulus-in-metres treatment as ortho
+mode. Falls back to the legacy image-plane method below when the ray-cast resolves under 50%
+of the (densified) vertices — a steep/oblique capture path genuinely caps the achievable hit
+fraction below that on some geometry, and the partial-but-parallax-free ground-frame selection
+still measurably beats the image-plane fallback there; `pipeline.measure`'s G5 gate (§3.9)
+separately reports the achieved `hit_frac`/`longest_miss_run` as `status="indicative"` even
+when ground-frame selection was used successfully.
 
 **Photo mode, image-plane fallback** (`volume.select_region`, `:497`): project the whole
 cloud into the marked view (`ImageView.project` uses `cv2.projectPoints` with distortion,
@@ -337,9 +354,24 @@ Datum labels: `rim_plane`, `rim_quad`, `rim_tps`, `surface_plane`, `dem`, `prior
   widens to the region's own height spread so a genuine deep cut isn't clipped like a stray
   stereo point would be).
 * `scipy.spatial.Delaunay` on (u,v); per triangle `V = area × mean(h_vertices)`.
-* **Bridging cull**: drop triangles with any edge `> max(20 × median spacing, 0.5 × region
-  diameter)`; warn when >5 % of area is dropped.
-* `fill = Σ V(h>0)`, `cut = −Σ V(h<0)`, `net = fill − cut`, `area = Σ kept area`.
+* **Bridging cull** (RC1/A1): drop triangles with any edge `> max(20 × median spacing, 0.5 m)`
+  — the old `0.5 × region diameter` term let the TIN silently bridge an entire 30-60 m²
+  unobserved back-facing slope with a handful of long triangles and report one confident
+  number for ground nobody actually measured (measured: 40-62% real occupancy inside the
+  traced polygon on every synthetic preset, including the "accurate" ones — the low point
+  error was interpolation luck on a smooth synthetic terrain, not real measurement); warn when
+  >5 % of area is dropped. `area_measured_m2`/`bridged_area_m2`/`cut_measured_m3` report what
+  survived the cull; `cut_upper_m3 = cut_measured + (polygon_area − area_measured) ×
+  max_depth_measured` is the upper bound if the unmeasured part were as deep as the deepest
+  measured point — the honest range in place of a single silently-interpolated number.
+* `fill = Σ V(h>0)`, `cut = −Σ V(h<0)`, `net = fill − cut`, `area = area_measured = Σ kept area`.
+* **Coverage gate** (G6, RC1/A1, `_coverage_gate`): independent of the TIN — when the caller
+  passes `polygon_ground` (the traced polygon in metric ground coordinates, available for
+  ground-frame photo mode and ortho mode), a 0.25 m occupancy grid of the polygon interior
+  reports `coverage_frac` (share of in-polygon cells holding ≥1 point) and `largest_void_m2`
+  (biggest connected empty patch, via `scipy.ndimage.label`) — the number the bridging cull
+  was silently hiding, now measured directly on the traced footprint rather than inferred from
+  which triangles got dropped.
 * **Slope stats** (`slope_stats`, `:163`): bin to cells of `clip(2.5·spacing, 0.05, 1.0) m`
   (≥3 points), `np.gradient`, report max/mean slope and area >35°.
 * **LoD** (`_lod_per_triangle`, `:429`): per-point k=9 local-plane residual
@@ -367,14 +399,59 @@ Datum labels: `rim_plane`, `rim_quad`, `rim_tps`, `surface_plane`, `dem`, `prior
   never the TPS membrane, too expensive to refit 50×) and recompute the fast raster net; the
   2.5/97.5 percentile spread **around that resample distribution's own median** (so the
   raster's systematic gap from the TIN cancels out) becomes `(lo_offset, hi_offset)`, applied
-  around the primary TIN `net` as `net_volume_ci95_m3`. `pipeline.measure` widens it
-  symmetrically by the scale error and sets `est_volume_error_m3 = max(net−lo, hi−net)`;
-  falls back to the old `σ_datum·area + 2·scale_rel_error·|net|` heuristic when no CI was
-  computed (surface-fallback datum, <15 rim points, or too few valid resamples).
+  around the primary TIN `net` as `net_volume_ci95_m3`. A coverage term is added in
+  quadrature (A4): `(polygon_area − area_measured) × mean|h|` when the G6 coverage gate ran,
+  else the older `unmeasured_area_m2 × max|h|` raster proxy — the G6 gap is the more honest
+  figure (the raster's `unmeasured_area` only flags cells with literally no nearby data,
+  missing the much larger "bridged, not observed" gap the tighter RC1 cull now excludes from
+  `area_measured`); `mean|h|` instead of the old `max|h|` so one deep outlier point doesn't
+  dominate a term meant to bound a plausible unseen patch. `pipeline.measure` widens the result
+  symmetrically by the scale error and sets `est_volume_error_m3 = max(net−lo, hi−net)`; falls
+  back to the old `σ_datum·area + 2·scale_rel_error·|net|` heuristic when no CI was computed
+  (surface-fallback datum, <15 rim points, or too few valid resamples).
 
 `dem_volume` (`:303`) shares the TIN / bridging / slope / LoD machinery but uses
 `h = z_surface − DEM(x,y)`; requires ≥60 % of the region on the DEM. No raster cross-check or
 bootstrap CI (no rim to resample).
+
+### 3.8a Quality gates and status — `gates.py` (A3)
+
+`pipeline.measure` calls `gates.evaluate_gates(ctx, res, region_method)` after every other
+field is computed and sets `res["status"] ∈ {ok, indicative, rejected}` (worst gate wins) and
+`res["reasons"]` (one string per gate that fired). Gates are detectors surfacing a risk the
+plan's own algorithmic mitigations would otherwise reduce further (A7 EXIF focal-lock, A8
+vertical-baseline stereo, A6 per-camera deregistration are **not implemented** — see
+REMAINING_ACCURACY_PROGRESS.md for why), not the mitigations themselves:
+
+* **G1 dense cloud used**: `rejected` when `res["cloud"] != "dense"` or the dense cloud has
+  <20 000 points (nadir's stereo-pair baseline-swap bug, RC4, still returns an empty dense
+  cloud and silently falls back to the sparse one — G1 is what turns that into a visible
+  rejection instead of a confident number on 3k sparse points).
+* **G2 marker/scale quality**: `scaling.aruco_scale` now itself **raises** when the four
+  triangulated marker sides disagree by >10% (`side_spread_rel`) or the reprojection-implied
+  scale uncertainty exceeds 10% — a grazing-angle or blurred marker detection no longer
+  silently produces an applied-but-wrong scale (nadir: 33% spread, was silently applied and
+  ~40% wrong). The 5–10% band is a soft warning (`scale_info["warnings"]`, also added to
+  `manual_scale`'s existing pattern); G2 turns any such warning into `indicative`.
+* **G3 per-camera sanity** (detection only): `indicative` when `sfm.reconstruct`'s own
+  best-attempt focal-spread check (`_focal_spread` > `FOCAL_SPREAD_RATIO_BAD`, already logged
+  to `ctx.warnings` before this gate exists) fired.
+* **G4 focal constraint**: `indicative` when `sfm._camera_center_collinearity(ctx.rec) < 0.10`
+  — a (near-)collinear capture path (`collinear`, `nadir`) leaves per-camera focal
+  self-calibration geometrically underconstrained regardless of how any one run happened to
+  converge.
+* **G5 ray-cast integrity** (photo mode): `indicative` when the image-plane fallback was used
+  at all, or ground-frame selection's `hit_frac < 0.85` or `max_miss_run > 3`;`rejected` below
+  `hit_frac < 0.5`. `hit_frac`/`max_miss_run` are always included in the result when
+  ground-frame selection ran.
+* **G6 coverage**: from `volume.prism_volume`'s `coverage_frac`/`largest_void_m2` (§3.7) —
+  `ok` ≥0.85 coverage and ≤2 m² void, `indicative` ≥0.6, else `rejected`.
+* **G7 scale honesty floor** (`pipeline.measure`): `scale_rel_error = max(reported, 0.03)`
+  unless the ArUco per-view PnP cross-check spread is ≤2% (an actual second, independent scale
+  estimate agreeing closely) — a single marker/click measurement rarely earns <3% honestly.
+* **G8 UI** (`server/static/js/steps/result.js`): `status`, `reasons`, `region_method`,
+  `hit_frac`, `coverage_frac`/`largest_void_m2`, `cut_upper_m3` are shown in the result table;
+  gate reasons are folded into the existing warnings panel when `status != "ok"`.
 
 ### 3.8 Prior DEM and change monitoring — `dem.py`, `change.py`
 
@@ -564,18 +641,19 @@ Umeyama, photo/ortho volume error, cloud RMS to the analytic GT surface, runtime
 RSS via `resource.getrusage`), degrading a single column to `n/a: <reason>` rather than
 failing the whole row when one preset misbehaves.
 
-`tests/test_e2e_presets.py` (`@pytest.mark.slow`, registered in `pytest.ini`, excluded
-from the default `-k "not e2e"` fast run same as `test_e2e_synth.py`) pins real,
-observed thresholds for the presets actually benchmarked before this pass ended:
+`tests/test_e2e_presets.py` (excluded from the default `-k "not e2e"` fast run, same as
+`test_e2e_synth.py`) covers all seven non-`arc` presets. Since the RC1/A1 bridging-cull
+fix (see REMAINING_ACCURACY_PROGRESS.md), `cut_volume_m3` is a measured-only lower bound
+on every preset (40-62% real occupancy inside the traced polygon on this benchmark scene),
+so thresholds are no longer a tight single-number tolerance against truth; they assert the
+plan's own range criterion (`cut_measured_m3 ≤ truth ≤ cut_upper_m3`) plus the `status`
+gate (`gates.py`, §3.8a) each preset's measured coverage implies:
 
-| preset | registered | scale err | photo vol err | ortho vol err | cloud RMS | note |
-| --- | --- | --- | --- | --- | --- | --- |
-| sparse8 | 8/8 | 0.05 % | 22.7 % | 11.2 % | 0.36 m | plan's naive 45%-overlap formula gave `yaw_span=160°` (2/8 registered); retuned to 64° (8°/step) for 8/8 |
-| nadir | 21/21 | 40.5 % (known-bad) | 24.5 % | 56.9 % | 43.75 m | the scene's ArUco board is **vertical** (see `MARKER`), near-invisible to a straight-down camera — a real, documented gap (needs a horizontal ground marker for true nadir sets), not something T3.3 was scoped to fix |
-
-`oblique60`, `descending`, `collinear`, `lowtex`, `distorted` have working generator code
-and a GT-polygon-in-frame check, but were not run to completion before this pass was
-told to stop — their `test_e2e_presets.py` cases are `pytest.mark.skip`'d with the exact
-command to un-skip once benchmarked (each full run costs several CPU-minutes of
-SfM+dense+measure). Un-skip and pin thresholds as the next step before trusting those
-five presets' numbers.
+| preset | registered | status | coverage_frac | note |
+| --- | --- | --- | --- | --- |
+| arc, lowtex, distorted | 21/21 | indicative | 60-62% | clean SfM (focal spread ~1.0×); measured/upper-bound range contains truth |
+| sparse8 | 8/8 | rejected | 45-48% | partial ray-cast (`hit_frac` 0.86-0.91); small-N reconstruction shows some run-to-run coverage variance |
+| collinear | 21/21 | rejected | ~58% | collinear camera path (G4) + coverage just under G6's 0.6 rejection floor |
+| descending | 20/21 | rejected | ~47% | degenerate low cameras (RC3); `test_descending_focal_spread_is_tight` can fail on a re-built reconstruction — see REMAINING_ACCURACY_PROGRESS.md §6 (pre-existing `sfm.py` ladder gap, not fixed by this pass) |
+| nadir | 21/21 | rejected | — | `aruco_scale` now raises outright (marker side spread >10%, G2) before any volume is computed |
+| oblique60 | 21/21 | — | — | unchanged: `aruco_scale` still raises (marker visible in only one photo) |

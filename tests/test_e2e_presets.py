@@ -22,17 +22,6 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data" / "bench"
 
 
-def _umeyama_scale(P, Q):
-    cp, cq = P.mean(0), Q.mean(0)
-    H = (P - cp).T @ (Q - cq)
-    U, S, Vt = np.linalg.svd(H)
-    d = np.sign(np.linalg.det(Vt.T @ U.T))
-    s = (S * [1, 1, d]).sum() / ((P - cp) ** 2).sum()
-    R = Vt.T @ np.diag([1, 1, d]) @ U.T
-    t = cq - s * R @ cp
-    return s, R, t
-
-
 def _gen(preset: str):
     d = DATA / preset
     if not (d / "ground_truth.json").exists():
@@ -95,13 +84,17 @@ def test_sparse8_volume(sparse8):
     truth = gt["volume_true_polygon_m3"]
     res = measure(ctx, gt["polygon_image"], gt["polygon_px"], dense=True,
                   rim_px=14.0, artifacts_dir=d / "artifacts", log=print)
-    rel_err = abs(res["cut_volume_m3"] - truth) / truth
-    # measured 22.7% on 8 views / 64° yaw span (vs arc's ~7-8% on 21 views) —
-    # fewer views genuinely costs accuracy; this pins that real number, not
-    # an aspirational one.
-    print(f"\nSPARSE8 VOLUME: cut {res['cut_volume_m3']:.1f} vs truth {truth:.1f} "
-          f"({rel_err * 100:.1f}%)")
-    assert rel_err < 0.35, f"cut {res['cut_volume_m3']:.1f} vs truth {truth:.1f}"
+    print(f"\nSPARSE8 VOLUME: cut_measured {res['cut_measured_m3']:.1f}, "
+          f"cut_upper {res['cut_upper_m3']:.1f}, truth {truth:.1f}, "
+          f"status {res['status']}, coverage {res.get('coverage_frac')}")
+    # RC1/A1: 8 views + a partial ray-cast hit fraction leaves ~45% coverage
+    # of the traced polygon (measured, not the old bridged/interpolated
+    # number) — G6 correctly reads that as status=rejected, not a tight
+    # point-error target. Acceptance criterion is §7.1's honest range.
+    assert res["cut_measured_m3"] <= truth <= res["cut_upper_m3"], (
+        f"truth {truth:.1f} outside [{res['cut_measured_m3']:.1f}, "
+        f"{res['cut_upper_m3']:.1f}]")
+    assert res["status"] in ("indicative", "rejected")
 
 
 # ------------------------------------------------------------------ nadir --
@@ -120,32 +113,25 @@ def test_nadir_registers_all_views(nadir):
     assert len(ctx.views) == 21
 
 
-def test_nadir_scale_is_known_bad(nadir):
-    """Known limitation, not a regression target: aruco_scale still finds
-    *a* detection from the oblique edge of the flight line (camera line is
-    offset 7.5 m in y from the marker board, altitude 20 m -> ~21° grazing
-    angle onto the board face), but it's badly wrong (measured ~40% error
-    against the camera-center Umeyama reference) because so few views see
-    the board well. A real nadir/drone survey needs a horizontal ground
-    marker, not this scene's vertical board — that's a synth.py scene-design
-    change, out of scope for T3.3 (which characterizes current behavior,
-    not fixes geometry). This test pins "doesn't crash, stays badly-scaled"
-    so a future scale-path change is forced to notice this case explicitly.
+def test_nadir_scale_rejected(nadir):
+    """G2 (RC4/A3): aruco_scale now REFUSES a marker whose 4 triangulated
+    sides disagree by >10% after triangulation, instead of silently applying
+    a badly-wrong scale. Nadir's vertical ArUco board is exactly this case —
+    camera line offset 7.5 m in y from the board, altitude 20 m -> ~21°
+    grazing angle, so few views see it well and the triangulated square is
+    far from square (measured 33-43% side spread across runs). A real
+    nadir/drone survey needs a horizontal ground marker, not this scene's
+    vertical board — that's a synth.py scene-design change, out of scope
+    here (T3.3 characterizes current behavior). Previously this silently
+    produced a ~40-60% wrong scale that `measure()` would apply with no
+    warning surfaced to the user; now the bad reference is refused outright.
     """
-    from landslide.geometry import camera_center
     from landslide.scaling import aruco_scale
     from landslide.sfm import reconstruct
     d, gt = nadir
     ctx = reconstruct(d / "images", d / "work", reuse=True, log=print)
-    info = aruco_scale(ctx, side_m=gt["marker"]["side"], log=print)
-    names = sorted(ctx.views)
-    P = np.array([camera_center(ctx.views[n].R, ctx.views[n].t) for n in names])
-    Q = np.array([gt["poses"][n]["eye"] for n in names])
-    s_true, _, _ = _umeyama_scale(P, Q)
-    rel = abs(ctx.scale - s_true) / s_true
-    print(f"\nNADIR SCALE: aruco {ctx.scale:.4f} vs truth {s_true:.4f} "
-          f"({rel * 100:.1f}% off) — known-bad, vertical marker unsuitable for nadir")
-    assert rel < 0.60, "scale error grew past the pinned baseline — investigate"
+    with pytest.raises(RuntimeError, match="disagree"):
+        aruco_scale(ctx, side_m=gt["marker"]["side"], log=print)
 
 
 # -------------------------------------------------------------- oblique60 --
@@ -209,18 +195,19 @@ def test_descending_volume(descending):
     truth = gt["volume_true_polygon_m3"]
     res = measure(ctx, gt["polygon_image"], gt["polygon_px"], dense=True,
                   rim_px=14.0, artifacts_dir=d / "artifacts", log=print)
-    rel_err = abs(res["cut_volume_m3"] - truth) / truth
-    print(f"\nDESCENDING VOLUME: cut {res['cut_volume_m3']:.1f} vs truth "
-          f"{truth:.1f} ({rel_err * 100:.1f}%)")
-    # F12 fixed the focal-spread symptom this preset was diagnosed with
-    # (see test_descending_focal_spread_is_tight — a fresh run now measures
-    # a tight ~1.1x spread, not the ~2.7x wild-camera outlier the audit
-    # found), but photo-mode volume error stays high (measured ~55%) on a
-    # walking-downhill path — a real, DIFFERENT limitation of the
-    # image-plane region-selection fallback on a steep, non-level camera
-    # path, not something F12/M6 addresses. Pinned to the real number, not
-    # the audit's aspirational <25%, per this file's own rule.
-    assert rel_err < 0.65, f"cut {res['cut_volume_m3']:.1f} vs truth {truth:.1f}"
+    print(f"\nDESCENDING VOLUME: cut_measured {res['cut_measured_m3']:.1f}, "
+          f"cut_upper {res['cut_upper_m3']:.1f}, truth {truth:.1f}, "
+          f"status {res['status']}, reasons {res['reasons']}")
+    # RC1+RC3 (A3): descending's genuine ~30% stereo coverage gap on a
+    # walking-downhill path is a real, un-fixed limitation — the correct
+    # pipeline response is `status=rejected` with named reasons, not a
+    # confident number (see REMAINING_ACCURACY_PLAN.md §3's per-preset
+    # verdict table: "explicit rejection today via G3/G5/G6"). No numeric
+    # error threshold is the point: this preset should never read as ok.
+    assert res["status"] == "rejected", res["reasons"]
+    assert res["cut_measured_m3"] <= truth <= res["cut_upper_m3"], (
+        f"truth {truth:.1f} outside [{res['cut_measured_m3']:.1f}, "
+        f"{res['cut_upper_m3']:.1f}]")
 
 
 # --------------------------------------------------------------- collinear --
@@ -249,10 +236,18 @@ def test_collinear_volume(collinear):
     truth = gt["volume_true_polygon_m3"]
     res = measure(ctx, gt["polygon_image"], gt["polygon_px"], dense=True,
                   rim_px=14.0, artifacts_dir=d / "artifacts", log=print)
-    rel_err = abs(res["cut_volume_m3"] - truth) / truth
-    print(f"\nCOLLINEAR PHOTO: cut {res['cut_volume_m3']:.1f} vs truth "
-          f"{truth:.1f} ({rel_err * 100:.1f}%)")
-    assert rel_err < 0.25, f"cut {res['cut_volume_m3']:.1f} vs truth {truth:.1f}"
+    print(f"\nCOLLINEAR PHOTO: cut_measured {res['cut_measured_m3']:.1f}, "
+          f"cut_upper {res['cut_upper_m3']:.1f}, truth {truth:.1f}, "
+          f"status {res['status']}, reasons {res['reasons']}")
+    # RC5 (A3, §7.4): single-azimuth capture — RC1's void is one solid block
+    # instead of a fragmented crescent, and the camera path is collinear
+    # (G4). Acceptance criterion is explicit: never `status=ok` at a
+    # flattering point error; indicative or rejected are both correct
+    # non-ok outcomes here (measured coverage sits right at the G6 boundary).
+    assert res["status"] in ("indicative", "rejected"), res["reasons"]
+    assert res["cut_measured_m3"] <= truth <= res["cut_upper_m3"], (
+        f"truth {truth:.1f} outside [{res['cut_measured_m3']:.1f}, "
+        f"{res['cut_upper_m3']:.1f}]")
 
 
 def test_collinear_ortho_volume(collinear, tmp_path):
@@ -271,10 +266,13 @@ def test_collinear_ortho_volume(collinear, tmp_path):
     truth = gt["volume_true_polygon_m3"]
     res = measure(ctx, None, poly_px, dense=True, mode="ortho", ortho=meta,
                   artifacts_dir=tmp_path, log=print)
-    rel_err = abs(res["cut_volume_m3"] - truth) / truth
-    print(f"\nCOLLINEAR ORTHO: cut {res['cut_volume_m3']:.1f} vs truth "
-          f"{truth:.1f} ({rel_err * 100:.1f}%)")
-    assert rel_err < 0.25, f"cut {res['cut_volume_m3']:.1f} vs truth {truth:.1f}"
+    print(f"\nCOLLINEAR ORTHO: cut_measured {res['cut_measured_m3']:.1f}, "
+          f"cut_upper {res['cut_upper_m3']:.1f}, truth {truth:.1f}, "
+          f"status {res['status']}")
+    assert res["cut_measured_m3"] <= truth <= res["cut_upper_m3"], (
+        f"truth {truth:.1f} outside [{res['cut_measured_m3']:.1f}, "
+        f"{res['cut_upper_m3']:.1f}]")
+    assert res["status"] in ("indicative", "rejected")
 
 
 # ----------------------------------------------------------------- lowtex --
@@ -300,10 +298,19 @@ def test_lowtex_volume(lowtex):
     truth = gt["volume_true_polygon_m3"]
     res = measure(ctx, gt["polygon_image"], gt["polygon_px"], dense=True,
                   rim_px=14.0, artifacts_dir=d / "artifacts", log=print)
-    rel_err = abs(res["cut_volume_m3"] - truth) / truth
-    print(f"\nLOWTEX PHOTO: cut {res['cut_volume_m3']:.1f} vs truth "
-          f"{truth:.1f} ({rel_err * 100:.1f}%)")
-    assert rel_err < 0.20, f"cut {res['cut_volume_m3']:.1f} vs truth {truth:.1f}"
+    print(f"\nLOWTEX PHOTO: cut_measured {res['cut_measured_m3']:.1f}, "
+          f"cut_upper {res['cut_upper_m3']:.1f}, truth {truth:.1f}, "
+          f"status {res['status']}, coverage {res.get('coverage_frac')}")
+    # RC1/A1 (§7.3): ~100% ray-cast hit, but the TIN only observes ~61% of
+    # the traced polygon (a 30-40 m² void on the far, camera-unseen side of
+    # the bowl) — the tight bridging cull now reports that honestly instead
+    # of interpolating across it, so `status=indicative` with the truth
+    # inside [cut_measured, cut_upper] is the correct outcome, not a tight
+    # point error.
+    assert res["cut_measured_m3"] <= truth <= res["cut_upper_m3"], (
+        f"truth {truth:.1f} outside [{res['cut_measured_m3']:.1f}, "
+        f"{res['cut_upper_m3']:.1f}]")
+    assert res["status"] in ("indicative", "rejected")
 
 
 def test_lowtex_ortho_volume(lowtex, tmp_path):
@@ -322,10 +329,13 @@ def test_lowtex_ortho_volume(lowtex, tmp_path):
     truth = gt["volume_true_polygon_m3"]
     res = measure(ctx, None, poly_px, dense=True, mode="ortho", ortho=meta,
                   artifacts_dir=tmp_path, log=print)
-    rel_err = abs(res["cut_volume_m3"] - truth) / truth
-    print(f"\nLOWTEX ORTHO: cut {res['cut_volume_m3']:.1f} vs truth "
-          f"{truth:.1f} ({rel_err * 100:.1f}%)")
-    assert rel_err < 0.10, f"cut {res['cut_volume_m3']:.1f} vs truth {truth:.1f}"
+    print(f"\nLOWTEX ORTHO: cut_measured {res['cut_measured_m3']:.1f}, "
+          f"cut_upper {res['cut_upper_m3']:.1f}, truth {truth:.1f}, "
+          f"status {res['status']}")
+    assert res["cut_measured_m3"] <= truth <= res["cut_upper_m3"], (
+        f"truth {truth:.1f} outside [{res['cut_measured_m3']:.1f}, "
+        f"{res['cut_upper_m3']:.1f}]")
+    assert res["status"] in ("indicative", "rejected")
 
 
 # --------------------------------------------------------------- distorted --
@@ -351,13 +361,14 @@ def test_distorted_volume(distorted):
     truth = gt["volume_true_polygon_m3"]
     res = measure(ctx, gt["polygon_image"], gt["polygon_px"], dense=True,
                   rim_px=14.0, artifacts_dir=d / "artifacts", log=print)
-    rel_err = abs(res["cut_volume_m3"] - truth) / truth
-    print(f"\nDISTORTED PHOTO: cut {res['cut_volume_m3']:.1f} vs truth "
-          f"{truth:.1f} ({rel_err * 100:.1f}%)")
-    # measured 23.9% (vs the plan's aspirational 20%) — real distortion-model
-    # residual after undistortion, not guessed; pinned per this file's own
-    # "record a bad number as a bad number" rule
-    assert rel_err < 0.30, f"cut {res['cut_volume_m3']:.1f} vs truth {truth:.1f}"
+    print(f"\nDISTORTED PHOTO: cut_measured {res['cut_measured_m3']:.1f}, "
+          f"cut_upper {res['cut_upper_m3']:.1f}, truth {truth:.1f}, "
+          f"status {res['status']}, coverage {res.get('coverage_frac')}")
+    # RC1/A1 — see test_lowtex_volume's comment; ~62% coverage here.
+    assert res["cut_measured_m3"] <= truth <= res["cut_upper_m3"], (
+        f"truth {truth:.1f} outside [{res['cut_measured_m3']:.1f}, "
+        f"{res['cut_upper_m3']:.1f}]")
+    assert res["status"] in ("indicative", "rejected")
 
 
 def test_distorted_ortho_volume(distorted, tmp_path):
@@ -376,7 +387,10 @@ def test_distorted_ortho_volume(distorted, tmp_path):
     truth = gt["volume_true_polygon_m3"]
     res = measure(ctx, None, poly_px, dense=True, mode="ortho", ortho=meta,
                   artifacts_dir=tmp_path, log=print)
-    rel_err = abs(res["cut_volume_m3"] - truth) / truth
-    print(f"\nDISTORTED ORTHO: cut {res['cut_volume_m3']:.1f} vs truth "
-          f"{truth:.1f} ({rel_err * 100:.1f}%)")
-    assert rel_err < 0.20, f"cut {res['cut_volume_m3']:.1f} vs truth {truth:.1f}"
+    print(f"\nDISTORTED ORTHO: cut_measured {res['cut_measured_m3']:.1f}, "
+          f"cut_upper {res['cut_upper_m3']:.1f}, truth {truth:.1f}, "
+          f"status {res['status']}")
+    assert res["cut_measured_m3"] <= truth <= res["cut_upper_m3"], (
+        f"truth {truth:.1f} outside [{res['cut_measured_m3']:.1f}, "
+        f"{res['cut_upper_m3']:.1f}]")
+    assert res["status"] in ("indicative", "rejected")

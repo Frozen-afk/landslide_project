@@ -57,21 +57,37 @@ def _umeyama_pose_aware(P_centers, Q_centers, P_axes, Q_axes, trim_frac=0.15):
     with a perfect center-only residual. Each camera's OPTICAL-AXIS
     endpoint (`center + forward_direction`) breaks that ambiquity — it
     only lines up when the rotation is actually correct, not just the
-    translation/scale. The two point sets (centers, axis endpoints) are
-    fit together as one correspondence set, then a trimmed refit drops the
-    worst `trim_frac` residuals (a straight path's registration can still
-    have a few off cameras) and refits on the rest — one bad camera should
-    not drag the alignment used to score everyone else.
+    translation/scale.
+
+    A5: `P_axes - P_centers` is a unit vector in MODEL units; `Q_axes -
+    Q_centers` is a unit vector in METRE units. Concatenating them as one
+    correspondence set (the original approach) fits one model unit of
+    optical-axis offset against one metre of it — inconsistent unless the
+    true scale happens to be 1, which inflated the "true-frame" residual by
+    0.4-1 m on every preset even where SfM was near-perfect (confirmed by
+    re-fitting with the axis endpoint scaled by 1/s). Fixed by rescaling the
+    model-frame axis offset by the best scale estimate SO FAR — seeded from
+    a centres-only fit, then iterated twice so the correspondence set
+    converges on the true scale instead of freezing the first (coarse)
+    estimate. Each iteration also trims the worst `trim_frac` residuals (a
+    straight path's registration can still have a few off cameras) and
+    refits on the rest, so one bad camera can't drag the alignment used to
+    score every preset stat.
     """
-    P = np.concatenate([P_centers, P_axes])
-    Q = np.concatenate([Q_centers, Q_axes])
-    s, R, t = _umeyama_scale(P, Q)
-    resid = np.linalg.norm((s * R @ P.T).T + t - Q, axis=1)
-    n_keep = max(6, int(np.ceil((1 - trim_frac) * len(P))))
-    keep = np.argsort(resid)[:n_keep]
-    if len(keep) < 6:
-        return s, R, t
-    return _umeyama_scale(P[keep], Q[keep])
+    fwd_p = P_axes - P_centers
+    fwd_q = Q_axes - Q_centers
+    s, R, t = _umeyama_scale(P_centers, Q_centers)
+    for _ in range(2):
+        P = np.concatenate([P_centers, P_centers + fwd_p / max(s, 1e-9)])
+        Q = np.concatenate([Q_centers, Q_centers + fwd_q])
+        s, R, t = _umeyama_scale(P, Q)
+        resid = np.linalg.norm((s * R @ P.T).T + t - Q, axis=1)
+        n_keep = max(6, int(np.ceil((1 - trim_frac) * len(P))))
+        keep = np.argsort(resid)[:n_keep]
+        if len(keep) < 6:
+            continue
+        s, R, t = _umeyama_scale(P[keep], Q[keep])
+    return s, R, t
 
 
 def run_preset(preset: str, work_root: Path, seed: int = 7) -> dict:

@@ -10,7 +10,7 @@ from __future__ import annotations
 import numpy as np
 from scipy.spatial import Delaunay, cKDTree
 
-from .geometry import points_in_polygon, ring_distance
+from .geometry import points_in_polygon, polygon_area, ring_distance
 from .sfm import Log, ReconCtx
 
 
@@ -253,11 +253,25 @@ def fit_tps_membrane(uv: np.ndarray, h: np.ndarray, lam: float,
     return {"sup": uvn, "w": sol[:n], "a": sol[n:n + 3], "s": s}
 
 
-def eval_tps(model, uv: np.ndarray, chunk: int = 100_000) -> np.ndarray:
-    """Evaluate a fit_tps_membrane model at raw (unnormalized) points."""
+def eval_tps(model, uv: np.ndarray, chunk: int | None = None) -> np.ndarray:
+    """Evaluate a fit_tps_membrane model at raw (unnormalized) points.
+
+    `chunk` defaults to bounding the per-chunk (chunk x n_support) pairwise
+    distance temporaries to a fixed element budget rather than a flat
+    100_000 rows: with up to `fit_tps_membrane`'s max_pts=4000 support
+    points, a flat 100_000-row chunk builds several (100000, 4000, ...)
+    float64 temporaries (~3-6 GB EACH) — confirmed as the actual source of
+    a "collinear dense stage reaches ~16 GB RSS" report, which traced back
+    to this call (interior-deviation check in `prism_volume`, not the
+    dense-cloud build itself) on the interior's full point count. Bounding
+    the row*support product instead keeps every eval, on any interior size
+    or support count, to the same modest working set.
+    """
     uv = np.asarray(uv, np.float64) / model["s"]
     out = np.empty(len(uv))
     sup, w, a = model["sup"], model["w"], model["a"]
+    if chunk is None:
+        chunk = max(1000, 2_000_000 // max(len(sup), 1))
     for s0 in range(0, len(uv), chunk):
         q = uv[s0:s0 + chunk]
         d2 = ((q[:, None, :] - sup[None, :, :]) ** 2).sum(-1)
@@ -766,11 +780,61 @@ def select_region(ctx: ReconCtx, image_name: str, polygon, rim_px: float = 12.0,
     return view, uv, interior, rim
 
 
+def _coverage_gate(interior_metric: np.ndarray, up: np.ndarray,
+                   polygon_ground: np.ndarray, cell: float = 0.25) -> dict | None:
+    """G6 coverage (RC1/A1): occupancy and largest connected void of the
+    traced ground polygon, on a 0.25 m grid.
+
+    Deliberately independent of the datum/TIN machinery below — it uses the
+    region's own horizontal (e1, e2) ground basis (from `up`), not the
+    (possibly tilted, arbitrarily rotated) datum-plane basis the height
+    integration picks — so it measures the real footprint coverage no
+    matter which surface model was adopted for heights. This is the number
+    the bridging cull was silently hiding: on every synthetic preset the
+    pipeline observes 40-62% of the traced region and used to integrate the
+    rest across a single wide void via long Delaunay triangles.
+    """
+    from scipy.ndimage import label
+
+    from .ortho import ground_basis
+
+    poly = np.asarray(polygon_ground, np.float64)
+    area = polygon_area(poly)
+    if area <= 0 or len(poly) < 3:
+        return None
+    e1, e2 = ground_basis(up)
+    u, v = interior_metric @ e1, interior_metric @ e2
+    lo_u, lo_v = float(poly[:, 0].min()), float(poly[:, 1].min())
+    hi_u, hi_v = float(poly[:, 0].max()), float(poly[:, 1].max())
+    nx = max(1, int(np.ceil((hi_u - lo_u) / cell)))
+    ny = max(1, int(np.ceil((hi_v - lo_v) / cell)))
+    xs = lo_u + (np.arange(nx) + 0.5) * cell
+    ys = lo_v + (np.arange(ny) + 0.5) * cell
+    Xc, Yc = np.meshgrid(xs, ys, indexing="xy")
+    inside = points_in_polygon(np.column_stack([Xc.ravel(), Yc.ravel()]), poly) \
+        .reshape(ny, nx)
+    n_inside = int(inside.sum())
+    if n_inside == 0:
+        return None
+    in_bounds = (u >= lo_u) & (u <= hi_u) & (v >= lo_v) & (v <= hi_v)
+    ix = np.clip(((u[in_bounds] - lo_u) / cell).astype(np.int64), 0, nx - 1)
+    iy = np.clip(((v[in_bounds] - lo_v) / cell).astype(np.int64), 0, ny - 1)
+    occ = np.zeros((ny, nx), dtype=bool)
+    occ[iy, ix] = True
+    occupancy = float((occ & inside).sum() / n_inside)
+    lbl, n_lbl = label(inside & ~occ)
+    largest_void = (float(np.bincount(lbl.ravel())[1:].max()) * cell * cell
+                    if n_lbl else 0.0)
+    return {"coverage_frac": occupancy, "largest_void_m2": largest_void,
+            "polygon_area_m2": float(area)}
+
+
 def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
                  log: Log = print, max_above_datum: float | None = None,
                  up: np.ndarray | None = None,
                  max_edge_factor: float = 20.0,
-                 max_edge_region_frac: float = 0.5) -> dict:
+                 max_edge_abs_m: float = 0.5,
+                 polygon_ground: np.ndarray | None = None) -> dict:
     """Cut/fill volume of interior points above the rim-fitted datum surface.
 
     All units: whatever the points are in (caller passes metric-scaled pts).
@@ -783,9 +847,17 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
 
     Delaunay interpolates across small data holes, which is desirable (the
     surface is smooth there); only triangles bridging a gap longer than
-    max(max_edge_factor × point spacing, max_edge_region_frac × region
-    diameter) are excluded, so a region marked over unreconstructed
-    background doesn't invent area/volume.
+    max(max_edge_factor × point spacing, max_edge_abs_m) are excluded (RC1/
+    A1: dropped the old "× region diameter" term — on a 30-60 m² unobserved
+    back-facing slope, half the region's own diameter let the TIN silently
+    bridge the whole void with a handful of 5-7 m triangles and integrate a
+    single confident number across a hole covering 40-60% of the traced
+    polygon). `area_measured_m2`/`bridged_area_m2`/`cut_measured_m3`/
+    `cut_upper_m3` report what was actually observed vs. guessed; when
+    `polygon_ground` (the traced polygon in metric ground coordinates) is
+    given, `coverage_frac`/`largest_void_m2` (G6, `_coverage_gate`) measure
+    the same thing independently, on a 0.25 m occupancy grid instead of the
+    TIN's own triangle-edge threshold.
 
     `net_volume_m3`/`cut_volume_m3`/`fill_volume_m3`/`area_m2` are the TIN
     integral above. T2.1 (`_raster_bin`) also bins the same points into a
@@ -974,23 +1046,25 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
     # drop catastrophic "bridging" triangles: Delaunay happily spans data
     # holes and the convex-hull rim with long triangles whose heights
     # interpolate across the gap. Small holes are fine (smooth surface), so
-    # the threshold is anchored to the region's own diameter and only kills
-    # bridges over genuinely-missing data.
+    # the threshold is anchored to point spacing and a small absolute cap
+    # (RC1/A1) — NOT a fraction of the region's own diameter, which on a
+    # 30-60 m² unobserved back-facing slope let the TIN bridge the entire
+    # void with a handful of long triangles and report one confident number
+    # for ground nobody actually measured.
     d_self, _ = cKDTree(uv2).query(uv2, k=2, workers=-1)
     spacing = float(np.median(d_self[:, 1]))
-    lo, hi = np.percentile(uv2, [1, 99], axis=0)
-    diam = float(np.linalg.norm(hi - lo))
-    max_edge = max(max_edge_factor * spacing, max_edge_region_frac * diam)
+    max_edge = max(max_edge_factor * spacing, max_edge_abs_m)
     edges = np.stack([np.linalg.norm(p1 - p0, axis=1),
                       np.linalg.norm(p2 - p1, axis=1),
                       np.linalg.norm(p0 - p2, axis=1)])
     keep_tri = edges.max(axis=0) <= max_edge
+    bridged_area = 0.0
     if not keep_tri.all():
-        bridged = float(area_tri[~keep_tri].sum())
+        bridged_area = float(area_tri[~keep_tri].sum())
         log(f"[volume] dropping {int((~keep_tri).sum())} bridging triangles "
-            f"(edge > {max_edge:.2f} m), {bridged:.1f} m^2 of unsupported area")
-        if bridged > 0.05 * float(area_tri.sum()):
-            warnings.append(f"{bridged:.0f} m² of the marked region could not be "
+            f"(edge > {max_edge:.2f} m), {bridged_area:.1f} m^2 of unsupported area")
+        if bridged_area > 0.05 * float(area_tri.sum()):
+            warnings.append(f"{bridged_area:.0f} m² of the marked region could not be "
                             "reconstructed and was excluded — the volume covers "
                             "only the measured part")
         area_tri, v_tri, h_tri = area_tri[keep_tri], v_tri[keep_tri], h_tri[keep_tri]
@@ -998,7 +1072,16 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
     fill = float(v_tri[h_tri > 0].sum())      # material above datum
     cut = float(-v_tri[h_tri < 0].sum())      # depression below datum
     net = fill - cut                          # depression -> negative net
-    area = float(area_tri.sum())
+    area = float(area_tri.sum())              # = area_measured_m2
+
+    # ---- G6 coverage gate (RC1/A1) ----
+    coverage = (_coverage_gate(interior, up, polygon_ground)
+               if (up is not None and polygon_ground is not None) else None)
+    polygon_area_m2 = coverage["polygon_area_m2"] if coverage else None
+    cut_upper_m3 = None
+    if polygon_area_m2 is not None:
+        unseen = max(0.0, polygon_area_m2 - area)
+        cut_upper_m3 = cut + unseen * float(-h.min()) if len(h) else cut
 
     # ---- T2.1: raster DSM cross-check ----
     # Plan's literal design made this the PRIMARY integrator; validated
@@ -1057,7 +1140,19 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
                                       cell_r, datum, log=log)
         if offsets is not None:
             lo_off, hi_off = offsets
-            cov_term = unmeasured_area * float(np.max(np.abs(h))) if len(h) else 0.0
+            # A4: prefer the G6 coverage gap (polygon area actually traced
+            # minus what the TIN could measure) over the raster's
+            # `unmeasured_area` proxy — the raster only flags cells with NO
+            # nearby data at all, missing the far larger "bridged, not
+            # observed" gap the tighter RC1 bridging cull now excludes from
+            # `area`. `mean|h|` (not `max|h|`) so one deep outlier point
+            # doesn't dominate a term meant to bound a plausible unseen
+            # patch, not a worst-case one.
+            if polygon_area_m2 is not None:
+                cov_area = max(0.0, polygon_area_m2 - area)
+            else:
+                cov_area = unmeasured_area
+            cov_term = cov_area * float(np.mean(np.abs(h))) if len(h) else 0.0
             lo_off = float(np.hypot(lo_off, cov_term))
             hi_off = float(np.hypot(hi_off, cov_term))
             ci = (net - lo_off, net + hi_off)
@@ -1104,6 +1199,10 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
         "cut_volume_m3": cut,
         "fill_volume_m3": fill,
         "area_m2": area,
+        "area_measured_m2": area,
+        "bridged_area_m2": bridged_area,
+        "cut_measured_m3": cut,
+        "cut_upper_m3": cut_upper_m3,
         "volume_raster_m3": r_net if r_area > 0 else None,
         "unmeasured_area_m2": unmeasured_area,
         "datum": datum,
@@ -1128,4 +1227,13 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
     }
     if ci is not None:
         result["net_volume_ci95_m3"] = [ci[0], ci[1]]
+    if coverage is not None:
+        result["coverage_frac"] = coverage["coverage_frac"]
+        result["largest_void_m2"] = coverage["largest_void_m2"]
+        result["polygon_area_m2"] = coverage["polygon_area_m2"]
+        if coverage["coverage_frac"] < 0.6:
+            warnings.append(
+                f"only {coverage['coverage_frac']:.0%} of the traced region has "
+                "nearby data (coverage gate) — the reported volume interpolates "
+                "over a large unobserved area")
     return result

@@ -43,8 +43,10 @@ def test_cast_polygon_recovers_known_ground_square():
     cell = estimate_cell_size(pts, e1, e2)
     dsm = build_dsm(pts, up, e1, e2, cell)
 
-    ground_poly, hit_frac = cast_polygon_to_ground(view, uv, dsm, up, e1, e2, scale=1.0)
+    ground_poly, hit_frac, max_miss_run = cast_polygon_to_ground(
+        view, uv, dsm, up, e1, e2, scale=1.0)
     assert hit_frac > 0.8
+    assert max_miss_run <= 2
     # every original corner is a densified-polygon vertex (k=0 for each edge)
     # and should ray-cast back to (x, y, 0) almost exactly on a flat ground
     for i, corner in enumerate(corners_world):
@@ -67,7 +69,7 @@ def test_cast_polygon_reports_low_hit_fraction_off_footprint():
     cell = estimate_cell_size(pts, e1, e2)
     dsm = build_dsm(pts, up, e1, e2, cell)
 
-    _, hit_frac = cast_polygon_to_ground(view, uv, dsm, up, e1, e2, scale=1.0)
+    _, hit_frac, _ = cast_polygon_to_ground(view, uv, dsm, up, e1, e2, scale=1.0)
     assert hit_frac < 0.3
 
 
@@ -87,6 +89,6 @@ def test_cast_polygon_respects_scale():
     pts_metric = _flat_ground_cloud(n=80_000, half=5.0) * scale
     cell = estimate_cell_size(pts_metric, e1, e2)
     dsm = build_dsm(pts_metric, up, e1, e2, cell)
-    ground_poly, hit_frac = cast_polygon_to_ground(view, uv, dsm, up, e1, e2, scale=scale)
+    ground_poly, hit_frac, _ = cast_polygon_to_ground(view, uv, dsm, up, e1, e2, scale=scale)
     assert hit_frac > 0.8
     np.testing.assert_allclose(ground_poly[0], corners_world[0, :2] * scale, atol=1e-6)

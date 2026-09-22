@@ -181,6 +181,11 @@ def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
         interior, rim, rinfo = select_region_ortho(ctx, ortho, polygon, log=log,
                                                    dense=dense)
         up = np.asarray(ortho["up"], np.float64)
+        # traced polygon in metric ground (e1, e2) coordinates — G6's
+        # coverage gate (RC1/A1) needs it, independent of the ortho pixel grid
+        polygon_ground = np.column_stack([
+            ortho["u0"] + polygon[:, 0] * ortho["res"],
+            ortho["v0"] + polygon[:, 1] * ortho["res"]])
         if dem is not None:
             R, t, surface = dem
             from .volume import dem_volume
@@ -190,9 +195,10 @@ def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
             res["rim_band_m"] = [rinfo["rim_inner_m"], rinfo["rim_outer_m"]]
         else:
             res = prism_volume(pts[interior] * ctx.scale, pts[rim] * ctx.scale,
-                               log=log, up=up)
+                               log=log, up=up, polygon_ground=polygon_ground)
             res["mode"] = "ortho"
             res["rim_band_m"] = [rinfo["rim_inner_m"], rinfo["rim_outer_m"]]
+        region_method = "ortho"
     elif mode == "photo":
         if image_name not in ctx.views:
             raise ValueError(f"image '{image_name}' is not part of the reconstruction")
@@ -212,9 +218,11 @@ def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
         except Exception as e:
             log(f"[measure] ground-frame selection failed ({e}); "
                 "falling back to image-plane selection")
+        polygon_ground = None
         if ground is not None:
             interior, rim, ginfo = ground
             region_method = "ground_frame"
+            polygon_ground = np.asarray(ginfo["ground_polygon"], np.float64)
         else:
             _, _, interior, rim = select_region(ctx, image_name, polygon,
                                                 rim_px, rim_inner_px,
@@ -230,12 +238,14 @@ def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
             res["image"] = image_name
         else:
             res = prism_volume(pts[interior] * ctx.scale, pts[rim] * ctx.scale,
-                               log=log, up=up)
+                               log=log, up=up, polygon_ground=polygon_ground)
             res["mode"] = "photo"
             res["image"] = image_name
         res["region_method"] = region_method
         if region_method == "ground_frame":
             res["rim_band_m"] = [ginfo["rim_inner_m"], ginfo["rim_outer_m"]]
+            res["hit_frac"] = ginfo["hit_frac"]
+            res["max_miss_run"] = ginfo["max_miss_run"]
         else:
             res["rim_band_px"] = [rim_px * 0.5 if rim_inner_px is None else rim_inner_px,
                                   (rim_px * 0.5 if rim_inner_px is None else rim_inner_px) + rim_px]
@@ -261,6 +271,14 @@ def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
     # field (see POST_IMPLEMENTATION_AUDIT.md F9/M4).
     scale_rel = ctx.scale_info.get("scale_rel_error")
     if scale_rel:
+        # G7 scale honesty floor: a reported scale error below 3% is rarely
+        # earned by a single reference measurement (marker detection noise,
+        # a few clicked pixels) unless a second, independent estimate agrees
+        # closely — the ArUco path's per-view PnP cross-check is the only
+        # such second reference this codebase has.
+        pnp_spread = ctx.scale_info.get("pnp_scale_spread")
+        two_agree = pnp_spread is not None and pnp_spread <= 0.02
+        scale_rel = float(scale_rel) if two_agree else max(float(scale_rel), 0.03)
         res["scale_rel_error"] = float(scale_rel)
     net = res["net_volume_m3"]
     ci = res.get("net_volume_ci95_m3")
@@ -281,6 +299,15 @@ def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
         res.setdefault("warnings", []).append(f"scale: {w}")
     for w in getattr(ctx, "warnings", None) or []:
         res.setdefault("warnings", []).append(f"sfm: {w}")
+
+    # A3: status/reasons from the mandatory quality gates (G1-G7) — a
+    # confident single number with no coverage/calibration context is what
+    # let every preset's ~1-2% "photo error" hide a 40-60% unobserved void
+    # (see REMAINING_ACCURACY_PLAN.md). G8 (the UI) is result.js.
+    from .gates import evaluate_gates
+    status, gate_reasons = evaluate_gates(ctx, res, region_method)
+    res["status"] = status
+    res["reasons"] = gate_reasons
 
     if artifacts_dir is not None:
         artifacts_dir = Path(artifacts_dir)

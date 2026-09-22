@@ -205,6 +205,19 @@ def aruco_scale(ctx: ReconCtx, side_m: float, dict_name: str = "auto",
     if mean_side <= 0 or not np.isfinite(mean_side):
         raise RuntimeError("marker triangulation degenerated")
     spread = float(sides.std() / mean_side)
+    # G2 quality gate: a marker whose 4 triangulated sides disagree by more
+    # than 10% is not the flat, square, known-size reference the volume
+    # scale needs — usually a grazing-angle detection, a bent/curled print,
+    # or the wrong marker matched (measured: nadir's oblique vertical-board
+    # detection spreads 33%, and the resulting scale was silently applied
+    # and 40% wrong). Rejecting here, not just warning, means a bad scale
+    # never reaches a volume the user might trust.
+    if spread > 0.10:
+        raise RuntimeError(
+            f"ArUco marker sides disagree by {spread * 100:.0f}% after "
+            "triangulation — the marker is not being seen as a flat square "
+            "(grazing angle, bent print, or a mismatched detection). Retake "
+            "the marker photos closer to face-on, or use manual scaling.")
     # squareness-enforced side length: a rigid-square Procrustes fit to the
     # four corners, less sensitive to one noisy corner than a plain mean of
     # four edges (each edge shares 2 of the 4 possibly-noisy corners).
@@ -230,6 +243,12 @@ def aruco_scale(ctx: ReconCtx, side_m: float, dict_name: str = "auto",
             or mean_px_side <= 0):
         raise RuntimeError("marker reprojection quality is not finite or degenerated")
     rel_err = _clip_rel(max(spread, reproj_px_mean / mean_px_side))
+    if rel_err > 0.10:
+        raise RuntimeError(
+            f"marker reprojection error implies ~{rel_err * 100:.0f}% scale "
+            "uncertainty — the marker is too small/far/blurred in these "
+            "photos for a reliable scale. Move closer, use a larger marker, "
+            "or use manual scaling.")
 
     # per-view PnP cross-check: an independent scale estimate per view that
     # shares no computation with the joint-DLT one above; reported, not used
@@ -245,6 +264,14 @@ def aruco_scale(ctx: ReconCtx, side_m: float, dict_name: str = "auto",
     scale = float(side_m / square_side)
     if not np.isfinite(scale) or scale <= 0:
         raise RuntimeError("marker scale must be finite and positive")
+    warnings: list[str] = []
+    if spread > 0.05:
+        warnings.append(f"corner sides differ {spread * 100:.0f}% — marker may be "
+                        "blurred or seen at a grazing angle")
+    if pnp_spread > 0.10:
+        warnings.append(f"per-view PnP scale cross-check spread {pnp_spread * 100:.0f}% "
+                        "— the marker geometry may not be a clean flat square of the "
+                        "stated side length")
     ctx.scale = scale
     ctx.scale_info = {
         "applied": True, "method": "aruco", "dict": best_dict,
@@ -257,6 +284,7 @@ def aruco_scale(ctx: ReconCtx, side_m: float, dict_name: str = "auto",
         "dropped_views": dropped_views,
         "pnp_scale_estimates": pnp_scales,
         "pnp_scale_spread": pnp_spread,
+        "warnings": warnings,
         # metric corners of the marker IN THE MODEL FRAME: if the same
         # physical marker is present in a second survey of the site, these
         # four points anchor an exact rigid registration between the two
@@ -268,13 +296,8 @@ def aruco_scale(ctx: ReconCtx, side_m: float, dict_name: str = "auto",
         f"square-fit side={square_side:.4g}; "
         f"reproj={reproj_px_mean:.2f}px; scale={scale:.6g} m/unit "
         f"(±{rel_err * 100:.1f}%); PnP cross-check spread={pnp_spread * 100:.1f}%")
-    if spread > 0.05:
-        log("[scale] warning: corner sides differ >5% — marker may be blurred "
-            "or seen at a grazing angle")
-    if pnp_spread > 0.10:
-        log("[scale] warning: per-view PnP scale cross-check spread "
-            f"{pnp_spread * 100:.0f}% — the marker geometry may not be a "
-            f"clean flat square of the stated side length")
+    for w in warnings:
+        log(f"[scale] warning: {w}")
     return ctx.scale_info
 
 

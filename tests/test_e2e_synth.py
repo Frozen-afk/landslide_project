@@ -99,9 +99,19 @@ def test_volume_end_to_end(ctx, synth):
     print(f"\nVOLUME: measured cut {res['cut_volume_m3']:.1f} m^3, "
           f"truth {truth:.1f} m^3, net {res['net_volume_m3']:.1f}, "
           f"fill {res['fill_volume_m3']:.1f}, points {res['n_points']}, "
-          f"dense pts {res['n_cloud_points']}")
-    rel_err = abs(res["cut_volume_m3"] - truth) / truth
-    assert rel_err < 0.30, f"cut {res['cut_volume_m3']:.1f} vs truth {truth:.1f}"
+          f"dense pts {res['n_cloud_points']}, status {res['status']}, "
+          f"coverage {res.get('coverage_frac')}")
+    # RC1/A1: cut_volume_m3 is now the MEASURED-only cut (tight bridging
+    # cull, no more interpolating across a 30-40 m² unobserved void) — the
+    # single-number tolerance this test used to check no longer applies (a
+    # 35-45% "error" here is a HONEST measured-vs-full-truth gap on a scene
+    # that observes ~60% of the traced region, not a regression). The plan's
+    # own acceptance criterion (§7.1) is cut_measured <= truth <= cut_upper.
+    assert res["cut_measured_m3"] <= truth <= res["cut_upper_m3"], (
+        f"truth {truth:.1f} outside [{res['cut_measured_m3']:.1f}, "
+        f"{res['cut_upper_m3']:.1f}]")
+    assert res["status"] in ("indicative", "rejected"), \
+        "this scene's ~60% coverage should never read as status=ok"
     assert res["fill_volume_m3"] < 0.35 * truth
     # F2/F8: restored from the 500 that was masking the voxel-starvation bug
     # (a healthy fused cloud on this scene measures ~70k interior points;
@@ -143,9 +153,14 @@ def test_volume_ortho_end_to_end(ctx, synth, tmp_path):
                   artifacts_dir=tmp_path, log=print)
     truth = synth["volume_true_polygon_m3"]
     print(f"\nORTHO VOLUME: cut {res['cut_volume_m3']:.1f} m^3, truth {truth:.1f}, "
-          f"datum {res['datum']}, rim band {res['rim_band_m']}")
+          f"datum {res['datum']}, rim band {res['rim_band_m']}, "
+          f"status {res['status']}")
     assert res["mode"] == "ortho"
-    rel_err = abs(res["cut_volume_m3"] - truth) / truth
-    assert rel_err < 0.30, f"cut {res['cut_volume_m3']:.1f} vs truth {truth:.1f}"
+    # RC1/A1 — see test_volume_end_to_end's comment: measured-only cut, range
+    # check against the plan's own acceptance criterion (§7.1) instead of a
+    # tight single-number tolerance.
+    assert res["cut_measured_m3"] <= truth <= res["cut_upper_m3"], (
+        f"truth {truth:.1f} outside [{res['cut_measured_m3']:.1f}, "
+        f"{res['cut_upper_m3']:.1f}]")
     # F2/F8: restored from the 500 that was masking the voxel-starvation bug
     assert res["n_points"] > 5000

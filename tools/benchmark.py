@@ -28,16 +28,50 @@ sys.path.insert(0, str(ROOT))
 from tools.synth import PRESETS, terrain_height, build_terrain  # noqa: E402
 
 
-def _umeyama_scale(P, Q):
+def _umeyama_scale(P, Q, weights=None):
     """Least-squares similarity P -> Q. Returns (scale, R, t)."""
-    cp, cq = P.mean(0), Q.mean(0)
-    H = (P - cp).T @ (Q - cq)
+    if weights is None:
+        cp, cq = P.mean(0), Q.mean(0)
+        H = (P - cp).T @ (Q - cq)
+        var_p = ((P - cp) ** 2).sum()
+    else:
+        w = weights / weights.sum()
+        cp, cq = (P * w[:, None]).sum(0), (Q * w[:, None]).sum(0)
+        H = ((P - cp) * w[:, None]).T @ (Q - cq)
+        var_p = (((P - cp) ** 2).sum(1) * w).sum()
     U, S, Vt = np.linalg.svd(H)
     d = np.sign(np.linalg.det(Vt.T @ U.T))
-    s = (S * [1, 1, d]).sum() / ((P - cp) ** 2).sum()
+    s = (S * [1, 1, d]).sum() / var_p
     R = Vt.T @ np.diag([1, 1, d]) @ U.T
     t = cq - s * R @ cp
     return s, R, t
+
+
+def _umeyama_pose_aware(P_centers, Q_centers, P_axes, Q_axes, trim_frac=0.15):
+    """Similarity fit robust to a collinear/near-collinear camera path (F13).
+
+    Camera CENTERS alone have a free rotation about the line they sit on
+    when that line is straight (or near enough): any rotation of the
+    recovered model about that axis fits the centers equally well, so a
+    `collinear`/`nadir` preset's "world" alignment can land 90 degrees off
+    with a perfect center-only residual. Each camera's OPTICAL-AXIS
+    endpoint (`center + forward_direction`) breaks that ambiquity — it
+    only lines up when the rotation is actually correct, not just the
+    translation/scale. The two point sets (centers, axis endpoints) are
+    fit together as one correspondence set, then a trimmed refit drops the
+    worst `trim_frac` residuals (a straight path's registration can still
+    have a few off cameras) and refits on the rest — one bad camera should
+    not drag the alignment used to score everyone else.
+    """
+    P = np.concatenate([P_centers, P_axes])
+    Q = np.concatenate([Q_centers, Q_axes])
+    s, R, t = _umeyama_scale(P, Q)
+    resid = np.linalg.norm((s * R @ P.T).T + t - Q, axis=1)
+    n_keep = max(6, int(np.ceil((1 - trim_frac) * len(P))))
+    keep = np.argsort(resid)[:n_keep]
+    if len(keep) < 6:
+        return s, R, t
+    return _umeyama_scale(P[keep], Q[keep])
 
 
 def run_preset(preset: str, work_root: Path, seed: int = 7) -> dict:
@@ -72,7 +106,15 @@ def run_preset(preset: str, work_root: Path, seed: int = 7) -> dict:
     names = sorted(ctx.views)
     P = np.array([camera_center(ctx.views[n].R, ctx.views[n].t) for n in names])
     Q = np.array([gt["poses"][n]["eye"] for n in names])
-    s_true, Rm, tm = _umeyama_scale(P, Q)
+    # F13: centers alone leave a free rotation about the camera line on a
+    # (near-)collinear path (`collinear`, `nadir`) — add each camera's
+    # optical-axis endpoint (center + forward direction; forward = row 2 of
+    # the world->cam rotation, in both frames) to break that ambiguity, and
+    # trim the worst-fit cameras so one outlier can't drag the alignment
+    # used to score every other preset stat.
+    fwd_p = np.array([ctx.views[n].R[2, :] for n in names])
+    fwd_q = np.array([np.asarray(gt["poses"][n]["R"])[2, :] for n in names])
+    s_true, Rm, tm = _umeyama_pose_aware(P, Q, P + fwd_p, Q + fwd_q)
 
     try:
         aruco_scale(ctx, side_m=gt["marker"]["side"], dict_name="auto",
@@ -104,7 +146,7 @@ def run_preset(preset: str, work_root: Path, seed: int = 7) -> dict:
                                     log=lambda *_: None)
         e1, e2 = ground_basis(estimate_up(ctx.views, ctx.sparse))
         Pw = P * ctx.scale
-        s2, Rm2, t2 = _umeyama_scale(Pw, Q)   # s2 ~= 1: Pw already metric
+        s2, Rm2, t2 = _umeyama_pose_aware(Pw, Q, Pw + fwd_p, Q + fwd_q)  # s2 ~= 1
         cx, cy, r = gt["bowl"]["x"], gt["bowl"]["y"], gt["polygon_radius_m"]
         ang = np.linspace(0, 2 * np.pi, 72, endpoint=False)
         circ_w = np.column_stack([cx + r * np.cos(ang), cy + r * np.sin(ang),
@@ -145,18 +187,69 @@ def _fmt(v, suffix=""):
     return str(v)
 
 
+_RESULT_PREFIX = "BENCH_RESULT_JSON:"
+
+
+def _run_preset_subprocess(preset: str, work_root: Path, seed: int) -> dict:
+    """Run one preset in its OWN process under `/usr/bin/time -v` (F13).
+
+    `ru_maxrss` (self OR children) is a running high-water mark: once one
+    preset allocates a lot, every LATER preset in the same process (or the
+    same `RUSAGE_CHILDREN` accumulator) reports that earlier peak instead
+    of its own — `peak_rss_mb` was ~0 for every preset after the first, and
+    negative if the generator subprocess ran first. `/usr/bin/time -v`
+    measures exactly one process's own peak, uncorrupted by history.
+    """
+    import json
+    import shutil
+
+    cmd = [sys.executable, "-m", "tools.benchmark", "--presets", preset,
+          "--out", str(work_root), "--seed", str(seed), "--_single-worker"]
+    time_bin = shutil.which("time") or "/usr/bin/time"
+    have_time = Path(time_bin).exists()
+    if have_time:
+        cmd = [time_bin, "-v"] + cmd
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    out = None
+    for line in proc.stdout.splitlines():
+        if line.startswith(_RESULT_PREFIX):
+            out = json.loads(line[len(_RESULT_PREFIX):])
+    if out is None:
+        return {"preset": preset, "registered": "FAILED: worker produced no result",
+               "runtime_s": 0.0,
+               "peak_rss_mb": 0.0, "_stderr": proc.stderr[-2000:]}
+    if have_time:
+        for line in proc.stderr.splitlines():
+            if "Maximum resident set size" in line:
+                try:
+                    out["peak_rss_mb"] = float(line.rsplit(":", 1)[1].strip()) / 1024
+                except (ValueError, IndexError):
+                    pass
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--presets", default=",".join(sorted(PRESETS)))
     ap.add_argument("--out", default=str(ROOT / "data" / "bench"))
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--md-out", default=None, help="optional path to also write the table")
+    ap.add_argument("--_single-worker", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
     presets = args.presets.split(",")
     work_root = Path(args.out)
     work_root.mkdir(parents=True, exist_ok=True)
 
-    rows = [run_preset(p, work_root, args.seed) for p in presets]
+    if args._single_worker:
+        # child mode: run exactly one preset and print its result as one
+        # JSON line the parent (`_run_preset_subprocess`) can extract
+        # regardless of anything else this process prints to stdout.
+        import json
+        result = run_preset(presets[0], work_root, args.seed)
+        print(_RESULT_PREFIX + json.dumps(result))
+        return
+
+    rows = [_run_preset_subprocess(p, work_root, args.seed) for p in presets]
 
     cols = ["preset", "registered", "scale_err_pct", "photo_vol_err_pct",
             "ortho_vol_err_pct", "cloud_rms_m", "runtime_s", "peak_rss_mb"]

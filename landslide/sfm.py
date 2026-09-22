@@ -35,8 +35,29 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 # (>24 GB with all-core extraction on ~7 MP phone photos). Four threads keep
 # extraction in the ~2-3 GB range; wall-time cost is small because extraction
 # is a minor share of total runtime (incremental mapping dominates and is
-# left multithreaded).
+# left multithreaded). Halved (F21/M8) on a machine with < 4 GB of physical
+# RAM, where a 2-worker pool is also cut to 1 (see server/executor.py) —
+# the two knobs share the same "this box is memory-constrained" trigger.
 SFM_THREADS = 4
+
+
+def _total_ram_bytes() -> int:
+    try:
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError, AttributeError):
+        return 0
+
+
+def _sfm_threads() -> int:
+    env = os.environ.get("SLOPELENS_SFM_THREADS")
+    if env:
+        try:
+            return max(1, int(env))
+        except ValueError:
+            pass
+    total = _total_ram_bytes()
+    return 2 if total and total < 4 * (1024 ** 3) else SFM_THREADS
+
 
 # Below this median per-image keypoint count the photo set is considered
 # low-contrast (shadows, wet mud, washed-out gravel) and the CLAHE-enhanced
@@ -179,6 +200,7 @@ class ReconCtx:
     scale_info: dict = field(default_factory=dict)
     dense: dict | None = None         # {'points': (M,3), 'colors': (M,3)} model units
     fingerprint: str = ""             # identifies this pose set; see build_ctx
+    warnings: list = field(default_factory=list)   # SfM-time diagnostics (F12)
 
     @property
     def scaled(self) -> bool:
@@ -193,6 +215,57 @@ class ReconCtx:
 
 def count_photos(photos_dir: Path) -> int:
     return sum(1 for p in photos_dir.iterdir() if p.suffix.lower() in IMAGE_EXTS)
+
+
+def _focal_spread(rec: pycolmap.Reconstruction) -> tuple[float, float, float]:
+    """(min_f, max_f, ratio) of per-camera focal length across the model.
+
+    A camera-by-camera PER_IMAGE self-calibration can diverge on a straight,
+    parallel-optical-axis path (the focal/depth ambiguity of pure
+    translation) or on a set with unstable per-image intrinsics — both cases
+    where the resulting model is geometrically wrong even though every image
+    registered (F12). `ratio` is 1.0 when every camera agrees.
+    """
+    focals = []
+    for cam in rec.cameras.values():
+        try:
+            f = float(cam.calibration_matrix()[0, 0])
+        except Exception:
+            continue
+        if f > 0:
+            focals.append(f)
+    if not focals:
+        return 0.0, 0.0, 1.0
+    lo, hi = min(focals), max(focals)
+    return lo, hi, (hi / lo if lo > 0 else float("inf"))
+
+
+def _camera_center_collinearity(rec: pycolmap.Reconstruction) -> float:
+    """2nd/1st singular value of the registered camera centers' spread.
+
+    Near 0 means the capture path is (near-)collinear — a drone line, a
+    single-line walk — the case where per-image focal self-calibration is
+    least constrained (F12) and most likely to diverge.
+    """
+    centers = []
+    for img in rec.images.values():
+        if not _prop(img, "has_pose"):
+            continue
+        cfw = _prop(img, "cam_from_world")
+        R = np.asarray(cfw.rotation.matrix(), np.float64)
+        t = np.asarray(cfw.translation, np.float64).ravel()
+        centers.append(camera_center(R, t))
+    if len(centers) < 3:
+        return 0.0
+    centers = np.array(centers)
+    _, S, _ = np.linalg.svd(centers - centers.mean(axis=0), full_matrices=False)
+    return float(S[1] / S[0]) if S[0] > 0 else 0.0
+
+
+# per-camera focal spread beyond this ratio means the attempt's intrinsics
+# are not trustworthy (F12) — one device shooting one scene should converge
+# to (near-)one focal length
+FOCAL_SPREAD_RATIO_BAD = 1.15
 
 
 def _attempt_score(nreg: int, npts: int) -> tuple[int, int, int]:
@@ -238,7 +311,9 @@ def reconstruct(photos_dir, workdir, max_image_size: int = 2400,
 
     attempts = _build_attempts(n, max_image_size)
 
-    best = None      # (score, rec, label, kp)
+    best = None          # (score, rec, label, kp, attempt_idx, focal_ratio)
+    last_idx = -1
+    locked_retry_done = False
     for i, a in enumerate(attempts):
         if a.get("enhanced") and best is not None \
                 and best[3] >= LOW_CONTRAST_KP:
@@ -253,13 +328,41 @@ def reconstruct(photos_dir, workdir, max_image_size: int = 2400,
                 shared_camera=a["shared_camera"],
                 enhanced=a.get("enhanced", False),
                 peak=a.get("peak"), edge=a.get("edge"),
-                global_mode=a.get("global_mode", False), log=log)
+                global_mode=a.get("global_mode", False),
+                lock_focal=a.get("lock_focal", False), log=log)
         except Exception as e:
             log(f"[sfm] attempt '{a['label']}' failed: {e}")
             continue
+        last_idx = i
         score = _attempt_score(nreg, len(rec.points3D))
+
+        # F12: a camera-by-camera self-calibration that diverges is a
+        # geometrically wrong model even when every image registered —
+        # whether from the focal/depth ambiguity of a (near-)collinear path
+        # or from a handful of individually unstable per-image intrinsics
+        # (e.g. two cameras converging to a wildly different focal on an
+        # otherwise normal path). Detected here (not just logged) so a
+        # bad-focal attempt gets a focal-locked shared-intrinsics retry
+        # NEXT, not after every other rung of the ladder has also been
+        # tried.
+        _, _, ratio = _focal_spread(rec)
+        if ratio > FOCAL_SPREAD_RATIO_BAD:
+            collin = _camera_center_collinearity(rec)
+            log(f"[sfm] attempt '{a['label']}': per-camera focal length "
+                f"spread {ratio:.2f}x (>{FOCAL_SPREAD_RATIO_BAD}x is "
+                f"unreliable self-calibration; path collinearity {collin:.3f})")
+            if not locked_retry_done and not a.get("lock_focal"):
+                locked_retry_done = True
+                log("[sfm] unstable per-camera focal — retrying next with "
+                    "one shared, unrefined focal length")
+                attempts.insert(i + 1, {
+                    "label": "shared intrinsics (focal-locked)",
+                    "matcher": a["matcher"], "overlap": a["overlap"],
+                    "size": a["size"], "shared_camera": True,
+                    "lock_focal": True})
+
         if best is None or score > best[0]:
-            best = (score, rec, a["label"], kp)
+            best = (score, rec, a["label"], kp, i, ratio)
         done = (score[0] == 1 and nreg >= max(3, int(0.9 * n)))
         if done:
             break
@@ -274,7 +377,7 @@ def reconstruct(photos_dir, workdir, max_image_size: int = 2400,
             "SfM failed to produce any reconstruction. Check that photos have "
             "60-80% overlap, are sharp, and the scene has texture.")
 
-    _, best_rec, best_label, _ = best
+    _, best_rec, best_label, _, best_idx, best_focal_ratio = best
     best_nreg = _prop(best_rec, "num_reg_images")
     best_pts = len(best_rec.points3D)
     log(f"[sfm] reconstruction done ({best_label}): {best_nreg}/{n} images "
@@ -286,21 +389,48 @@ def reconstruct(photos_dir, workdir, max_image_size: int = 2400,
     if best_pts < MIN_SPARSE_PER_IMG * max(best_nreg, 1):
         log(f"[sfm] warning: thin geometry ({best_pts} points for "
             f"{best_nreg} images) — volume accuracy will be limited")
-    return build_ctx(best_rec, photos_dir, workdir)
+
+    # F7: every attempt wipes and rewrites workdir/sparse, so the ladder
+    # leaves the LAST attempt tried on disk, not necessarily the best one —
+    # every later stage (`reconstruct(reuse=True)`, the dense cache
+    # fingerprint) reloads from disk, so a silently worse model would be
+    # used everywhere downstream. Make disk match `best` when they differ.
+    if best_idx != last_idx:
+        out_dir = workdir / "sparse"
+        shutil.rmtree(out_dir, ignore_errors=True)
+        out_dir.mkdir(parents=True)
+        model_dir = out_dir / "0"
+        model_dir.mkdir()
+        best_rec.write(str(model_dir))
+        log(f"[sfm] disk held the last attempt tried, not the best one — "
+            f"rewrote sparse/ with the winning '{best_label}' model")
+
+    ctx = build_ctx(best_rec, photos_dir, workdir)
+    if best_focal_ratio > FOCAL_SPREAD_RATIO_BAD:
+        ctx.warnings.append(
+            f"per-camera focal length varies {best_focal_ratio:.2f}x across "
+            "the reconstruction — geometry (and volume) may be systematically "
+            "distorted; this is common on a straight-line or single-device "
+            "capture where self-calibration is poorly constrained")
+    return ctx
 
 
 def _run_attempt(photos_dir: Path, workdir: Path, n: int, matcher: str,
                  overlap: int, max_image_size: int, shared_camera: bool,
                  log: Log, enhanced: bool = False,
                  peak: float | None = None, edge: float | None = None,
-                 global_mode: bool = False):
+                 global_mode: bool = False, lock_focal: bool = False):
     """One full SfM pass; wipes any previous database first.
 
     enhanced=True runs the pass on CLAHE+unsharp copies (same filenames,
     same geometry — the poses apply to the originals unchanged) with the
     SIFT peak/edge thresholds relaxed to keep weak low-contrast texture.
     global_mode=True recovers poses with GLOMAP (one-shot global SfM)
-    instead of incremental mapping.
+    instead of incremental mapping. lock_focal=True (F12) disables bundle
+    adjustment's own focal refinement — combined with shared_camera=True,
+    every image is pinned to the single EXIF-seeded focal length instead of
+    each image being free to drift toward the focal/depth ambiguity of a
+    collinear or parallel-optical-axis path.
     Returns (reconstruction, n_registered, median_keypoints_per_image).
     """
     db_path = workdir / "database.db"
@@ -333,7 +463,7 @@ def _run_attempt(photos_dir: Path, workdir: Path, n: int, matcher: str,
     try:
         # per-thread SIFT cost grows with the working resolution: the 3200px
         # retry attempt runs with half the threads to hold the same ceiling
-        threads = min(SFM_THREADS, os.cpu_count() or 1)
+        threads = min(_sfm_threads(), os.cpu_count() or 1)
         if max_image_size > 2400:
             threads = max(2, threads // 2)
         fo.num_threads = threads
@@ -364,7 +494,7 @@ def _run_attempt(photos_dir: Path, workdir: Path, n: int, matcher: str,
 
     matching = pycolmap.FeatureMatchingOptions()
     try:
-        matching.num_threads = min(SFM_THREADS, os.cpu_count() or 1)
+        matching.num_threads = min(_sfm_threads(), os.cpu_count() or 1)
     except Exception:
         pass
     try:
@@ -400,10 +530,18 @@ def _run_attempt(photos_dir: Path, workdir: Path, n: int, matcher: str,
         except Exception as e:
             raise RuntimeError(f"global mapping failed: {e}")
     else:
-        log("[sfm] incremental mapping (this is the slow part)")
+        log("[sfm] incremental mapping (this is the slow part)"
+            + (", focal length locked to the EXIF/shared prior" if lock_focal else ""))
+        mo = pycolmap.IncrementalPipelineOptions()
+        if lock_focal:
+            try:
+                mo.ba_refine_focal_length = False
+            except Exception:
+                pass
         result = pycolmap.incremental_mapping(database_path=str(db_path),
                                               image_path=str(img_dir),
-                                              output_path=str(out_dir))
+                                              output_path=str(out_dir),
+                                              options=mo)
     rec = _largest_reconstruction(result, out_dir)
     return rec, _prop(rec, "num_reg_images"), _median_keypoints(db_path)
 

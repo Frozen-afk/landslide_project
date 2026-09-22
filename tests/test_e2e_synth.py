@@ -103,10 +103,10 @@ def test_volume_end_to_end(ctx, synth):
     rel_err = abs(res["cut_volume_m3"] - truth) / truth
     assert rel_err < 0.30, f"cut {res['cut_volume_m3']:.1f} vs truth {truth:.1f}"
     assert res["fill_volume_m3"] < 0.35 * truth
-    # T1.4 multi-view depth fusion trades raw point count for per-point
-    # cross-neighbour confidence (min. 2-of-k agreeing depth estimates),
-    # so the cloud is smaller but cleaner than the old per-pair union
-    assert res["n_points"] > 500
+    # F2/F8: restored from the 500 that was masking the voxel-starvation bug
+    # (a healthy fused cloud on this scene measures ~70k interior points;
+    # 5000 is a floor, not the expected number)
+    assert res["n_points"] > 5000
 
 
 def test_volume_ortho_end_to_end(ctx, synth, tmp_path):
@@ -147,7 +147,5 @@ def test_volume_ortho_end_to_end(ctx, synth, tmp_path):
     assert res["mode"] == "ortho"
     rel_err = abs(res["cut_volume_m3"] - truth) / truth
     assert rel_err < 0.30, f"cut {res['cut_volume_m3']:.1f} vs truth {truth:.1f}"
-    # T1.4 multi-view depth fusion trades raw point count for per-point
-    # cross-neighbour confidence (min. 2-of-k agreeing depth estimates),
-    # so the cloud is smaller but cleaner than the old per-pair union
-    assert res["n_points"] > 500
+    # F2/F8: restored from the 500 that was masking the voxel-starvation bug
+    assert res["n_points"] > 5000

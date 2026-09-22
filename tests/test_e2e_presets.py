@@ -41,6 +41,35 @@ def _gen(preset: str):
     return d, json.loads((d / "ground_truth.json").read_text())
 
 
+def _ortho_polygon_px(ctx, gt, meta):
+    """Ground-truth polygon (world circle) -> model frame -> ortho pixels.
+
+    Same construction as `test_e2e_synth.py`/`tools/benchmark.py`, using the
+    pose-aware (F13) alignment so a (near-)collinear preset's polygon lands
+    in the right place instead of off by the free rotation about the line.
+    """
+    from tools.benchmark import _umeyama_pose_aware
+
+    from landslide.densify import estimate_up
+    from landslide.geometry import camera_center
+    from landslide.ortho import ground_basis
+
+    e1, e2 = ground_basis(estimate_up(ctx.views, ctx.sparse))
+    names = sorted(ctx.views)
+    P = np.array([camera_center(ctx.views[n].R, ctx.views[n].t) for n in names]) * ctx.scale
+    Q = np.array([gt["poses"][n]["eye"] for n in names])
+    fwd_p = np.array([ctx.views[n].R[2, :] for n in names])
+    fwd_q = np.array([np.asarray(gt["poses"][n]["R"])[2, :] for n in names])
+    s, Rm, t = _umeyama_pose_aware(P, Q, P + fwd_p, Q + fwd_q)
+    cx, cy, r = gt["bowl"]["x"], gt["bowl"]["y"], gt["polygon_radius_m"]
+    ang = np.linspace(0, 2 * np.pi, 72, endpoint=False)
+    circle_world = np.column_stack([cx + r * np.cos(ang), cy + r * np.sin(ang),
+                                    np.zeros(72)])
+    circle_model = ((circle_world - t) @ Rm) / s
+    return np.column_stack([(circle_model @ e1 - meta["u0"]) / meta["res"],
+                            (circle_model @ e2 - meta["v0"]) / meta["res"]])
+
+
 # ---------------------------------------------------------------- sparse8 --
 @pytest.fixture(scope="module")
 def sparse8():
@@ -119,43 +148,235 @@ def test_nadir_scale_is_known_bad(nadir):
     assert rel < 0.60, "scale error grew past the pinned baseline — investigate"
 
 
-# ---------------- generators implemented, full run deferred (time budget) --
-# `python -m tools.synth.py --preset <name>` works for all of these (GT-polygon
-# frame-containment verified for every preset at generation time — see
-# tools/synth.py's own assertions) and `python -m tools.benchmark --preset
-# <name>` will produce the real numbers to replace these skips; a from-scratch
-# SfM+dense+measure run costs several minutes each and only sparse8/nadir
-# were run in this pass (see IMPLEMENTATION_PROGRESS.md's Tier 3 section).
-@pytest.mark.skip(reason="generator implemented, not yet benchmarked — run "
-                         "`python -m tools.benchmark --presets oblique60` "
-                         "and pin real thresholds here")
-def test_oblique60_e2e():
-    pass
+# -------------------------------------------------------------- oblique60 --
+@pytest.fixture(scope="module")
+def oblique60():
+    return _gen("oblique60")
 
 
-@pytest.mark.skip(reason="generator implemented, not yet benchmarked — run "
-                         "`python -m tools.benchmark --presets descending` "
-                         "and pin real thresholds here")
-def test_descending_e2e():
-    pass
+def test_oblique60_marker_is_known_undetected(oblique60):
+    """Known limitation (F23), not a regression target: the 2m ArUco board
+    at ~10m from a 60deg-oblique, close-in camera path is only visible
+    (post-detection-threshold) in a single frame, so `aruco_scale` can't
+    triangulate corners from a stereo pair of views and raises. Real field
+    markers are smaller and closer, which is a different failure mode
+    (H2, out of scope here); this test pins "registers fine, scale
+    correctly refuses" so a future scale-path change must notice this case
+    explicitly rather than silently starting to "succeed" with a garbage
+    scale.
+    """
+    from landslide.scaling import aruco_scale
+    from landslide.sfm import reconstruct
+    d, gt = oblique60
+    ctx = reconstruct(d / "images", d / "work", reuse=True, log=print)
+    assert len(ctx.views) == 21
+    with pytest.raises(Exception):
+        aruco_scale(ctx, side_m=gt["marker"]["side"], dict_name="auto", log=print)
 
 
-@pytest.mark.skip(reason="generator implemented, not yet benchmarked — run "
-                         "`python -m tools.benchmark --presets collinear` "
-                         "and pin real thresholds here")
-def test_collinear_e2e():
-    pass
+# ------------------------------------------------------------- descending --
+@pytest.fixture(scope="module")
+def descending():
+    return _gen("descending")
 
 
-@pytest.mark.skip(reason="generator implemented, not yet benchmarked — run "
-                         "`python -m tools.benchmark --presets lowtex` "
-                         "and pin real thresholds here")
-def test_lowtex_e2e():
-    pass
+def test_descending_registers_most_views(descending):
+    from landslide.sfm import reconstruct
+    d, gt = descending
+    ctx = reconstruct(d / "images", d / "work", reuse=True, log=print)
+    assert len(ctx.views) >= 20
 
 
-@pytest.mark.skip(reason="generator implemented, not yet benchmarked — run "
-                         "`python -m tools.benchmark --presets distorted` "
-                         "and pin real thresholds here")
-def test_distorted_e2e():
-    pass
+def test_descending_focal_spread_is_tight(descending):
+    """F12: a walking-downhill capture isn't collinear, but per-image
+    self-calibration can still drift on a couple of cameras; the fix (an
+    unrefined shared-focal retry when the spread is bad) must keep the
+    registered set's focal lengths close together."""
+    from landslide.sfm import _focal_spread, reconstruct
+    d, gt = descending
+    ctx = reconstruct(d / "images", d / "work", reuse=True, log=print)
+    lo, hi, ratio = _focal_spread(ctx.rec)
+    assert ratio < 1.15, f"focal spread {ratio:.2f}x (lo {lo:.0f}, hi {hi:.0f})"
+
+
+def test_descending_volume(descending):
+    from landslide.pipeline import measure
+    from landslide.scaling import aruco_scale
+    from landslide.sfm import reconstruct
+    d, gt = descending
+    ctx = reconstruct(d / "images", d / "work", reuse=True, log=print)
+    aruco_scale(ctx, side_m=gt["marker"]["side"], log=print)
+    truth = gt["volume_true_polygon_m3"]
+    res = measure(ctx, gt["polygon_image"], gt["polygon_px"], dense=True,
+                  rim_px=14.0, artifacts_dir=d / "artifacts", log=print)
+    rel_err = abs(res["cut_volume_m3"] - truth) / truth
+    print(f"\nDESCENDING VOLUME: cut {res['cut_volume_m3']:.1f} vs truth "
+          f"{truth:.1f} ({rel_err * 100:.1f}%)")
+    # F12 fixed the focal-spread symptom this preset was diagnosed with
+    # (see test_descending_focal_spread_is_tight — a fresh run now measures
+    # a tight ~1.1x spread, not the ~2.7x wild-camera outlier the audit
+    # found), but photo-mode volume error stays high (measured ~55%) on a
+    # walking-downhill path — a real, DIFFERENT limitation of the
+    # image-plane region-selection fallback on a steep, non-level camera
+    # path, not something F12/M6 addresses. Pinned to the real number, not
+    # the audit's aspirational <25%, per this file's own rule.
+    assert rel_err < 0.65, f"cut {res['cut_volume_m3']:.1f} vs truth {truth:.1f}"
+
+
+# --------------------------------------------------------------- collinear --
+@pytest.fixture(scope="module")
+def collinear():
+    return _gen("collinear")
+
+
+def test_collinear_registers_all_views(collinear):
+    from landslide.sfm import reconstruct
+    d, gt = collinear
+    ctx = reconstruct(d / "images", d / "work", reuse=True, log=print)
+    assert len(ctx.views) == 21
+
+
+def test_collinear_volume(collinear):
+    """F13: the harness's own alignment (used only for cloud_rms/ortho-
+    polygon placement, not by the pipeline) has a free rotation about a
+    straight camera line unless pose-aware — see `_ortho_polygon_px`."""
+    from landslide.pipeline import measure
+    from landslide.scaling import aruco_scale
+    from landslide.sfm import reconstruct
+    d, gt = collinear
+    ctx = reconstruct(d / "images", d / "work", reuse=True, log=print)
+    aruco_scale(ctx, side_m=gt["marker"]["side"], log=print)
+    truth = gt["volume_true_polygon_m3"]
+    res = measure(ctx, gt["polygon_image"], gt["polygon_px"], dense=True,
+                  rim_px=14.0, artifacts_dir=d / "artifacts", log=print)
+    rel_err = abs(res["cut_volume_m3"] - truth) / truth
+    print(f"\nCOLLINEAR PHOTO: cut {res['cut_volume_m3']:.1f} vs truth "
+          f"{truth:.1f} ({rel_err * 100:.1f}%)")
+    assert rel_err < 0.25, f"cut {res['cut_volume_m3']:.1f} vs truth {truth:.1f}"
+
+
+def test_collinear_ortho_volume(collinear, tmp_path):
+    from landslide.densify import dense_cloud
+    from landslide.ortho import render_orthophoto
+    from landslide.pipeline import measure
+    from landslide.scaling import aruco_scale
+    from landslide.sfm import reconstruct
+    d, gt = collinear
+    ctx = reconstruct(d / "images", d / "work", reuse=True, log=print)
+    aruco_scale(ctx, side_m=gt["marker"]["side"], log=print)
+    dense_cloud(ctx, log=print)
+    _, meta = render_orthophoto(ctx, jpg_path=tmp_path / "ortho.jpg",
+                                meta_path=tmp_path / "ortho.json", log=print)
+    poly_px = _ortho_polygon_px(ctx, gt, meta)
+    truth = gt["volume_true_polygon_m3"]
+    res = measure(ctx, None, poly_px, dense=True, mode="ortho", ortho=meta,
+                  artifacts_dir=tmp_path, log=print)
+    rel_err = abs(res["cut_volume_m3"] - truth) / truth
+    print(f"\nCOLLINEAR ORTHO: cut {res['cut_volume_m3']:.1f} vs truth "
+          f"{truth:.1f} ({rel_err * 100:.1f}%)")
+    assert rel_err < 0.25, f"cut {res['cut_volume_m3']:.1f} vs truth {truth:.1f}"
+
+
+# ----------------------------------------------------------------- lowtex --
+@pytest.fixture(scope="module")
+def lowtex():
+    return _gen("lowtex")
+
+
+def test_lowtex_registers_all_views(lowtex):
+    from landslide.sfm import reconstruct
+    d, gt = lowtex
+    ctx = reconstruct(d / "images", d / "work", reuse=True, log=print)
+    assert len(ctx.views) == 21
+
+
+def test_lowtex_volume(lowtex):
+    from landslide.pipeline import measure
+    from landslide.scaling import aruco_scale
+    from landslide.sfm import reconstruct
+    d, gt = lowtex
+    ctx = reconstruct(d / "images", d / "work", reuse=True, log=print)
+    aruco_scale(ctx, side_m=gt["marker"]["side"], log=print)
+    truth = gt["volume_true_polygon_m3"]
+    res = measure(ctx, gt["polygon_image"], gt["polygon_px"], dense=True,
+                  rim_px=14.0, artifacts_dir=d / "artifacts", log=print)
+    rel_err = abs(res["cut_volume_m3"] - truth) / truth
+    print(f"\nLOWTEX PHOTO: cut {res['cut_volume_m3']:.1f} vs truth "
+          f"{truth:.1f} ({rel_err * 100:.1f}%)")
+    assert rel_err < 0.20, f"cut {res['cut_volume_m3']:.1f} vs truth {truth:.1f}"
+
+
+def test_lowtex_ortho_volume(lowtex, tmp_path):
+    from landslide.densify import dense_cloud
+    from landslide.ortho import render_orthophoto
+    from landslide.pipeline import measure
+    from landslide.scaling import aruco_scale
+    from landslide.sfm import reconstruct
+    d, gt = lowtex
+    ctx = reconstruct(d / "images", d / "work", reuse=True, log=print)
+    aruco_scale(ctx, side_m=gt["marker"]["side"], log=print)
+    dense_cloud(ctx, log=print)
+    _, meta = render_orthophoto(ctx, jpg_path=tmp_path / "ortho.jpg",
+                                meta_path=tmp_path / "ortho.json", log=print)
+    poly_px = _ortho_polygon_px(ctx, gt, meta)
+    truth = gt["volume_true_polygon_m3"]
+    res = measure(ctx, None, poly_px, dense=True, mode="ortho", ortho=meta,
+                  artifacts_dir=tmp_path, log=print)
+    rel_err = abs(res["cut_volume_m3"] - truth) / truth
+    print(f"\nLOWTEX ORTHO: cut {res['cut_volume_m3']:.1f} vs truth "
+          f"{truth:.1f} ({rel_err * 100:.1f}%)")
+    assert rel_err < 0.10, f"cut {res['cut_volume_m3']:.1f} vs truth {truth:.1f}"
+
+
+# --------------------------------------------------------------- distorted --
+@pytest.fixture(scope="module")
+def distorted():
+    return _gen("distorted")
+
+
+def test_distorted_registers_all_views(distorted):
+    from landslide.sfm import reconstruct
+    d, gt = distorted
+    ctx = reconstruct(d / "images", d / "work", reuse=True, log=print)
+    assert len(ctx.views) == 21
+
+
+def test_distorted_volume(distorted):
+    from landslide.pipeline import measure
+    from landslide.scaling import aruco_scale
+    from landslide.sfm import reconstruct
+    d, gt = distorted
+    ctx = reconstruct(d / "images", d / "work", reuse=True, log=print)
+    aruco_scale(ctx, side_m=gt["marker"]["side"], log=print)
+    truth = gt["volume_true_polygon_m3"]
+    res = measure(ctx, gt["polygon_image"], gt["polygon_px"], dense=True,
+                  rim_px=14.0, artifacts_dir=d / "artifacts", log=print)
+    rel_err = abs(res["cut_volume_m3"] - truth) / truth
+    print(f"\nDISTORTED PHOTO: cut {res['cut_volume_m3']:.1f} vs truth "
+          f"{truth:.1f} ({rel_err * 100:.1f}%)")
+    # measured 23.9% (vs the plan's aspirational 20%) — real distortion-model
+    # residual after undistortion, not guessed; pinned per this file's own
+    # "record a bad number as a bad number" rule
+    assert rel_err < 0.30, f"cut {res['cut_volume_m3']:.1f} vs truth {truth:.1f}"
+
+
+def test_distorted_ortho_volume(distorted, tmp_path):
+    from landslide.densify import dense_cloud
+    from landslide.ortho import render_orthophoto
+    from landslide.pipeline import measure
+    from landslide.scaling import aruco_scale
+    from landslide.sfm import reconstruct
+    d, gt = distorted
+    ctx = reconstruct(d / "images", d / "work", reuse=True, log=print)
+    aruco_scale(ctx, side_m=gt["marker"]["side"], log=print)
+    dense_cloud(ctx, log=print)
+    _, meta = render_orthophoto(ctx, jpg_path=tmp_path / "ortho.jpg",
+                                meta_path=tmp_path / "ortho.json", log=print)
+    poly_px = _ortho_polygon_px(ctx, gt, meta)
+    truth = gt["volume_true_polygon_m3"]
+    res = measure(ctx, None, poly_px, dense=True, mode="ortho", ortho=meta,
+                  artifacts_dir=tmp_path, log=print)
+    rel_err = abs(res["cut_volume_m3"] - truth) / truth
+    print(f"\nDISTORTED ORTHO: cut {res['cut_volume_m3']:.1f} vs truth "
+          f"{truth:.1f} ({rel_err * 100:.1f}%)")
+    assert rel_err < 0.20, f"cut {res['cut_volume_m3']:.1f} vs truth {truth:.1f}"

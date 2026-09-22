@@ -9,9 +9,11 @@ import pytest
 from PIL import Image
 
 from landslide.densify import dense_cloud
-from landslide.pipeline import import_photos
+from landslide.pipeline import import_photos, measure
 from landslide.sfm import ImageView, ReconCtx
 from landslide.volume import prism_volume, select_region
+
+from test_volume import make_bowl_points
 
 
 # ---------- T0.1: EXIF focal prior survives the re-encode ----------
@@ -48,7 +50,7 @@ def test_stale_dense_cache_is_rejected(tmp_path, monkeypatch):
     ctx = ReconCtx(rec=None, views={}, sparse=np.zeros((1, 3)),
                    sparse_colors=np.zeros((1, 3)), photos_dir=tmp_path,
                    workdir=tmp_path, fingerprint="aaaaaaaa")
-    cache = tmp_path / "dense_1280_aaaaaaaa.npz"
+    cache = tmp_path / "dense_1280_v2_aaaaaaaa.npz"
     np.savez_compressed(cache, points=np.ones((5, 3)), colors=np.ones((5, 3)),
                         fingerprint="bbbbbbbb")   # written by a different pose set
 
@@ -117,6 +119,42 @@ def test_symmetric_low_clip_keeps_deep_cuts_drops_floaters():
                                log=lambda *_: None)
     assert res_floater["n_low_dropped"] == 1
     assert abs(res_floater["cut_volume_m3"] - res_clean["cut_volume_m3"]) < 0.5
+
+
+# ---------- F4: scale error must propagate as volume^(1/3) (factor 3, not 2) ----------
+
+def test_measure_scale_error_widens_ci_by_cube_power():
+    """A 10% scale error must widen the reported interval by >= 30% of |net|
+    (dV/V = 3 * ds/s, not 2 — see POST_IMPLEMENTATION_AUDIT.md F4)."""
+    # select_region_ortho picks its OWN rim band (6-30x median point
+    # spacing, clipped to [0.5, 2.5] m for this cloud's spacing) rather than
+    # trusting a caller-supplied ring, so the synthetic rim must sit in that
+    # band — not make_bowl_points' own narrow 0.35 m rim — for the datum to
+    # actually be "rim_plane" (and a CI to be computed at all).
+    interior, _, _ = make_bowl_points(rim_width=0.0)
+    r_poly = 5.6
+    theta = np.linspace(0, 2 * np.pi, 400, endpoint=False)
+    radii = np.linspace(r_poly + 0.5, r_poly + 2.5, 8)
+    rr, tt = np.meshgrid(radii, theta)
+    rim = np.stack([rr.ravel() * np.cos(tt.ravel()), rr.ravel() * np.sin(tt.ravel()),
+                    np.zeros(rr.size)], axis=1)
+    ctx = ReconCtx(rec=None, views={}, sparse=np.zeros((1, 3)),
+                  sparse_colors=np.zeros((1, 3)), photos_dir=Path("."),
+                  workdir=Path("."), scale=1.0,
+                  scale_info={"applied": True, "scale": 1.0,
+                              "scale_rel_error": 0.10})
+    ctx.dense = {"points": np.vstack([interior, rim]),
+                "colors": np.zeros((len(interior) + len(rim), 3))}
+    ang = np.linspace(0, 2 * np.pi, 72, endpoint=False)
+    polygon_px = np.column_stack([r_poly * np.cos(ang), r_poly * np.sin(ang)])
+    ortho = {"e1": [1.0, 0.0, 0.0], "e2": [0.0, 1.0, 0.0], "up": [0.0, 0.0, 1.0],
+             "u0": 0.0, "v0": 0.0, "res": 1.0}
+    res = measure(ctx, None, polygon_px, dense=True, mode="ortho", ortho=ortho,
+                  log=lambda *_: None)
+    net = res["net_volume_m3"]
+    lo, hi = res["net_volume_ci95_m3"]
+    assert (hi - net) >= 0.30 * abs(net) - 1e-6
+    assert (net - lo) >= 0.30 * abs(net) - 1e-6
 
 
 # ---------- T0.6: request bodies reject malformed input instead of crashing ----------

@@ -20,6 +20,7 @@ from typing import Optional
 
 import cv2
 from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response, StreamingResponse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -81,7 +82,12 @@ async def create_job(files: list[UploadFile] = File(...)):
                                                  f"than {MAX_FILE_MB} MB")
                     out.write(chunk)
             tmp_paths.append(dst)
-        names = import_photos(tmp_paths, job.dir / "photos", log=job.say)
+        # F14: PIL EXIF-transpose + LANCZOS resize + Laplacian over up to 200
+        # photos is tens of seconds of pure CPU — run off the event loop so
+        # every other request (polls, SSE, other users' uploads) isn't
+        # frozen for the duration.
+        names = await run_in_threadpool(import_photos, tmp_paths,
+                                        job.dir / "photos", log=job.say)
         job.say(f"stored {len(names)} photos")
     except HTTPException:
         job.set_status("error", "upload failed: unsupported/oversized file")
@@ -203,6 +209,21 @@ def _get_ready_job(job_id: str) -> Job:
     return job
 
 
+def _invalidate_scale_dependents(job: Job) -> None:
+    """A re-scale (ArUco or manual) changes every metric quantity derived
+    from the old scale — the orthophoto's u0/v0/res, the DEM alignment
+    (R/t fit against the old-scale cloud) and any prior measurement — so all
+    three must be dropped (F5), not silently left stale for the next
+    ortho-mode trace or measure to use without the user ever re-running
+    them."""
+    job.ortho = None
+    job.dem_info = None
+    job.result = None
+    for name in ("ortho.jpg", "ortho.json"):
+        (job.dir / "artifacts" / name).unlink(missing_ok=True)
+    (job.dir / "dem.xyz").unlink(missing_ok=True)
+
+
 def _attach_geo(job: Job) -> None:
     """Georeference annotation once the metric scale is known."""
     try:
@@ -222,6 +243,7 @@ def scale_aruco(job_id: str, spec: ArucoScaleRequest):
                            dict_name=spec.dict_name,
                            marker_id=spec.id, log=job.say)
         job.scale_info = {k: v for k, v in info.items() if k != "marker_px"}
+        _invalidate_scale_dependents(job)
         _attach_geo(job)
         job.save_state()
         return {k: v for k, v in info.items() if k != "marker_px"}
@@ -237,6 +259,7 @@ def scale_manual(job_id: str, spec: ManualScaleRequest):
         info = manual_scale(job.ctx, spec.a.model_dump(), spec.b.model_dump(),
                             spec.length_m, log=job.say)
         job.scale_info = info
+        _invalidate_scale_dependents(job)
         _attach_geo(job)
         job.save_state()
         return info
@@ -298,6 +321,14 @@ def run_measure_endpoint(job_id: str, spec: MeasureRequest):
         raise HTTPException(400, "set the scale (reference object) first")
     if spec.mode == "ortho" and not job.ortho:
         raise HTTPException(400, "generate the top-down view first")
+    if spec.mode == "ortho" and job.ortho:
+        ortho_scale = job.ortho.get("scale")
+        cur_scale = (job.scale_info or {}).get("scale")
+        if ortho_scale is not None and cur_scale is not None \
+                and abs(ortho_scale - cur_scale) > 1e-9 * max(abs(cur_scale), 1.0):
+            raise HTTPException(409, "the top-down view was rendered at a "
+                                     "different scale (re-scaled since) — "
+                                     "generate it again")
     if not job.reconstructable:
         raise HTTPException(409, "this job has no cached reconstruction (it "
                                  "may have failed or been interrupted before "

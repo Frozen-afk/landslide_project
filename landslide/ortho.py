@@ -88,6 +88,7 @@ def render_orthophoto(ctx: ReconCtx, up=None, max_side: int = 1400,
         "width": width, "height": height,
         "up": np.asarray(up, np.float64).tolist(),
         "e1": e1.tolist(), "e2": e2.tolist(),
+        "scale": float(ctx.scale),   # F5: lets a stale ortho be detected after a re-scale
     }
     if meta_path is not None:
         Path(meta_path).write_text(json.dumps(meta))

@@ -1,8 +1,9 @@
 """Memory-bounding behaviour of the densify stage (no SfM needed)."""
 import numpy as np
 
-from landslide.densify import (StereoConfig, _cap_voxel, _fuse_depth_candidates,
-                               _pair_geometry_ok, surface_filter, voxel_downsample)
+from landslide.densify import (StereoConfig, _cap_voxel, _estimate_num_disp,
+                               _fuse_depth_candidates, _pair_geometry_ok,
+                               _sparse_extent, surface_filter, voxel_downsample)
 from landslide.sfm import ImageView
 
 
@@ -40,6 +41,46 @@ def test_cap_voxel_scales_and_respects_bound():
     cols = np.full((len(pts), 3), 128, np.uint8)
     p, _ = voxel_downsample(pts, cols, v)
     assert len(p) <= 1.3 * 2_500_000   # ~cap (density is not perfectly uniform)
+
+
+# ---------- F3/M3: disparity window must cover the sparse 1-99% depth range ----------
+
+def test_estimate_num_disp_covers_the_percentile_depth_range():
+    fx, baseline = 1700.0, 2.0
+    zmin, zmax = 8.0, 25.0             # sparse 1st/99th percentile depths
+    min_disp, num_disp_units = _estimate_num_disp(fx, baseline, zmin, zmax)
+    num_disp = num_disp_units * 16
+    d_far = fx * baseline / zmax       # disparity at the FARTHEST (1%) point
+    d_near = fx * baseline / zmin      # disparity at the NEAREST (99%) point
+    assert min_disp <= d_far
+    assert min_disp + num_disp >= d_near, \
+        "the search window must reach the near-field disparity, not truncate it"
+
+
+def test_estimate_num_disp_a_close_pair_needs_a_wider_window_than_a_far_pair():
+    fx, baseline = 1700.0, 2.0
+    _, close_units = _estimate_num_disp(fx, baseline, 5.0, 8.0)    # near scene
+    _, far_units = _estimate_num_disp(fx, baseline, 40.0, 60.0)    # far scene
+    assert close_units > far_units
+
+
+# ---------- F2/M2: sparse extent must not be inflated by far outliers ----------
+
+def test_sparse_extent_ignores_far_outliers():
+    rng = np.random.default_rng(0)
+    plane = np.column_stack([rng.uniform(0, 10, 10_000),
+                             rng.uniform(0, 10, 10_000),
+                             rng.normal(0, 0.01, 10_000)])
+    clean_extent = _sparse_extent(plane)
+
+    outliers = np.column_stack([rng.uniform(-100, 100, 20),
+                                rng.uniform(-100, 100, 20),
+                                rng.uniform(-100, 100, 20)])
+    contaminated_extent = _sparse_extent(np.vstack([plane, outliers]))
+
+    assert abs(contaminated_extent - clean_extent) < 0.10 * clean_extent
+    # sanity: the raw ptp WOULD have been badly inflated by those outliers
+    assert np.ptp(np.vstack([plane, outliers]), axis=0).max() > 5 * clean_extent
 
 
 def test_voxel_downsample_uniform_grid():

@@ -252,25 +252,35 @@ def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
 
     # propagated uncertainty: T2.2's bootstrap CI when the rim datum ran one
     # (net_volume_ci95_m3), widened by the scale error acting multiplicatively
-    # on the volume (2-sigma); falls back to the flat datum-roughness x area
-    # heuristic when no CI was computed (surface/DEM datum, thin rim)
+    # on the volume (2-sigma). est_volume_error_m3 is reported as the MAX of
+    # that CI half-width and the old flat datum-roughness x area + scale
+    # heuristic (F9): the resampling redesign (block-bootstrapped interior,
+    # coverage term) is a big enough change to this codebase's only real
+    # accuracy evidence that neither estimate is trusted alone yet — the
+    # heuristic is a floor, not replaced, until both are validated in the
+    # field (see POST_IMPLEMENTATION_AUDIT.md F9/M4).
     scale_rel = ctx.scale_info.get("scale_rel_error")
     if scale_rel:
         res["scale_rel_error"] = float(scale_rel)
     net = res["net_volume_m3"]
     ci = res.get("net_volume_ci95_m3")
+    # volume = area x height, area ~ s^2, height ~ s (s = the linear scale
+    # factor) so dV/V = 3 * ds/s — NOT 2 (F4): a 2x factor systematically
+    # under-states the scale contribution to the reported interval by 33%.
+    scale_term = 3.0 * scale_rel * abs(net) if scale_rel else 0.0
+    heuristic = res["datum_rms_m"] * res["area_m2"] + scale_term
     if ci is not None:
         lo, hi = ci
         if scale_rel:
-            pad = 2.0 * scale_rel * abs(net)
-            lo, hi = lo - pad, hi + pad
+            lo, hi = lo - scale_term, hi + scale_term
             res["net_volume_ci95_m3"] = [lo, hi]
-        res["est_volume_error_m3"] = float(max(net - lo, hi - net))
+        res["est_volume_error_m3"] = float(max(net - lo, hi - net, heuristic))
     elif scale_rel:
-        res["est_volume_error_m3"] = float(
-            res["datum_rms_m"] * res["area_m2"] + 2.0 * scale_rel * abs(net))
+        res["est_volume_error_m3"] = float(heuristic)
     for w in ctx.scale_info.get("warnings") or []:
         res.setdefault("warnings", []).append(f"scale: {w}")
+    for w in getattr(ctx, "warnings", None) or []:
+        res.setdefault("warnings", []).append(f"sfm: {w}")
 
     if artifacts_dir is not None:
         artifacts_dir = Path(artifacts_dir)

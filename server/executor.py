@@ -8,6 +8,7 @@ process, or every test that imports `server.routes` pays that cost.
 """
 from __future__ import annotations
 
+import os
 import threading
 import traceback
 from concurrent.futures import ProcessPoolExecutor
@@ -23,9 +24,68 @@ _log_queue = None
 _pool: ProcessPoolExecutor | None = None
 _drain_thread: threading.Thread | None = None
 
+_LOW_RAM_BYTES = 4 * (1024 ** 3)
+
+
+def _total_ram_bytes() -> int:
+    try:
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError, AttributeError):
+        return 0
+
+
+def max_workers() -> int:
+    """Pool size (F21/M8): 2 heavy workers x (1.5-3 GB SfM + dense stereo)
+    can exceed a small field laptop's RAM well before either worker OOMs on
+    its own; on a box with < 4 GB physical RAM, run one job at a time
+    instead. `SLOPELENS_WORKERS` overrides for an operator who knows their
+    hardware better than this heuristic.
+    """
+    env = os.environ.get("SLOPELENS_WORKERS")
+    if env:
+        try:
+            return max(1, int(env))
+        except ValueError:
+            pass
+    total = _total_ram_bytes()
+    return 1 if total and total < _LOW_RAM_BYTES else 2
+
+
+def _worker_mem_limit_bytes() -> int:
+    """Per-worker RLIMIT_AS (F21): an allocation past this raises (a
+    catchable) MemoryError inside the worker — surfaced as a normal job
+    error via `submit_job`'s exception handling — instead of the kernel OOM
+    -killing the process, which is exactly the crash F1 exists to survive
+    but is nicer to avoid triggering at all. Sized from actual machine RAM
+    (not a flat guess) so it neither starves a real measurement on a big
+    box nor allows one worker to take down a small one: `total * 0.8`
+    split evenly across the pool, leaving ~20% for the parent process + OS.
+    """
+    env = os.environ.get("SLOPELENS_WORKER_MEM_MB")
+    if env:
+        try:
+            return max(256, int(env)) * 1024 * 1024
+        except ValueError:
+            pass
+    total = _total_ram_bytes()
+    if not total:
+        return 0   # unknown RAM: no limit rather than guessing wrong
+    return max(int(1.5 * 1024 ** 3), int(0.8 * total) // max(max_workers(), 1))
+
+
+def _worker_init() -> None:
+    limit = _worker_mem_limit_bytes()
+    if not limit:
+        return
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+    except Exception:
+        pass   # e.g. platform without RLIMIT_AS — best-effort only
+
 
 def _new_pool() -> ProcessPoolExecutor:
-    return ProcessPoolExecutor(max_workers=2)
+    return ProcessPoolExecutor(max_workers=max_workers(), initializer=_worker_init)
 
 
 def _drain_log_queue() -> None:
@@ -52,10 +112,18 @@ def _ensure_started() -> None:
 
 
 def _recreate_pool() -> None:
+    """Swap in a fresh pool without calling `shutdown()` on the broken one.
+
+    `shutdown()` on a pool that `ProcessPoolExecutor` itself is in the middle
+    of tearing down (a worker crash) deadlocks: `terminate_broken` holds
+    `self.shutdown_lock` while it sets exceptions on pending futures, which
+    invokes this function's caller (`_cb`) *on that same thread*; re-entering
+    `shutdown()` then blocks forever on the non-reentrant lock it already
+    holds (F1). A broken pool is already tearing itself down, so just drop
+    the reference — nothing to shut down.
+    """
     global _pool
     with _state_lock:
-        if _pool is not None:
-            _pool.shutdown(wait=False, cancel_futures=True)
         _pool = _new_pool()
 
 

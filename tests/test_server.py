@@ -122,6 +122,92 @@ def test_measure_busy_race_is_atomic(ready_job, monkeypatch):
     assert len(calls) == 1
 
 
+# ---------- F14: photo import must not block the event loop ----------
+
+def test_photo_upload_import_does_not_block_other_requests(monkeypatch):
+    def slow_import(paths, dest, log=print):
+        time.sleep(1.0)
+        return [f"{i:03d}_x.jpg" for i in range(len(paths))]
+    monkeypatch.setattr("server.routes.import_photos", slow_import)
+
+    files = [("files", (f"{i}.jpg", b"x", "image/jpeg")) for i in range(3)]
+    with ThreadPoolExecutor(max_workers=2) as tp:
+        fut = tp.submit(lambda: client.post("/api/jobs", files=files))
+        time.sleep(0.2)   # let the upload land inside the slow import
+        t0 = time.time()
+        r = client.get("/api/jobs")
+        dt = time.time() - t0
+        upload = fut.result(timeout=10)
+    assert r.status_code == 200
+    assert dt < 0.5, f"GET /api/jobs took {dt:.2f}s while an import was in flight"
+    assert upload.status_code == 200
+
+
+# ---------- F21/M8: pool size / per-worker memory limit follow available RAM ----------
+
+def test_max_workers_drops_to_one_below_4gb(monkeypatch):
+    monkeypatch.delenv("SLOPELENS_WORKERS", raising=False)
+    monkeypatch.setattr(executor, "_total_ram_bytes", lambda: 3 * 1024 ** 3)
+    assert executor.max_workers() == 1
+    monkeypatch.setattr(executor, "_total_ram_bytes", lambda: 8 * 1024 ** 3)
+    assert executor.max_workers() == 2
+
+
+def test_max_workers_env_override_wins(monkeypatch):
+    monkeypatch.setenv("SLOPELENS_WORKERS", "3")
+    monkeypatch.setattr(executor, "_total_ram_bytes", lambda: 1 * 1024 ** 3)
+    assert executor.max_workers() == 3
+
+
+def test_worker_mem_limit_scales_with_ram_and_worker_count(monkeypatch):
+    monkeypatch.delenv("SLOPELENS_WORKER_MEM_MB", raising=False)
+    monkeypatch.delenv("SLOPELENS_WORKERS", raising=False)
+    monkeypatch.setattr(executor, "_total_ram_bytes", lambda: 8 * 1024 ** 3)
+    limit_2 = executor._worker_mem_limit_bytes()
+    assert limit_2 == pytest.approx(0.8 * 8 * 1024 ** 3 / 2)
+    monkeypatch.setattr(executor, "_total_ram_bytes", lambda: 0)   # unknown RAM
+    assert executor._worker_mem_limit_bytes() == 0
+
+
+# ---------- F5: a re-scale must invalidate the stale ortho/dem/result ----------
+
+def test_rescale_invalidates_ortho_dem_and_result(ready_job, monkeypatch):
+    import types
+    # ensure_ctx() short-circuits on a non-None ctx: no real COLMAP data
+    # needed, just something with the attributes save_state()/aruco_scale
+    # touch.
+    ready_job.ctx = types.SimpleNamespace(scale_info={})
+    ready_job.scale_info = {"applied": True, "scale": 1.0}
+    ready_job.ortho = {"scale": 1.0, "u0": 0.0, "v0": 0.0, "res": 1.0}
+    ready_job.dem_info = {"file": "dem.xyz", "R": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                          "t": [0, 0, 0], "rms_m": 0.1}
+    ready_job.result = {"net_volume_m3": 1.0}
+    monkeypatch.setattr(
+        "server.routes.aruco_scale",
+        lambda *a, **kw: {"applied": True, "scale": 2.0, "method": "aruco"})
+
+    r = client.post(f"/api/jobs/{ready_job.id}/scale/aruco", json={})
+    assert r.status_code == 200
+    assert ready_job.ortho is None
+    assert ready_job.dem_info is None
+    assert ready_job.result is None
+
+    calls = []
+    monkeypatch.setattr("server.routes.executor.submit_job",
+                        lambda *a, **kw: calls.append(a))
+    r2 = client.post(f"/api/jobs/{ready_job.id}/ortho")
+    assert r2.status_code == 200 and r2.json() == {"queued": True}
+    assert len(calls) == 1
+
+
+def test_ortho_measure_rejects_ortho_from_a_stale_scale(ready_job):
+    ready_job.scale_info = {"applied": True, "scale": 2.0}
+    ready_job.ortho = {"scale": 1.0, "u0": 0.0, "v0": 0.0, "res": 1.0}   # rendered pre-rescale
+    body = {"polygon": [[0, 0], [1, 0], [1, 1]], "mode": "ortho"}
+    r = client.post(f"/api/jobs/{ready_job.id}/measure", json=body)
+    assert r.status_code == 409
+
+
 # ---------- S2: a crashed worker must not take the server (or other jobs) down ----------
 
 def _crash_worker(job_id, photos_dir, work_dir, queue):

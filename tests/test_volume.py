@@ -1,6 +1,7 @@
 import numpy as np
 
-from landslide.volume import (fit_plane, fit_plane_robust, fit_quadratic,
+from landslide.volume import (_fill_small_holes, _raster_bin, bootstrap_volume_ci,
+                              fit_plane, fit_plane_robust, fit_quadratic,
                               prism_volume)
 
 
@@ -315,6 +316,98 @@ def make_s_curve_road_with_pile(step=0.22, half=2.0, pile_r=1.3,
     # cone pile volume above the road
     analytic = np.pi * pile_r ** 2 * pile_h / 3.0
     return interior, rim, analytic
+
+
+# ---------- F15/M4: T2.1/T2.2 unit tests (none existed before this audit) ----------
+
+def test_raster_bin_median_and_mad_per_cell():
+    # two points in one cell, one in another: median/count/sigma per cell
+    uv2 = np.array([[0.05, 0.05], [0.06, 0.06], [1.5, 1.5]])
+    h = np.array([1.0, 3.0, -2.0])
+    grid = _raster_bin(uv2, h, cell=1.0)
+    assert grid["nx"] == 3 and grid["ny"] == 3
+    cell0 = 0 * grid["nx"] + 0     # (0,0): both first points land here
+    cell1 = 1 * grid["nx"] + 1     # (1,1): the third point
+    assert grid["count"][cell0] == 2
+    assert grid["height"][cell0] == 2.0                 # median(1, 3)
+    assert grid["sigma"][cell0] == 1.4826 * 1.0          # MAD(1,3) around 2
+    assert grid["count"][cell1] == 1
+    assert grid["height"][cell1] == -2.0
+    assert grid["sigma"][cell1] == 0.0                   # single point, no spread
+
+
+def test_raster_bin_empty_cells_are_nan():
+    uv2 = np.array([[0.05, 0.05], [3.5, 3.5]])
+    h = np.array([1.0, 2.0])
+    grid = _raster_bin(uv2, h, cell=1.0)
+    empty = grid["count"] == 0
+    assert empty.any()
+    assert np.isnan(grid["height"][empty]).all()
+
+
+def test_fill_small_holes_fills_gap_enclosed_along_a_row():
+    # data - gap - data, 1 row: the gap has data on both sides of ITS OWN row
+    grid = {"nx": 3, "ny": 1, "height": np.array([1.0, np.nan, 3.0]),
+            "count": np.array([1, 0, 1])}
+    filled, valid, unmeasured = _fill_small_holes(grid, max_radius=20, min_neighbors=1)
+    assert valid[1] and not unmeasured[1]
+    assert filled[1] == 2.0                              # mean of the two neighbours
+
+
+def test_fill_small_holes_leaves_edge_gap_unmeasured():
+    # gap - gap - data: the gaps only ever see data on ONE side (edge of the
+    # real footprint, not an enclosed hole) -> left unfilled, flagged
+    grid = {"nx": 3, "ny": 1, "height": np.array([np.nan, np.nan, 1.0]),
+            "count": np.array([0, 0, 1])}
+    filled, valid, unmeasured = _fill_small_holes(grid, max_radius=20, min_neighbors=1)
+    assert not valid[0] and not valid[1]
+    assert unmeasured[0] and unmeasured[1]
+
+
+def test_fill_small_holes_does_not_bridge_a_diagonal_gap():
+    # data only at the two opposite corners of a 3x3 block: the center gap's
+    # OWN row and column are both entirely empty, so the 1D row/column
+    # enclosure check does not see the diagonal data at all (documented
+    # asymmetry, F15) — it must stay unfilled, not silently bridged.
+    height = np.full((3, 3), np.nan)
+    count = np.zeros((3, 3), np.int64)
+    height[0, 0], count[0, 0] = 1.0, 1
+    height[2, 2], count[2, 2] = 1.0, 1
+    grid = {"nx": 3, "ny": 3, "height": height.ravel(), "count": count.ravel()}
+    filled, valid, unmeasured = _fill_small_holes(grid, max_radius=20, min_neighbors=1)
+    center = 1 * 3 + 1
+    assert not valid[center]
+    assert not unmeasured[center]      # no data at all in its own row/column
+
+
+def test_bootstrap_volume_ci_returns_none_below_15_rim_points():
+    interior, rim, _ = make_bowl_points()
+    assert bootstrap_volume_ci(interior, rim[:14], None, 10.0, 10.0, 0.2,
+                               "rim_plane", log=lambda *_: None) is None
+
+
+def test_bootstrap_volume_ci_deterministic_for_fixed_seed():
+    interior, rim, _ = make_bowl_points()
+    up = np.array([0.0, 0.0, 1.0])
+    a = bootstrap_volume_ci(interior, rim, up, 5.0, 5.0, 0.5, "rim_plane",
+                            log=lambda *_: None, B=30, seed=0)
+    b = bootstrap_volume_ci(interior, rim, up, 5.0, 5.0, 0.5, "rim_plane",
+                            log=lambda *_: None, B=30, seed=0)
+    assert a == b
+
+
+def test_bootstrap_volume_ci_widens_with_rim_noise():
+    interior, rim, _ = make_bowl_points()
+    up = np.array([0.0, 0.0, 1.0])
+    clean = bootstrap_volume_ci(interior, rim, up, 5.0, 5.0, 0.5, "rim_plane",
+                                log=lambda *_: None, B=60, seed=0)
+    rng = np.random.default_rng(1)
+    noisy_rim = rim.copy()
+    noisy_rim[:, 2] += rng.normal(0, 0.15, len(rim))
+    noisy = bootstrap_volume_ci(interior, noisy_rim, up, 5.0, 5.0, 0.5, "rim_plane",
+                                log=lambda *_: None, B=60, seed=0)
+    assert clean is not None and noisy is not None
+    assert (noisy[0] + noisy[1]) > (clean[0] + clean[1])
 
 
 def test_s_curve_road_gets_membrane_datum():

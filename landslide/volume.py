@@ -100,7 +100,7 @@ def _med_abs_resid(pts: np.ndarray, keep: np.ndarray) -> float:
 
 
 def fit_plane_robust(pts: np.ndarray, iters: int = 3, clip: float = 2.5,
-                     min_keep_frac: float = 0.5):
+                     min_keep_frac: float = 0.5, ransac_iters: int = 250):
     """Sigma-clipped plane fit: (centroid, normal, in-plane basis, inlier_mask).
 
     Two candidates are refined and compared: the plain all-points clip (the
@@ -111,11 +111,17 @@ def fit_plane_robust(pts: np.ndarray, iters: int = 3, clip: float = 2.5,
     all-points fit). The seeded fit wins only when its plane explains the
     whole rim decisively better (median absolute residual over ALL points,
     so a tight fit on a tiny subset cannot win by construction).
+
+    `ransac_iters` (F10) is separate from `iters` (the clip-loop repeat
+    count): the primary fit needs the full RANSAC search, but
+    `bootstrap_volume_ci` calls this B times per measurement and only needs
+    each replicate's consensus plane to be roughly right, not the primary
+    fit's full search depth.
     """
     pts = np.asarray(pts, np.float64)
     keep_all = _clip_loop(pts, np.ones(len(pts), dtype=bool),
                           iters, clip, min_keep_frac)
-    seed = fit_plane_ransac(pts)
+    seed = fit_plane_ransac(pts, iters=ransac_iters)
     if seed is not None:
         keep_seed = _clip_loop(pts, seed, iters, clip, min_keep_frac)
         if keep_seed.sum() >= max(0.25 * len(pts), 15):
@@ -475,6 +481,15 @@ def _raster_bin(uv2: np.ndarray, h: np.ndarray, cell: float,
     steeper, sparser-stereo-coverage centre) during development, for cells
     that had perfectly good single-point data. A cell of 1 just carries no
     local sigma estimate (0, below); `sigma_datum` still bounds its LoD.
+
+    Vectorized (F10/M2): a Python loop over occupied cells dominated
+    `bootstrap_volume_ci`'s runtime once F2's fix stopped starving the
+    cloud (this is called once per bootstrap replicate). Per-cell median
+    and MAD are both computed via two `lexsort`s (group cells together,
+    then order each group's values / absolute deviations) instead of a
+    per-cell `np.median` call — the median/MAD of an odd-or-even-length
+    sorted run is just the mean of its two middle elements, so no Python
+    loop over cells is needed at all.
     """
     x0, y0 = float(uv2[:, 0].min()), float(uv2[:, 1].min())
     nx = int(np.ceil(np.ptp(uv2[:, 0]) / cell)) + 1
@@ -482,20 +497,26 @@ def _raster_bin(uv2: np.ndarray, h: np.ndarray, cell: float,
     ix = np.clip(((uv2[:, 0] - x0) / cell).astype(np.int64), 0, nx - 1)
     iy = np.clip(((uv2[:, 1] - y0) / cell).astype(np.int64), 0, ny - 1)
     flat = iy * nx + ix
-    order = np.argsort(flat, kind="stable")
+
+    order = np.lexsort((h, flat))              # grouped by cell, sorted by h within
     flat_s, h_s = flat[order], h[order]
     uniq, starts, counts = np.unique(flat_s, return_index=True, return_counts=True)
+    lo = starts + (counts - 1) // 2
+    hi = starts + counts // 2
+    med = 0.5 * (h_s[lo] + h_s[hi])             # median of each group (odd or even)
+
+    dev = np.abs(h_s - np.repeat(med, counts))  # aligned with h_s (same group order)
+    order2 = np.lexsort((dev, flat_s))          # re-sort each group by |deviation|
+    dev_s = dev[order2]
+    mad = 0.5 * (dev_s[lo] + dev_s[hi])
+
+    keep = counts >= min_cell_pts
     height = np.full(nx * ny, np.nan)
     sigma = np.zeros(nx * ny)
     count = np.zeros(nx * ny, np.int64)
-    for u, s0, c in zip(uniq.tolist(), starts.tolist(), counts.tolist()):
-        if c < min_cell_pts:
-            continue
-        vals = h_s[s0:s0 + c]
-        m = float(np.median(vals))
-        height[u] = m
-        sigma[u] = 1.4826 * float(np.median(np.abs(vals - m)))
-        count[u] = c
+    height[uniq[keep]] = med[keep]
+    sigma[uniq[keep]] = 1.4826 * mad[keep]
+    count[uniq[keep]] = counts[keep]
     return {"x0": x0, "y0": y0, "cell": cell, "nx": nx, "ny": ny,
             "height": height, "sigma": sigma, "count": count}
 
@@ -580,22 +601,26 @@ def _fill_small_holes(grid: dict, max_radius: int = 20, min_neighbors: int = 2):
 
 def bootstrap_volume_ci(interior: np.ndarray, rim: np.ndarray, up, cap: float,
                         cap_low: float, cell: float, datum: str, log: Log = print,
-                        B: int = 50, seed: int = 0):
-    """Resampling-based 95% net-volume SPREAD (T2.2), as (lo_offset, hi_offset)
-    to apply around the caller's own (TIN) net volume — NOT an absolute
-    interval. B bootstrap resamples of the rim points, each refitting the
-    datum plane (and quadratic, if the real fit used one) and recomputing the
-    fast raster net volume (no hole-fill) over the fixed interior points.
-    Only the replicate-to-replicate spread is trusted, not the raster net's
-    absolute level (it carries the same systematic gap from the TIN the
-    raster cross-check above can show on real, patchy point clouds); offsets
-    are measured from the resample distribution's OWN median so that gap
-    cancels out. Replaces the old `sigma_datum * area + 2 * scale_rel * |net|`
-    heuristic with an actual resampling distribution for the geometry term
-    (the scale term is still added on top, in pipeline.measure).
+                        B: int = 200, seed: int = 0):
+    """Resampling-based 95% net-volume SPREAD (T2.2/F9), as (lo_offset,
+    hi_offset) to apply around the caller's own (TIN) net volume — NOT an
+    absolute interval. Each of B replicates (1) resamples the RIM points and
+    refits the datum plane (and quadratic, if the real fit used one), so
+    datum uncertainty enters, and (2) block-bootstraps the INTERIOR by
+    resampling raster cells (not raw points) of the per-replicate height
+    field with replacement, so stereo depth noise and coverage patchiness
+    enter too (F9 — resampling only the rim understated the interval because
+    the dominant real error sources are region selection, coverage gaps and
+    stereo noise, not datum-plane variance). Cells are the right resampling
+    unit: nearby points share correlated stereo/coverage noise, so treating
+    each point as an independent draw would understate the spread again.
+    Offsets are measured from the resample distribution's OWN median so a
+    systematic raster/TIN gap cancels out; the spread itself is reported via
+    a normal approximation (1.96 * sample std) rather than raw B=50
+    percentiles, which single-sample the 2.5th/97.5th tails.
 
     Deliberate simplification vs. the plan's literal design: the TPS
-    membrane is never refit per replicate (50 dense n x n solves would
+    membrane is never refit per replicate (200 dense n x n solves would
     dominate a measurement's runtime) — a `rim_tps` datum bootstraps its
     quadratic stage instead, which still captures rim-resampling variance in
     the plane/curvature, just not the membrane's own wiggle. The outlier caps
@@ -611,7 +636,11 @@ def bootstrap_volume_ci(interior: np.ndarray, rim: np.ndarray, up, cap: float,
     for _ in range(B):
         idx = rng.integers(0, n_rim, n_rim)
         rim_b = rim[idx]
-        c_b, n_b, basis_b, inl_b = fit_plane_robust(rim_b)
+        # F10: 60 RANSAC iterations (vs. the primary fit's 250) keeps a
+        # B=200-replicate bootstrap from dominating a measurement's runtime
+        # — each replicate only needs a roughly-right consensus plane, not
+        # the primary fit's full search depth.
+        c_b, n_b, basis_b, inl_b = fit_plane_robust(rim_b, ransac_iters=60)
         if up is not None:
             if n_b @ up < 0:
                 n_b = -n_b
@@ -628,13 +657,25 @@ def bootstrap_volume_ci(interior: np.ndarray, rim: np.ndarray, up, cap: float,
         keep = (h_b <= cap) & (h_b >= -cap_low)
         if int(keep.sum()) < 30:
             continue
-        nets.append(_raster_net(uv2_b[keep], h_b[keep], cell))
+        # block bootstrap: bin this replicate's heights into the same raster
+        # cells the primary cross-check uses, then resample CELLS (not raw
+        # points) with replacement — a cell absorbs the local stereo/coverage
+        # noise, so resampling cells (blocks) propagates that noise into the
+        # spread instead of averaging it away the way i.i.d. point resampling
+        # would on a spatially-correlated field.
+        grid = _raster_bin(uv2_b[keep], h_b[keep], cell)
+        valid = np.flatnonzero(grid["count"] > 0)
+        if len(valid) < 10:
+            continue
+        ridx = rng.choice(valid, size=len(valid), replace=True)
+        nets.append(float(np.sum(grid["height"][ridx])) * cell * cell)
     if len(nets) < max(10, B // 4):
         log("[volume] bootstrap CI: too few valid resamples, skipping")
         return None
     med = float(np.median(nets))
-    lo, hi = np.percentile(nets, [2.5, 97.5])
-    return med - float(lo), float(hi) - med
+    sd = float(np.std(nets, ddof=1)) if len(nets) > 1 else 0.0
+    half = 1.96 * sd
+    return half, half
 
 
 def _neighbor_views(ctx: ReconCtx, image_name: str, k: int = 1):
@@ -999,19 +1040,26 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
         log("[volume] raster cross-check produced no valid cells")
         unmeasured_area = 0.0
 
-    # ---- T2.2: bootstrap volume CI (rim resampling) ----
+    # ---- T2.2: bootstrap volume CI (rim + block-bootstrapped interior) ----
     # The raster cross-check's fast net (no hole-fill) is only used for the
     # replicate-to-replicate SPREAD, not its absolute level (it carries the
     # same systematic gap from the TIN as above) — bootstrap_volume_ci
     # returns that spread as offsets from ITS OWN median, applied here
     # around the primary (TIN) `net` so a consistent raster/TIN gap can't
-    # leak into the reported interval.
+    # leak into the reported interval. A coverage term
+    # (unmeasured area x the region's own peak height) is added in
+    # quadrature (F9): the bootstrap's fixed interior positions can't see
+    # the risk that a genuinely unmeasured patch hides real relief, so this
+    # is the honest way to fold that specific, unresampled risk in.
     ci = None
     if datum.startswith("rim_") and rim is not None and len(rim) >= 15:
         offsets = bootstrap_volume_ci(interior_pre_cap, rim, up, cap, cap_low,
                                       cell_r, datum, log=log)
         if offsets is not None:
             lo_off, hi_off = offsets
+            cov_term = unmeasured_area * float(np.max(np.abs(h))) if len(h) else 0.0
+            lo_off = float(np.hypot(lo_off, cov_term))
+            hi_off = float(np.hypot(hi_off, cov_term))
             ci = (net - lo_off, net + hi_off)
 
     # ---- secondary-hazard: surface slope (over-steepened debris / scarp) ----

@@ -31,6 +31,18 @@ class StereoConfig:
     per_image: int = 2
     max_pairs: int = 30
     rescue_per_image: int = 3
+    # F3: this is a RELIABILITY/memory ceiling, not a coverage limit — a wide
+    # range that exceeds it gets the pair's working resolution shrunk
+    # instead (see stereo_pair), so it never truncates real depth range the
+    # way the old fixed 320 cap did. Empirically (data/bench/arc), raising
+    # this past ~320 does NOT help: OpenCV's SGBM_MODE_HH4 silently returns
+    # an all-invalid disparity map on some wide, nonzero-minDisparity ranges
+    # (a real cv2 behavior, reproduced directly against this build), and
+    # numDisparities=512 measurably risks OOM (SGBM cost scales with it).
+    # 320 downscale-on-exceed measured ~27x the fused points of the old
+    # truncate-at-320 code on the same scene (197803 vs 7299) — the win is
+    # from never truncating, not from a bigger absolute window.
+    max_num_disp: int = 320
     baseline_ratio: tuple[float, float] = (0.10, 1.5)
     convergence_deg: tuple[float, float] = (4.0, 35.0)
     ray_angle_deg: tuple[float, float] = (3.0, 30.0)
@@ -284,7 +296,8 @@ def _depth_map_for_view(ref: ImageView, neighbors: list[ImageView],
     fx_ref = float(ref.K[0, 0])
 
     for k, nb in enumerate(neighbors):
-        pts_world, cols = stereo_pair(ref, nb, sparse, max_width=stereo_width, cfg=cfg)
+        pts_world, cols = stereo_pair(ref, nb, sparse, max_width=stereo_width, cfg=cfg,
+                                      log=log)
         if len(pts_world) == 0:
             continue
         uv, depth = ref.project(pts_world)
@@ -325,17 +338,68 @@ def _depth_map_for_view(ref: ImageView, neighbors: list[ImageView],
     return pts_world, col
 
 
+def _estimate_num_disp(fx: float, baseline: float, zmin: float, zmax: float) -> tuple[int, int]:
+    """(min_disp, num_disp) covering the sparse cloud's 1-99% depth range."""
+    d_far, d_near = fx * baseline / zmax, fx * baseline / zmin
+    min_disp = int(max(0, np.floor(d_far) - 8))
+    span = max(d_near - min_disp, 16)
+    return min_disp, int(np.ceil(span / 16)) + 1
+
+
+def _stereo_match(ra: np.ndarray, rb: np.ndarray, min_disp: int, num_disp: int,
+                  cfg: "StereoConfig", w: int, use_hh4: bool):
+    """Left disparity + left/right consistency mask for one rectified pair."""
+    def _sgbm(md, nd):
+        s = cv2.StereoSGBM_create(
+            minDisparity=md, numDisparities=nd, blockSize=cfg.block_size,
+            P1=cfg.p1, P2=cfg.p2,
+            disp12MaxDiff=cfg.disp12_max_diff, uniquenessRatio=cfg.uniqueness_ratio,
+            speckleWindowSize=cfg.speckle_window, speckleRange=cfg.speckle_range,
+            preFilterCap=cfg.prefilter_cap,
+        )
+        if use_hh4:
+            try:
+                s.setMode(cv2.STEREO_SGBM_MODE_HH4)
+            except Exception:
+                pass
+        return s
+
+    disp = _sgbm(min_disp, num_disp).compute(ra, rb).astype(np.float32) / 16.0
+    disp_r = _sgbm(-(min_disp + num_disp), num_disp).compute(rb, ra).astype(np.float32) / 16.0
+    rows, cols = np.nonzero(disp > min_disp + 1.0)
+    d_l = disp[rows, cols]
+    cols_r = np.clip((cols - d_l.round()).astype(np.int64), 0, w - 1)
+    consistent = np.abs(disp_r[rows, cols_r] + d_l) <= 1.5
+    mask = np.zeros(disp.shape, dtype=bool)
+    mask[rows[consistent], cols[consistent]] = True
+    return disp, mask
+
+
 def stereo_pair(va: ImageView, vb: ImageView, sparse: np.ndarray,
                 max_width: int = 1280, cfg: "StereoConfig | None" = None,
-                _swapped: bool = False):
+                _swapped: bool = False, log: Log = print):
     """One rectified SGBM stereo reconstruction; returns world points+colors.
 
     max_width sets the working resolution. 1280 (default) is the accuracy
     choice; on the synthetic bowl benchmark 640px runs ~5x faster but the
     measured volume error grows from ~18% to ~33% — half-res disparity
     smears steep walls. Only drop to 640 for quick previews, not finals.
+
+    The disparity search window's MINIMUM end (`min_disp`, the far-field
+    disparity) is never moved — only its width (`num_disp`) is capped, by
+    `cfg.max_num_disp` and by the image width/blockSize (F3): the old code
+    capped only by a flat constant, which could occasionally ask SGBM for a
+    window that runs past the frame — OpenCV then either rejects the call
+    outright or (MODE_HH4 specifically) silently returns an all-invalid
+    disparity map. F3 also considered shrinking the working RESOLUTION for a
+    wide-range pair instead of capping the window; empirically (on this
+    OpenCV build) that made yield worse, not better — MODE_HH4 with a large,
+    nonzero minDisparity at reduced resolution reproducibly returned zero
+    matches on pairs that worked fine at full resolution with the window
+    capped — so this stays a pure width/bounds cap, no resolution change.
     """
     cfg = cfg or StereoConfig()
+
     img_a, Ka = _load_scaled(va, max_width)
     img_b, Kb = _load_scaled(vb, max_width)
     h = min(img_a.shape[0], img_b.shape[0])
@@ -353,7 +417,7 @@ def stereo_pair(va: ImageView, vb: ImageView, sparse: np.ndarray,
     baseline = -P2[0, 3] / fx
     if baseline <= 0 and not _swapped:
         # cameras are order-swapped for stereo; retry with a/b exchanged
-        return stereo_pair(vb, va, sparse, max_width, cfg, _swapped=True)
+        return stereo_pair(vb, va, sparse, max_width, cfg, _swapped=True, log=log)
     baseline = abs(baseline)
 
     m1a, m1b = cv2.initUndistortRectifyMap(Ka, va.dist, R1, P1[:3, :3],
@@ -374,43 +438,26 @@ def stereo_pair(va: ImageView, vb: ImageView, sparse: np.ndarray,
     zmin, zmax = np.percentile(depth_a, 1), np.percentile(depth_a, 99)
     if zmin <= 0 or baseline == 0:
         return np.zeros((0, 3)), np.zeros((0, 3))
-    d_far, d_near = fx * baseline / zmax, fx * baseline / zmin
-    min_disp = int(max(0, np.floor(d_far) - 8))
-    span = max(d_near - min_disp, 16)
-    num_disp = int(np.clip((int(np.ceil(span / 16)) + 1) * 16, 16, 320))
+    min_disp, num_disp_raw = _estimate_num_disp(fx, baseline, zmin, zmax)
+    # num_disp is capped by cfg.max_num_disp AND by what the image can
+    # physically hold: SGBM requires `w - (min_disp + num_disp) >
+    # blockSize/2` (an under-margined range is either rejected outright by
+    # the default mode or silently returns nothing from MODE_HH4) — a
+    # block-sized safety margin, not just literal width.
+    margin = cfg.block_size + 16
+    if min_disp >= w - margin - 16:
+        return np.zeros((0, 3)), np.zeros((0, 3))
+    max_reach = ((w - min_disp - margin) // 16) * 16
+    num_disp = int(np.clip(num_disp_raw * 16, 16, min(cfg.max_num_disp, max_reach)))
 
-    sgbm = cv2.StereoSGBM_create(
-        minDisparity=min_disp, numDisparities=num_disp, blockSize=cfg.block_size,
-        P1=cfg.p1, P2=cfg.p2,
-        disp12MaxDiff=cfg.disp12_max_diff, uniquenessRatio=cfg.uniqueness_ratio,
-        speckleWindowSize=cfg.speckle_window, speckleRange=cfg.speckle_range,
-        preFilterCap=cfg.prefilter_cap,
-    )
-    try:
-        sgbm.setMode(cv2.STEREO_SGBM_MODE_HH4)
-    except Exception:
-        pass
-    disp = sgbm.compute(ra, rb).astype(np.float32) / 16.0
-
-    # left/right consistency: kill matches that don't survive a reverse match
-    sgbm_r = cv2.StereoSGBM_create(
-        minDisparity=-(min_disp + num_disp), numDisparities=num_disp,
-        blockSize=cfg.block_size, P1=cfg.p1, P2=cfg.p2,
-        disp12MaxDiff=cfg.disp12_max_diff, uniquenessRatio=cfg.uniqueness_ratio,
-        speckleWindowSize=cfg.speckle_window, speckleRange=cfg.speckle_range,
-        preFilterCap=cfg.prefilter_cap,
-    )
-    try:
-        sgbm_r.setMode(cv2.STEREO_SGBM_MODE_HH4)
-    except Exception:
-        pass
-    disp_r = sgbm_r.compute(rb, ra).astype(np.float32) / 16.0
-    rows, cols = np.nonzero(disp > min_disp + 1.0)
-    d_l = disp[rows, cols]
-    cols_r = np.clip((cols - d_l.round()).astype(np.int64), 0, w - 1)
-    consistent = np.abs(disp_r[rows, cols_r] + d_l) <= 1.5
-    mask = np.zeros(disp.shape, dtype=bool)
-    mask[rows[consistent], cols[consistent]] = True
+    disp, mask = _stereo_match(ra, rb, min_disp, num_disp, cfg, w, use_hh4=True)
+    if not mask.any():
+        # MODE_HH4 (a fixed-size SIMD cost-volume implementation) can return
+        # an all-invalid disparity map on some wide, nonzero-minDisparity
+        # search ranges that the plain multi-pass SGBM mode handles fine,
+        # just more slowly (reproduced directly against this OpenCV build).
+        # One retry, only when HH4 actually produced nothing.
+        disp, mask = _stereo_match(ra, rb, min_disp, num_disp, cfg, w, use_hh4=False)
     if not mask.any():
         return np.zeros((0, 3)), np.zeros((0, 3))
     pts_rect = cv2.reprojectImageTo3D(disp, Q, handleMissingValues=False)
@@ -564,6 +611,18 @@ def surface_filter(points: np.ndarray, up: np.ndarray, k: int = 16,
 MAX_FUSED_POINTS = 2_500_000
 
 
+def _sparse_extent(sparse: np.ndarray) -> float:
+    """Robust scene extent (F2): 1st-99th percentile range, not raw ptp.
+
+    A handful of far SfM outliers (a stray triangulated point at many times
+    the scene's real size) inflate `np.ptp` by up to ~7x on real
+    reconstructions; every voxel/radius derived from it inherits that
+    inflation. The percentile range tracks what the cameras actually see.
+    """
+    lo, hi = np.percentile(sparse, [1, 99], axis=0)
+    return float((hi - lo).max())
+
+
 def _cap_voxel(n_points: int, voxel: float, max_points: int = MAX_FUSED_POINTS):
     """Voxel size that brings a surface-like cloud under the point cap.
 
@@ -584,7 +643,11 @@ def dense_cloud(ctx: ReconCtx, log: Log = print, max_pairs: int = 30,
     for finals, 640 for ~5x-faster previews at reduced accuracy.
     """
     cfg = cfg or StereoConfig(max_pairs=max_pairs)
-    cache = ctx.workdir / f"dense_{stereo_width}_{ctx.fingerprint}.npz"
+    # "v2": F2 changed how `voxel` below is derived from the sparse cloud, so
+    # a cache written by the old formula must not be reused (its voxel is
+    # ~50x coarser and its dense cloud starved) — bump the cache key rather
+    # than silently trusting a file the new code would never have produced.
+    cache = ctx.workdir / f"dense_{stereo_width}_v2_{ctx.fingerprint}.npz"
     if ctx.dense is not None and not force:
         return ctx.dense
     if cache.exists() and not force:
@@ -613,8 +676,12 @@ def dense_cloud(ctx: ReconCtx, log: Log = print, max_pairs: int = 30,
     # voxel size is fixed up front from the sparse extent (the dense cloud is
     # support-clipped to the sparse one, so their extents track closely) —
     # this lets each reference image's fused points be downsampled the
-    # moment they're produced instead of concatenating raw points first
-    extent = float(np.ptp(ctx.sparse, axis=0).max())
+    # moment they're produced instead of concatenating raw points first.
+    # F2: extent is the ROBUST (percentile) scene size, not raw ptp — see
+    # `_sparse_extent`. A handful of far SfM outliers inflated the raw ptp
+    # by ~7x, driving a voxel ~7x too coarse and starving the whole dense
+    # cloud (~50x fewer points than intended).
+    extent = _sparse_extent(ctx.sparse)
     voxel = max(extent / 900.0, 1e-6)
 
     # T1.4: for each registered image, fuse depth against up to

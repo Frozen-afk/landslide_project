@@ -68,6 +68,17 @@ PRESETS = {
     "distorted": dict(path="arc", n_views=21, yaw_span=96.0, radius=26.0,
                        height=7.0, height_ramp=0.0, f_px=1600.0, tex_scale=1.0,
                        k1=-0.15),
+    # V1 (POST_AUDIT_HIGH_VALUE_PLAN.md): two arcs 90 deg apart, each an
+    # unmodified copy of "arc"'s own geometry (radius/height/yaw_span/f_px),
+    # so it differs from "arc" only in azimuth coverage — the capture
+    # protocol REMAINING_ACCURACY_PROGRESS.md SS7 already names as the one
+    # that should close the bowl's camera-invisible far side ("two azimuths
+    # >=60 deg apart"). arc_offset=90 keeps a ~6 deg overlap between arms
+    # (each spans 96 deg) so SfM has shared features to register both arms
+    # into one model.
+    "twosided": dict(path="arc2", n_views=30, yaw_span=96.0, radius=26.0,
+                      height=7.0, height_ramp=0.0, f_px=1600.0, tex_scale=1.0,
+                      k1=0.0, arc_offset=180.0),
 }
 
 EXTS_OK = (".jpg", ".jpeg", ".png")
@@ -250,6 +261,22 @@ def view_poses(p: dict, X, Y, z, zc_mean: float) -> list[tuple[np.ndarray, np.nd
                             by - p["radius"] * np.cos(yaw),
                             zc_mean + height_k])
             out.append((eye, target, np.array([0.0, 0.0, 1.0])))
+    elif p["path"] == "arc2":
+        # Two independent "arc" arms, each identical to the "arc" preset's
+        # own formula, their centres `arc_offset` degrees apart.
+        target = np.array([bx, by, terrain_height(X, Y, z, bx, by)])
+        n_arc = n // 2
+        offset = p["arc_offset"]
+        for arm in range(2):
+            yaw_center = arm * offset
+            for k in range(n_arc):
+                yaw = np.deg2rad(yaw_center - p["yaw_span"] / 2 +
+                                  p["yaw_span"] * k / max(n_arc - 1, 1))
+                height_k = p["height"] + p["height_ramp"] * (k / max(n_arc - 1, 1))
+                eye = np.array([bx + p["radius"] * np.sin(yaw),
+                                by - p["radius"] * np.cos(yaw),
+                                zc_mean + height_k])
+                out.append((eye, target, np.array([0.0, 0.0, 1.0])))
     elif p["path"] == "line":
         target = np.array([bx, by, terrain_height(X, Y, z, bx, by)])
         for k in range(n):
@@ -298,7 +325,9 @@ def main():
     poses = {}
     views = view_poses(p, X, Y, z, zc_mean)
     n_views = len(views)
-    middle = n_views // 2
+    # arc2's second arm starts at n_views // 2 (not its own centre) — use the
+    # first arm's own centre so the GT/marker framing matches "arc"'s.
+    middle = (n_views // 2) // 2 if p["path"] == "arc2" else n_views // 2
     for k, (eye, target, up) in enumerate(views):
         R, t = look_at(eye, target, up=up)
         img = render(verts, tris, vcolors, R, t, K, k1=k1)

@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 from scipy.spatial import cKDTree
 
-from .geometry import points_in_polygon, ring_distance
+from .geometry import median_point_spacing, points_in_polygon, ring_distance
 from .sfm import Log, ReconCtx
 
 
@@ -52,9 +52,11 @@ def render_orthophoto(ctx: ReconCtx, up=None, max_side: int = 1400,
                       jpg_path=None, meta_path=None, log: Log = print):
     """Rasterize the metric point cloud top-down. Returns (image, meta).
 
-    Each pixel keeps the color of the highest point along `up` (the visible
-    surface). `meta` maps pixels to ground coordinates:
-        ground_u = u0 + col * res,  ground_v = v0 + row * res.
+    Each point is splatted into a k x k pixel block (block radius = one
+    median spacing) so the render isn't mostly background speckle
+    when the dense cloud is sparser than the pixel grid; the highest point
+    along `up` still wins every contested pixel. `meta` maps pixels to
+    ground coordinates: ground_u = u0 + col * res,  ground_v = v0 + row * res.
     """
     from .densify import estimate_up
 
@@ -77,8 +79,27 @@ def render_orthophoto(ctx: ReconCtx, up=None, max_side: int = 1400,
     iy = np.clip(((v - v0) / res).astype(np.int64), 0, height - 1)
 
     order = np.argsort(h)                    # ascending: last write per pixel
+    ix_o, iy_o = ix[order], iy[order]
+    cols_o = np.asarray(cols, np.uint8)[order]
+
+    spacing = median_point_spacing(u, v)
+    k = int(np.clip(2 * np.ceil(spacing / res) + 1, 1, 7))
     img = np.full((height, width, 3), (24, 28, 34), np.uint8)   # BGR dark
-    img[iy[order], ix[order]] = np.asarray(cols, np.uint8)[order]
+    if k == 1:
+        img[iy_o, ix_o] = cols_o
+    else:
+        # splat each point into a k x k block, one chunk of points at a time
+        # so the (points x k^2) index arrays stay bounded on a multi-million
+        # point cloud. Points stay in ascending-height order within and
+        # across chunks, so the highest point still wins every pixel it
+        # shares with a lower one.
+        off = np.arange(k) - (k - 1) // 2
+        doff_x, doff_y = (a.ravel() for a in np.meshgrid(off, off, indexing="ij"))
+        for s in range(0, len(ix_o), 200_000):
+            e = s + 200_000
+            bx = np.clip(ix_o[s:e, None] + doff_x[None, :], 0, width - 1)
+            by = np.clip(iy_o[s:e, None] + doff_y[None, :], 0, height - 1)
+            img[by.ravel(), bx.ravel()] = np.repeat(cols_o[s:e], k * k, axis=0)
     _scale_bar(img, res)
 
     if jpg_path is not None:
@@ -92,8 +113,9 @@ def render_orthophoto(ctx: ReconCtx, up=None, max_side: int = 1400,
     }
     if meta_path is not None:
         Path(meta_path).write_text(json.dumps(meta))
-    covered = int(len(np.unique(iy * width + ix)))
-    log(f"[ortho] {width}x{height} px at {res * 100:.2f} cm/px, "
+    painted = ~((img[:, :, 0] == 24) & (img[:, :, 1] == 28) & (img[:, :, 2] == 34))
+    covered = int(painted.sum())
+    log(f"[ortho] {width}x{height} px at {res * 100:.2f} cm/px, splat k={k}, "
         f"{covered} / {width * height} cells covered by {len(pts)} points")
     return img, meta
 

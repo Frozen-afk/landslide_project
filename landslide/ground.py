@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .geometry import undistort_normalized
+from .geometry import median_point_spacing, undistort_normalized
 from .ortho import ground_basis, select_region_world
 from .sfm import ImageView, Log, ReconCtx
 
@@ -44,14 +44,8 @@ def estimate_cell_size(pts: np.ndarray, e1: np.ndarray, e2: np.ndarray,
     cell size masquerading as coverage") measures the real surface instead
     of a coarse, biased proxy for it.
     """
-    from scipy.spatial import cKDTree
-
     u, v = pts @ e1, pts @ e2
-    sub = np.column_stack([u, v])[:: max(1, len(pts) // sample)]
-    if len(sub) < 3:
-        return 0.1
-    d, _ = cKDTree(sub).query(sub, k=2, workers=-1)
-    spacing = float(np.median(d[:, 1]))
+    spacing = median_point_spacing(u, v, sample)
     return float(np.clip(4.0 * spacing, 0.1, 0.5))
 
 

@@ -64,6 +64,18 @@ def ring_distance(pts2d, polygon) -> np.ndarray:
     return dmin
 
 
+def median_point_spacing(u: np.ndarray, v: np.ndarray, sample: int = 20_000) -> float:
+    """Median nearest-neighbor spacing of 2D points (u, v) via a k-d tree on
+    a subsample (cheap enough to run on every photo-mode DSM / ortho render)."""
+    from scipy.spatial import cKDTree
+
+    sub = np.column_stack([u, v])[:: max(1, len(u) // sample)]
+    if len(sub) < 3:
+        return 0.025
+    d, _ = cKDTree(sub).query(sub, k=2, workers=-1)
+    return float(np.median(d[:, 1]))
+
+
 def polygon_area(polygon) -> float:
     """Absolute shoelace area of a closed polygon (K, 2)."""
     p = np.asarray(polygon, np.float64)

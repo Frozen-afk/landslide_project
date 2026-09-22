@@ -11,6 +11,7 @@ exact numbers), not guessed — per the task's own "don't weaken tests merely
 to make them pass" rule, a bad number is recorded as a bad number.
 """
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -183,6 +184,23 @@ def test_descending_focal_spread_is_tight(descending):
     ctx = reconstruct(d / "images", d / "work", reuse=True, log=print)
     lo, hi, ratio = _focal_spread(ctx.rec)
     assert ratio < 1.15, f"focal spread {ratio:.2f}x (lo {lo:.0f}, hi {hi:.0f})"
+
+
+def test_descending_focal_spread_is_stable_across_clean_runs(descending):
+    """Stabilization pass: `descending`'s per-camera focal self-calibration
+    diverges on a fresh SfM run more often than not (COLMAP's own
+    multi-threaded matching/BA is not bit-for-bit reproducible), so the
+    focal-locked retry and its selection over the diverged attempt must
+    both hold on repeated *clean* (non-cached) builds, not just once against
+    whatever happens to be on disk."""
+    from landslide.sfm import _focal_spread, reconstruct
+    d, gt = descending
+    for run in range(2):
+        shutil.rmtree(d / "work", ignore_errors=True)
+        ctx = reconstruct(d / "images", d / "work", reuse=False, log=print)
+        lo, hi, ratio = _focal_spread(ctx.rec)
+        assert ratio < 1.15, (
+            f"run {run}: focal spread {ratio:.2f}x (lo {lo:.0f}, hi {hi:.0f})")
 
 
 def test_descending_volume(descending):

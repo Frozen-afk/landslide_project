@@ -92,3 +92,96 @@ def test_focal_spread_is_one_when_cameras_agree():
             i + 1, pycolmap.CameraModelId.SIMPLE_PINHOLE, 1300.0, 800, 600))
     _, _, ratio = sfm_mod._focal_spread(rec)
     assert ratio == pytest.approx(1.0)
+
+
+# ---- focal-lock retry reachability / selection (stabilization pass) -------
+
+def _load_cached_sparse8():
+    import pycolmap
+    model_dir = next((ROOT / "data" / "bench" / "sparse8" / "work" /
+                      "sparse").iterdir())
+    return pycolmap.Reconstruction(str(model_dir))
+
+
+def _bump_one_camera_focal(rec, factor=3.0):
+    """Mutate one camera's focal length in place to force a bad spread."""
+    cam = next(iter(rec.cameras.values()))
+    params = np.asarray(cam.params, np.float64).copy()
+    params[0] *= factor
+    cam.params = params
+    return rec
+
+
+CACHED_SPARSE8 = ROOT / "data" / "bench" / "sparse8" / "work" / "sparse"
+
+
+@pytest.mark.skipif(not CACHED_SPARSE8.is_dir(),
+                    reason="needs the cached sparse8 benchmark reconstruction")
+def test_focal_lock_retry_actually_runs(tmp_path, monkeypatch):
+    """The ladder must not `break` on the very iteration it inserts the
+    focal-locked retry for a bad-focal attempt — the retry has to be
+    reachable, not just appended to a list nobody visits."""
+    bad = _bump_one_camera_focal(_load_cached_sparse8(), factor=3.0)
+    good = _load_cached_sparse8()
+    assert sfm_mod._focal_spread(bad)[2] > sfm_mod.FOCAL_SPREAD_RATIO_BAD
+    assert sfm_mod._focal_spread(good)[2] <= sfm_mod.FOCAL_SPREAD_RATIO_BAD
+
+    calls = []
+
+    def fake_run_attempt(*a, lock_focal=False, **kw):
+        calls.append(lock_focal)
+        rec = bad if len(calls) == 1 else good
+        return rec, sfm_mod._prop(rec, "num_reg_images"), 9999.0
+
+    n_photos = 8   # matches the cached model's registration count (all "done")
+    monkeypatch.setattr(
+        sfm_mod, "_build_attempts",
+        lambda n, size: [
+            {"label": "default", "matcher": "exhaustive", "overlap": 12,
+             "size": size, "shared_camera": False},
+        ])
+    monkeypatch.setattr(sfm_mod, "_run_attempt", fake_run_attempt)
+
+    photos_dir = tmp_path / "photos"
+    photos_dir.mkdir()
+    for i in range(n_photos):
+        (photos_dir / f"{i}.jpg").write_bytes(b"x")
+    workdir = tmp_path / "work"
+
+    ctx = sfm_mod.reconstruct(photos_dir, workdir, reuse=False, log=lambda *_: None)
+
+    assert calls == [False, True], \
+        "focal-locked retry was inserted but never actually run"
+    lo, hi, ratio = sfm_mod._focal_spread(ctx.rec)
+    assert ratio <= sfm_mod.FOCAL_SPREAD_RATIO_BAD, \
+        f"retry ran but the bad-focal attempt was still selected ({ratio:.2f}x)"
+
+
+def test_attempt_score_prefers_good_focal_over_more_images():
+    """Deterministic tie-break (F12): a diverged-focal attempt must not
+    outrank a focal-reliable one just because it registered more images —
+    otherwise the focal-locked retry can lose to the very attempt it exists
+    to replace."""
+    from landslide.sfm import MIN_SPARSE_PER_IMG, _attempt_score
+
+    bad_focal_more_images = _attempt_score(
+        21, 21 * MIN_SPARSE_PER_IMG, focal_ratio=1.82)
+    good_focal_fewer_images = _attempt_score(
+        20, 20 * MIN_SPARSE_PER_IMG, focal_ratio=1.0)
+    assert good_focal_fewer_images > bad_focal_more_images
+
+    # both usable and both good-focal: falls back to registration/points,
+    # same as before this pass (no unrelated behavior change)
+    assert sfm_mod._attempt_score(20, 20 * MIN_SPARSE_PER_IMG, 1.0) > \
+        sfm_mod._attempt_score(19, 19 * MIN_SPARSE_PER_IMG, 1.0)
+
+
+def test_build_attempts_is_deterministic():
+    """Same (n, max_image_size) must always produce the same ladder, in the
+    same order — retry-insertion logic in `reconstruct` depends on stable
+    attempt indices."""
+    a1 = sfm_mod._build_attempts(21, 2400)
+    a2 = sfm_mod._build_attempts(21, 2400)
+    assert a1 == a2
+    labels = [a["label"] for a in a1]
+    assert len(labels) == len(set(labels))

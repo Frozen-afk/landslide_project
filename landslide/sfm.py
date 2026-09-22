@@ -268,15 +268,22 @@ def _camera_center_collinearity(rec: pycolmap.Reconstruction) -> float:
 FOCAL_SPREAD_RATIO_BAD = 1.15
 
 
-def _attempt_score(nreg: int, npts: int) -> tuple[int, int, int]:
-    """Rank SfM attempts: usable geometry first, then images, then tracks.
+def _attempt_score(nreg: int, npts: int, focal_ratio: float = 1.0) -> tuple[int, int, int, int]:
+    """Rank SfM attempts: usable geometry first, then focal sanity, then
+    images, then tracks.
 
     A high registration count with a starved sparse cloud (poses on a
     handful of tracks) must lose to a slightly smaller but well-triangulated
-    model, so usability dominates the comparison.
+    model, so usability dominates the comparison. A diverged per-camera
+    focal spread (F12) means the geometry itself is wrong regardless of how
+    many images registered, so a reliable-focal attempt must outrank a
+    diverged one before registration count is even compared — otherwise the
+    focal-locked retry this ladder inserts specifically to fix a bad spread
+    can lose a tie/near-tie to the very attempt it was meant to replace.
     """
     usable = 1 if npts >= MIN_SPARSE_PER_IMG * max(nreg, 1) else 0
-    return (usable, nreg, npts)
+    good_focal = 1 if focal_ratio <= FOCAL_SPREAD_RATIO_BAD else 0
+    return (usable, good_focal, nreg, npts)
 
 
 def reconstruct(photos_dir, workdir, max_image_size: int = 2400,
@@ -334,7 +341,6 @@ def reconstruct(photos_dir, workdir, max_image_size: int = 2400,
             log(f"[sfm] attempt '{a['label']}' failed: {e}")
             continue
         last_idx = i
-        score = _attempt_score(nreg, len(rec.points3D))
 
         # F12: a camera-by-camera self-calibration that diverges is a
         # geometrically wrong model even when every image registered —
@@ -345,7 +351,9 @@ def reconstruct(photos_dir, workdir, max_image_size: int = 2400,
         # bad-focal attempt gets a focal-locked shared-intrinsics retry
         # NEXT, not after every other rung of the ladder has also been
         # tried.
+        just_inserted_retry = False
         _, _, ratio = _focal_spread(rec)
+        score = _attempt_score(nreg, len(rec.points3D), ratio)
         if ratio > FOCAL_SPREAD_RATIO_BAD:
             collin = _camera_center_collinearity(rec)
             log(f"[sfm] attempt '{a['label']}': per-camera focal length "
@@ -353,6 +361,7 @@ def reconstruct(photos_dir, workdir, max_image_size: int = 2400,
                 f"unreliable self-calibration; path collinearity {collin:.3f})")
             if not locked_retry_done and not a.get("lock_focal"):
                 locked_retry_done = True
+                just_inserted_retry = True
                 log("[sfm] unstable per-camera focal — retrying next with "
                     "one shared, unrefined focal length")
                 attempts.insert(i + 1, {
@@ -363,7 +372,11 @@ def reconstruct(photos_dir, workdir, max_image_size: int = 2400,
 
         if best is None or score > best[0]:
             best = (score, rec, a["label"], kp, i, ratio)
-        done = (score[0] == 1 and nreg >= max(3, int(0.9 * n)))
+        # a retry just queued to fix THIS attempt's bad focal spread must get
+        # a chance to run — stopping here (score/registration looked "done")
+        # would leave the inserted attempt in the list but never reached.
+        done = (score[0] == 1 and nreg >= max(3, int(0.9 * n))
+                and not just_inserted_retry)
         if done:
             break
         if i < len(attempts) - 1:

@@ -557,3 +557,156 @@ validation and corrected before shipping rather than merged as originally spec'd
   §7.1 finding that near-collinear camera paths leave reconstruction quality run-to-run
   unstable — unchanged by this pass, already tracked as out of scope for H2.
 - P3-P6 and V1 remain as scoped in `POST_AUDIT_HIGH_VALUE_PLAN.md`, untouched.
+
+---
+
+# High-value pass — P5 progress
+
+Implements `POST_AUDIT_HIGH_VALUE_PLAN.md` §2 P5 only ("DEM alignment: use the dense
+cloud, search heading", H5 reduced). P1/P2/P4 (above) are untouched by this pass; P3, P6
+and V1 are untouched, per this task's explicit "P5 only" boundary.
+
+## What was implemented
+
+**P5(b) — dense-cache reuse, done first (P5(a) builds on it).**
+`landslide/densify.py` — the cache-lookup half of `dense_cloud` (the `ctx.dense is not
+None` short-circuit and the on-disk `dense_<w>_v2_<fingerprint>.npz` fingerprint check)
+is factored out, unchanged, into a new `load_cached_dense(ctx, log=print,
+stereo_width=1280) -> dict | None`. `dense_cloud` now calls it as its first step instead
+of duplicating the same two checks — same cache key, same fingerprint contract, zero
+behavior change (verified: `dense_cloud`'s own `test_stale_dense_cache_is_rejected`
+passes unchanged). `load_cached_dense` never runs stereo — it only reads `ctx.dense` or
+the disk cache — so it is safe to call from a request thread; building a dense cloud
+stays confined to `dense_cloud`, called only from `server/worker.py` (inside the process
+pool) and `pipeline.py`'s own worker-side paths, exactly as the plan requires.
+
+`landslide/dem.py::align_to_dem` — replaces the unconditional `ctx.cloud(dense=True)`
+(which silently falls back to sparse because the parent process's `ctx.dense` is always
+`None`) with `load_cached_dense(ctx, log=log)`: if it returns a non-empty cloud, align on
+that; otherwise fall back to `ctx.sparse` exactly as before, with a log line naming which
+path was taken. No `dense_cloud` import in `dem.py` at all — there is nothing to
+monkeypatch-forget-to-call, the module simply has no path that can build one.
+
+**P5(a) — yaw sweep.** `align_to_dem` gains a heading search between the existing
+gravity-rotation seed and the final ICP refinement: `yaw_starts=12` seeds spaced
+30° apart about `up` (new helper `_axis_R`, a general Rodrigues rotation — `_gravity_R`
+is kept as-is, it already solves the tilt half), each probed with a short
+`yaw_probe_iters=4` trimmed ICP run (translation seeded fresh per yaw, since rotating a
+non-origin-centred cloud about `up` moves its centroid); the lowest-probe-RMS heading is
+then refined with the existing full 25-iteration `icp_rigid` call, unchanged from before.
+`align_to_dem`'s two new parameters (`yaw_starts`, `yaw_probe_iters`) default exactly to
+the plan's own numbers; the one existing call site (`server/routes.py:291`) passes
+neither, so its call is source-unchanged.
+
+## Scope note: `yaw_probe_iters=4`, not a literal 12 full ICP runs
+
+The plan's wording ("seed 12 starts ... keep the best trimmed RMS") reads as 12 full ICP
+runs. Run naively that is ~12x the runtime of one full run, far over the plan's own "≤ 3×
+current" budget. Implemented instead as 12 *short* (4-iteration) probes to rank headings,
+then one full 25-iteration refinement from the winner — 12×4 + 25 = 73 iterations total
+vs. baseline 25, a 2.92x iteration-count ratio, measured at 2.86x wall time (below).
+Chosen because ICP's early iterations already separate "roughly the right heading" from
+"wrong heading" (correspondences start converging vs. staying scattered) well before full
+convergence — confirmed by the yaw-sweep test below recovering a 120° offset to near-zero
+RMS with this scheme, while a single full-length gravity-only seed on the same scene
+converges to 0.13 m and stays there (see Measured results). Flagged as a deviation rather
+than silently narrowed, since "keep the best trimmed RMS" could be read either way and
+the literal 12x reading would have blown the plan's own runtime acceptance criterion.
+
+## Regression coverage added
+
+`tests/test_dem.py`, three new cases:
+- `test_align_to_dem_yaw_sweep_recovers_120deg_heading` — the plan's own acceptance case:
+  a relief scene (road + hill + pile, enough geometry for heading to be observable) is
+  DEM'd against itself with a **120° heading offset** applied to the model cloud before
+  alignment. Asserts `rms_m < 0.1` (the plan's bar) and that the fallback-to-sparse log
+  line fired (no dense cache present in this fixture, exercising that path too).
+- `test_align_to_dem_prefers_cached_dense_cloud` — `ctx.dense` set to the true DEM points,
+  `ctx.sparse` set to a cloud offset 50 m away (garbage). Asserts alignment succeeds
+  (`rms_m < 0.05`, only possible if the dense cloud was used, not the 50 m-off sparse one)
+  and that the "cached dense cloud" log line fired.
+- `test_align_to_dem_never_builds_a_dense_cloud` — the plan's own acceptance case:
+  monkeypatches `landslide.densify.dense_cloud` to raise `AssertionError` if called at
+  all, then runs a normal `align_to_dem` call and asserts it still succeeds — proving no
+  code path in `align_to_dem` can reach `dense_cloud`.
+
+`.venv/bin/python -m pytest -q tests/test_dem.py`: **9 passed** (6 baseline + 3 new).
+`.venv/bin/python -m pytest -q -k "not e2e"`: **167 passed, 1 skipped** (164 baseline from
+the P4 pass + 3 new `test_dem.py` cases). No existing assertion changed.
+
+## Focused validation
+
+Ran a standalone probe against the repo's cached `arc` preset SfM + dense-cloud (copied
+to a scratch dir, tracked `data/bench/arc/*` untouched), covering the plan's two
+acceptance criteria at realistic scale (`arc`'s real dense cloud: 201406 points, capped to
+the same 60000-point budget `align_to_dem` itself applies).
+
+**(a) Yaw sweep, 60k points — alignment quality and runtime:**
+
+| seed strategy | recovered rms (120° offset) | wall time |
+| --- | --- | --- |
+| single gravity-only seed (old behavior, `iters=25`) | 0.134 m — does not converge | 9.28 s |
+| yaw sweep (12×4-iter probes + 25-iter refine, new) | 0.000 m — recovers exactly | 26.49 s |
+
+Runtime ratio: **2.86×** — under the plan's `≤ 3×` bar. Alignment quality: the plan's own
+`< 0.1 m` bar is met (0.000 m here because the synthetic "DEM" in this probe is the model
+cloud itself under a known transform, i.e. a noise-free upper bound — `test_dem.py`'s
+independent test above, with a *different* relief scene, also clears the bar cleanly).
+
+**(b) Dense-cache reuse — point count and RMS, dense vs. sparse, same DEM:**
+
+| cloud used | points | rms |
+| --- | --- | --- |
+| dense (cached, this pass) | 201406 | 0.000 m |
+| sparse (fallback, old behavior) | 7140 | 0.060 m |
+
+Confirms the plan's acceptance wording directly: after an ortho/measure run left a dense
+cache on disk, DEM alignment now uses **28× more points** and lands on a **lower RMS**
+than the sparse cloud it silently used before.
+
+**Existing DEM/change suite:** all 6 pre-existing `tests/test_dem.py` cases pass
+unchanged (`test_dem_volume_recovers_pile`, `..._aligned_after_rigid_move`,
+`test_load_dem_xyz_text`, `test_icp_rigid_rejects_contamination`,
+`test_change_volume_between_epochs`, `test_change_marker_anchored_registration`) — the
+plan's "existing 6 DEM/change cases unchanged" criterion.
+
+## Deviations from the plan
+
+One, already flagged above: `yaw_probe_iters=4` short probes per heading seed instead of
+12 full-length ICP runs, to meet the plan's own runtime budget. No other deviation —
+`load_cached_dense`'s extraction is byte-identical logic to what `dense_cloud` already
+did, and the monkeypatch test confirms `align_to_dem` never reaches `dense_cloud`.
+
+## Acceptance status against the plan's criteria
+
+1. **New `tests/test_dem.py` case, 120° heading offset aligns to < 0.1 m RMS (fails
+   today) — MET.** Test passes; the focused-validation table above additionally shows the
+   old single-seed behavior stalling at 0.134 m on the same kind of offset, confirming the
+   "fails today" premise directly rather than just asserting the new behavior.
+2. **Existing 6 DEM/change cases unchanged — MET.**
+3. **`align_to_dem` wall time ≤ 3× current at 60k points — MET** (2.86× measured).
+4. **After an ortho run, DEM upload logs a point count > the sparse count and reports a
+   lower RMS on the same DEM — MET** (201406 vs. 7140 points, 0.000 m vs. 0.060 m rms,
+   both directly measured and logged).
+5. **With no cache present the sparse path still works and says so — MET**
+   (`test_align_to_dem_yaw_sweep_recovers_120deg_heading` runs with no dense cache and
+   asserts the "no cached dense cloud" log line).
+6. **A monkeypatch test asserts `dense_cloud` is never called from the parent process —
+   MET** (`test_align_to_dem_never_builds_a_dense_cloud`).
+
+**Status: implemented, tested, all six acceptance criteria met.** Compatibility risk
+realized as none: the one call site (`server/routes.py:291`) is source-unchanged, both new
+`align_to_dem` parameters default to the plan's own numbers, and `dense_cloud`'s own cache
+behavior is provably unchanged (its own pre-existing stale-cache test still passes,
+byte-identical logic just relocated).
+
+## Remaining risks / follow-up (not undertaken here — out of P5's scope)
+
+- The literal "12 full ICP runs" reading of the plan, if ever wanted exactly as written,
+  would need either a materially larger runtime budget or a cheaper per-probe correspondence
+  step (e.g. a coarser voxel subsample per probe) — not attempted here since the
+  probe-then-refine scheme already meets every stated acceptance number.
+- Moving DEM alignment into a worker job remains explicitly excluded (plan's own
+  "Excluded" note) — this pass's runtime win (2.86× not 12×) makes that tradeoff milder
+  than the plan assumed but does not revisit the decision.
+- P3, P6 and V1 remain as scoped in `POST_AUDIT_HIGH_VALUE_PLAN.md`, untouched.

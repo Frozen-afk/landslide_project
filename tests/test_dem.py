@@ -101,6 +101,72 @@ def test_icp_rigid_rejects_contamination():
     assert d.mean() < 0.05, f"ground misaligned by {d.mean():.3f} m"
 
 
+# ---------- P5(a): yaw sweep recovers a heading offset outside ICP's basin ----------
+
+def test_align_to_dem_yaw_sweep_recovers_120deg_heading(tmp_path):
+    from landslide.dem import align_to_dem
+    from landslide.sfm import ReconCtx
+
+    base, _ = _road_with_pile(r_half=2.0, pile_r=0.9, pile_h=0.4, step=0.15, seed=3)
+    dem_pts = base.copy()
+    r = np.hypot(dem_pts[:, 0], dem_pts[:, 1])
+    inside = r <= 0.9
+    dem_pts[inside, 2] -= 0.4 * np.clip(1 - r[inside] / 0.9, 0, 1)
+
+    # the reconstructed model's heading is 120 deg off the DEM's — well
+    # outside a single gravity-only seed's ~30 deg ICP basin
+    theta = np.radians(120)
+    cz, sz = np.cos(theta), np.sin(theta)
+    Rz = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]])
+    model_pts = base @ Rz.T
+
+    ctx = ReconCtx(rec=None, views={}, sparse=model_pts,
+                   sparse_colors=np.zeros_like(model_pts), photos_dir=tmp_path,
+                   workdir=tmp_path, fingerprint="yawtest")
+    lines = []
+    al = align_to_dem(ctx, dem_pts, np.array([0.0, 0.0, 1.0]), log=lines.append)
+    assert al["rms_m"] < 0.1, f"rms {al['rms_m']:.3f} m"
+    assert any("no cached dense cloud" in l for l in lines)
+
+
+def test_align_to_dem_prefers_cached_dense_cloud(tmp_path):
+    """A dense cloud already on ctx (loaded from disk by an earlier ortho/
+    measure run) is used instead of a garbage sparse cloud, and it's logged."""
+    from landslide.dem import align_to_dem
+    from landslide.sfm import ReconCtx
+
+    dem_pts, _ = _road_with_pile(step=0.15, seed=3)
+    sparse_pts = dem_pts + np.array([50.0, 50.0, 50.0])  # nowhere near the DEM
+    dense_pts = dem_pts.astype(np.float32)
+
+    ctx = ReconCtx(rec=None, views={}, sparse=sparse_pts,
+                   sparse_colors=np.zeros_like(sparse_pts), photos_dir=tmp_path,
+                   workdir=tmp_path, fingerprint="cachehit",
+                   dense={"points": dense_pts, "colors": np.zeros_like(dense_pts)})
+    lines = []
+    al = align_to_dem(ctx, dem_pts, np.array([0.0, 0.0, 1.0]), log=lines.append)
+    assert al["rms_m"] < 0.05, f"rms {al['rms_m']:.3f} m"
+    assert any("cached dense cloud" in l for l in lines)
+
+
+def test_align_to_dem_never_builds_a_dense_cloud(tmp_path, monkeypatch):
+    """align_to_dem runs synchronously in a request thread; building a dense
+    cloud (SGBM stereo) belongs in a worker only — see `load_cached_dense`."""
+    import landslide.densify as densify_mod
+    from landslide.dem import align_to_dem
+    from landslide.sfm import ReconCtx
+
+    monkeypatch.setattr(densify_mod, "dense_cloud",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("dense_cloud must not be called")))
+
+    pts, _ = _road_with_pile(r_half=1.0, step=0.2, seed=7)
+    ctx = ReconCtx(rec=None, views={}, sparse=pts, sparse_colors=np.zeros_like(pts),
+                   photos_dir=tmp_path, workdir=tmp_path, fingerprint="nobuild")
+    al = align_to_dem(ctx, pts, np.array([0.0, 0.0, 1.0]), log=lambda *_: None)
+    assert al["rms_m"] < 0.05
+
+
 def test_change_volume_between_epochs():
     """Road, then the same road with a pile added: net change = pile."""
     from landslide.change import change_volume

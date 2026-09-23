@@ -20,6 +20,7 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial import cKDTree
 
+from .densify import load_cached_dense
 from .sfm import Log, ReconCtx
 
 
@@ -145,6 +146,13 @@ def _gravity_R(up: np.ndarray) -> np.ndarray:
     return np.eye(3) + k + k @ k * (1 / (1 + c))
 
 
+def _axis_R(axis: np.ndarray, angle_rad: float) -> np.ndarray:
+    """Rodrigues rotation by `angle_rad` about unit `axis`."""
+    a = axis / np.linalg.norm(axis)
+    k = np.array([[0, -a[2], a[1]], [a[2], 0, -a[0]], [-a[1], a[0], 0]])
+    return np.eye(3) + np.sin(angle_rad) * k + (1 - np.cos(angle_rad)) * (k @ k)
+
+
 class DemSurface:
     """Rotation-invariant DEM surface: scattered IDW interpolation.
 
@@ -187,26 +195,62 @@ def _spacing(v: np.ndarray) -> float:
 
 
 def align_to_dem(ctx: ReconCtx, dem_pts: np.ndarray, up: np.ndarray,
-                 log: Log = print, max_pts: int = 60_000) -> dict:
-    """Rigid model->DEM transform via gravity-seeded trimmed ICP.
+                 log: Log = print, max_pts: int = 60_000,
+                 yaw_starts: int = 12, yaw_probe_iters: int = 4) -> dict:
+    """Rigid model->DEM transform via gravity-seeded, yaw-swept trimmed ICP.
 
     The cloud is metric (marker scale); scale is NOT solved — an ICP scale
     far from 1 would mean a bad DEM or a broken reconstruction, reported as
     a diagnostic instead of silently absorbed.
+
+    Gravity fixes tilt but leaves heading (rotation about `up`) free, and
+    plain ICP only converges when the seed is already within its basin —
+    roughly 30 deg here. `yaw_starts` seeds spaced evenly about `up` are
+    each probed with a short (`yaw_probe_iters`) ICP run; the best-RMS seed
+    is refined to full convergence and that result is kept.
+
+    Aligns on the dense cloud when one is already cached on disk (built by
+    an earlier ortho/measure run) rather than the sparse cloud — the sparse
+    cloud's outliers otherwise pull the centroid seed. Never builds a dense
+    cloud itself (`load_cached_dense` is a pure lookup): this runs
+    synchronously in a request thread, and stereo fusion belongs in a
+    worker.
     """
-    pts, _ = ctx.cloud(dense=True)
+    dense = load_cached_dense(ctx, log=log)
+    if dense is not None and len(dense["points"]) > 0:
+        pts = dense["points"]
+        log(f"[dem] aligning on cached dense cloud: {len(pts)} points")
+    else:
+        pts = ctx.sparse
+        log(f"[dem] no cached dense cloud; aligning on sparse cloud "
+            f"({len(pts)} points)")
     pts = np.asarray(pts, np.float64) * ctx.scale
     if len(pts) > max_pts:
         rng = np.random.default_rng(0)
         pts = pts[rng.choice(len(pts), max_pts, replace=False)]
     R0 = _gravity_R(up)
-    src = pts @ R0.T
+    src0 = pts @ R0.T
     dst_tree = cKDTree(dem_pts)
-    # seed translation by centroid match of the gravity-aligned cloud
-    R, t, rms = icp_rigid(src, dst_tree,
-                          init_R=np.eye(3), init_t=dem_pts.mean(0) - src.mean(0),
-                          log=log)
-    R_full = R @ R0
+    dem_mean = dem_pts.mean(0)
+
+    quiet: Log = lambda *_: None
+    best_yaw_R, best_rms = np.eye(3), float("inf")
+    for k in range(yaw_starts):
+        Ry = _axis_R(np.array([0.0, 0.0, 1.0]), 2 * np.pi * k / yaw_starts)
+        src = src0 @ Ry.T
+        _, _, rms = icp_rigid(src, dst_tree, iters=yaw_probe_iters,
+                              init_t=dem_mean - src.mean(0), log=quiet)
+        if rms < best_rms:
+            best_rms, best_yaw_R = rms, Ry
+    best_yaw_deg = np.degrees(np.arctan2(best_yaw_R[1, 0], best_yaw_R[0, 0]))
+    log(f"[dem] yaw sweep: best heading {best_yaw_deg:.0f} deg "
+        f"(probe rms {best_rms:.3f} m over {yaw_starts} starts)")
+
+    src = src0 @ best_yaw_R.T
+    # seed translation by centroid match of the gravity+yaw-aligned cloud
+    R, t, rms = icp_rigid(src, dst_tree, init_R=np.eye(3),
+                          init_t=dem_mean - src.mean(0), log=log)
+    R_full = R @ best_yaw_R @ R0
     # diagnostic scale check via the ICP correspondence spread ratio
     return {"R": R_full, "t": t, "rms_m": rms,
             "model_to_dem": lambda p: np.asarray(p) @ R_full.T + t}

@@ -457,9 +457,16 @@ REMAINING_ACCURACY_PROGRESS.md for why), not the mitigations themselves:
 
 * `load_dem`: XYZ text (≥200 points) or GeoTIFF via optional rasterio.
 * `DemSurface`: IDW over 9 nearest neighbours in (x,y); NaN beyond 3× point spacing.
-* `align_to_dem`: gravity rotation `_gravity_R(up)` → +z, centroid translation seed,
-  `icp_rigid` (25 iterations, keep best 50 % correspondences, point-to-plane linearised
-  solve with rotation step clamped to 0.2 rad). Scale is fixed (cloud is already metric).
+* `align_to_dem`: gravity rotation `_gravity_R(up)` → +z, then a 12-start yaw sweep about
+  `up` (30° increments, each probed with a short 4-iteration ICP; the best-RMS heading is
+  refined to full convergence) — gravity alone leaves heading unconstrained, and a single
+  seed only converges within ICP's ~30° basin. Aligns on the cached dense cloud when one
+  already exists on disk (`densify.load_cached_dense`, a pure lookup — never builds one;
+  building is a worker-process job) instead of the sparse cloud, whose outliers otherwise
+  pull the centroid seed; falls back to sparse when no dense cache is present. Centroid
+  translation seed, `icp_rigid` (25 iterations, keep best 50 % correspondences,
+  point-to-plane linearised solve with rotation step clamped to 0.2 rad). Scale is fixed
+  (cloud is already metric).
 * `change_volume`: registration priority (1) shared ArUco marker — Kabsch on the four
   metric corners plus a virtual normal point, both signs, all cyclic shifts, accepted if
   max residual ≤ 25 % of side; (2) gravity-seeded trimmed ICP. Epoch A becomes the

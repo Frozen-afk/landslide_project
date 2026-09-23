@@ -653,6 +653,34 @@ def _cap_voxel(n_points: int, voxel: float, max_points: int = MAX_FUSED_POINTS):
     return voxel * float(np.sqrt(n_points / max_points))
 
 
+def load_cached_dense(ctx: ReconCtx, log: Log = print,
+                      stereo_width: int = 1280) -> dict | None:
+    """`ctx.dense` if already loaded, else the on-disk dense-cloud cache.
+
+    Never runs stereo — pure lookup, so it's safe to call from a process
+    that must not pay for SGBM (e.g. a request thread; building only ever
+    happens inside `dense_cloud`, which itself calls this first). Uses the
+    exact same cache key and fingerprint check `dense_cloud` writes, so a
+    cache from a different reconstruction is never silently reused.
+    """
+    if ctx.dense is not None:
+        return ctx.dense
+    # "v2": F2 changed how `voxel` is derived from the sparse cloud, so a
+    # cache written by the old formula must not be reused (its voxel is
+    # ~50x coarser and its dense cloud starved) — bump the cache key rather
+    # than silently trusting a file the new code would never have produced.
+    cache = ctx.workdir / f"dense_{stereo_width}_v2_{ctx.fingerprint}.npz"
+    if not cache.exists():
+        return None
+    z = np.load(cache)
+    if "fingerprint" in z and str(z["fingerprint"]) == ctx.fingerprint:
+        dense = {"points": z["points"], "colors": z["colors"]}
+        log(f"[dense] loaded cache: {len(dense['points'])} points")
+        return dense
+    log("[dense] cached cloud is from a different reconstruction, ignoring")
+    return None
+
+
 def dense_cloud(ctx: ReconCtx, log: Log = print, max_pairs: int = 30,
                 force: bool = False, stereo_width: int = 1280,
                 cfg: "StereoConfig | None" = None) -> dict:
@@ -662,20 +690,13 @@ def dense_cloud(ctx: ReconCtx, log: Log = print, max_pairs: int = 30,
     for finals, 640 for ~5x-faster previews at reduced accuracy.
     """
     cfg = cfg or StereoConfig(max_pairs=max_pairs)
-    # "v2": F2 changed how `voxel` below is derived from the sparse cloud, so
-    # a cache written by the old formula must not be reused (its voxel is
-    # ~50x coarser and its dense cloud starved) — bump the cache key rather
-    # than silently trusting a file the new code would never have produced.
-    cache = ctx.workdir / f"dense_{stereo_width}_v2_{ctx.fingerprint}.npz"
-    if ctx.dense is not None and not force:
-        return ctx.dense
-    if cache.exists() and not force:
-        z = np.load(cache)
-        if "fingerprint" in z and str(z["fingerprint"]) == ctx.fingerprint:
-            ctx.dense = {"points": z["points"], "colors": z["colors"]}
-            log(f"[dense] loaded cache: {len(ctx.dense['points'])} points")
+    # "v2" cache key: see `load_cached_dense`'s docstring for the fingerprint
+    # contract this relies on.
+    if not force:
+        cached = load_cached_dense(ctx, log=log, stereo_width=stereo_width)
+        if cached is not None:
+            ctx.dense = cached
             return ctx.dense
-        log("[dense] cached cloud is from a different reconstruction, rebuilding")
 
     views_sorted = sorted(ctx.views.values(), key=lambda v: v.name)
     if not views_sorted:

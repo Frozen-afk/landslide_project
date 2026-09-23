@@ -73,6 +73,15 @@ def evaluate_gates(ctx: ReconCtx, res: dict, region_method: str) -> tuple[str, l
                 flag("indicative", f"ray-cast hit {hit_frac:.0%} of the traced "
                      f"boundary (longest consecutive miss run {max_run})")
 
+    # up-vector quality (P4/H1): the scene-plane/camera-plane candidates
+    # disagreed by more than 20 deg and a ground-like vote (not agreement)
+    # decided which one is "up" — everything referenced to it (slope stats,
+    # hazard map, top-down view, DEM gravity seed) inherits that uncertainty.
+    disagree = res.get("up_disagree_deg")
+    if disagree is not None and disagree > 20.0:
+        flag("indicative", f"up-vector candidates disagreed by {disagree:.0f}° "
+             f"— chose {res.get('up_source')} by a ground-like vote, not agreement")
+
     # G6 — coverage of the selected interior (RC1/A1)
     cov = res.get("coverage_frac")
     if cov is not None:

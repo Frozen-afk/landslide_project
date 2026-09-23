@@ -112,6 +112,10 @@ def test_volume_end_to_end(ctx, synth):
         f"{res['cut_upper_m3']:.1f}]")
     assert res["status"] in ("indicative", "rejected"), \
         "this scene's ~60% coverage should never read as status=ok"
+    # P4: up_source/up_disagree_deg are always published, whichever branch
+    # of estimate_up decided (see tests/test_up.py for the branch-level check)
+    assert res["up_source"] in ("scene_plane", "camera_plane")
+    assert "up_disagree_deg" in res
     assert res["fill_volume_m3"] < 0.35 * truth
     # F2/F8: restored from the 500 that was masking the voxel-starvation bug
     # (a healthy fused cloud on this scene measures ~70k interior points;

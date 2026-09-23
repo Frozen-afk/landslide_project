@@ -203,7 +203,8 @@ def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
         if image_name not in ctx.views:
             raise ValueError(f"image '{image_name}' is not part of the reconstruction")
         view = ctx.views[image_name]
-        up = estimate_up(ctx.views, ctx.sparse, log=log)
+        up_info: dict = {}
+        up = estimate_up(ctx.views, ctx.sparse, log=log, info=up_info)
 
         # ground-frame selection (T1.2): cast the traced polygon onto a
         # ground DSM instead of projecting the cloud into the photo, so
@@ -242,6 +243,8 @@ def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
             res["mode"] = "photo"
             res["image"] = image_name
         res["region_method"] = region_method
+        res["up_source"] = up_info["up_source"]
+        res["up_disagree_deg"] = up_info["disagree_deg"]
         if region_method == "ground_frame":
             res["rim_band_m"] = [ginfo["rim_inner_m"], ginfo["rim_outer_m"]]
             res["hit_frac"] = ginfo["hit_frac"]

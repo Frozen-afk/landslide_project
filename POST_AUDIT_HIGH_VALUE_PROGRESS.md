@@ -219,6 +219,131 @@ so not attempted here.
 
 ---
 
+# High-value pass — P4 progress
+
+Implements `POST_AUDIT_HIGH_VALUE_PLAN.md` §2 P4 only ("Report which 'up' was chosen",
+H1 reporting half). P1/P2 (above) are untouched by this pass; P3, P5, P6 and V1 are
+untouched, per this task's explicit "P4 only" boundary.
+
+## What was implemented
+
+`landslide/densify.py::estimate_up` — matches the plan's design exactly: a new optional
+`info: dict | None = None` parameter, filled at every `return` with `up_source`
+("scene_plane" | "camera_plane"), `disagree_deg` (the angle between the two candidates,
+or `None` in the two branches where no meaningful comparison happens — `scene_up is
+None`, or the collinear-path early return, where the camera-plane candidate is itself
+degenerate) and `collinearity`. No call-site signature changes: all seven other callers
+(`densify.py:745`, `ortho.py:69`, `ground.py:273`, `change.py:104`, `server/routes.py:290`,
+`tools/benchmark.py:163`, plus the two `tests/test_up.py` pre-existing calls) pass no
+`info` and are byte-for-byte unaffected.
+
+`landslide/pipeline.py::measure` (photo-mode branch only) — passes `info=up_info` to its
+existing `estimate_up` call and publishes `res["up_source"]` / `res["up_disagree_deg"]`
+right beside the existing `res["region_method"]` assignment.
+
+`landslide/gates.py::evaluate_gates` — new gate: `up_disagree_deg > 20°` (the vote, not
+agreement, decided which candidate is "up") flags `indicative` with a reason naming both
+the disagreement angle and the source chosen.
+
+`server/static/js/steps/result.js::showResult` — one new row, "up vector source", shown
+beside "region selection" when `r.up_source` is present, including the disagreement angle
+when there was a genuine one to report.
+
+## Scope note: photo mode only, not ortho mode
+
+The plan's acceptance criterion reads "`up_source` and `up_disagree_deg` present in every
+`measure()` result", without a mode qualifier. In practice this pass follows the *existing*
+convention already set by `region_method` itself: `pipeline.py` only ever sets
+`res["region_method"]` inside the `mode == "photo"` branch (confirmed — grep finds exactly
+one assignment site, `pipeline.py:244`); `mode == "ortho"` results have never carried it,
+and `result.js` already guards every such field with `if (r.field)`. Ortho mode's `up` is
+read from the cached `ortho.json` meta (computed once, at render time, by
+`ortho.py:69`'s own `estimate_up` call) rather than recomputed at measure time, so there is
+no `info` dict available there without either (a) a second, redundant `estimate_up` call
+solely to populate reporting fields, or (b) writing into `ortho.json`'s meta — the latter
+is exactly what P1 fenced off as a byte-identical-compatibility boundary for saved jobs.
+Given P4's own "zero numeric change" / "compatibility risk: none" framing, this pass adds
+`up_source`/`up_disagree_deg` to photo-mode results only, mirroring `region_method`'s own
+precedent, and does not touch `ortho.py` or `ortho.json`. Flagged as a remaining-risk item
+below rather than silently narrowed.
+
+## Regression coverage added
+
+`tests/test_up.py::test_info_reports_source_and_disagree_angle_on_genuine_disagreement` —
+exactly the plan's own §P4 acceptance case: a scene ground plane tilted 25° under an arc of
+cameras (high enough that the camera-plane candidate stays near true vertical), asserting
+`disagree_deg` is within 2° of the constructed 25° and that `up_source` names the branch
+that actually produced the returned vector (checked against the true normal of whichever
+candidate `up_source` claims, not just that the string is one of the two valid values).
+
+`tests/test_e2e_synth.py::test_volume_end_to_end` — two assertions added to the existing
+photo-mode e2e case: `res["up_source"] in ("scene_plane", "camera_plane")` and
+`"up_disagree_deg" in res`, covering the plan's "present in every measure() result (e2e
+assertion)" criterion for the photo-mode path.
+
+`.venv/bin/python -m pytest -q -k "not e2e"`: **164 passed, 1 skipped** (163 baseline from
+the P2 pass + 1 new `test_up.py` case). No existing assertion changed.
+
+## Focused validation
+
+`.venv/bin/python -m pytest -q tests/test_e2e_synth.py::test_volume_end_to_end -v` — full
+SfM + dense stereo + measure() run on the `arc` preset: **1 passed**, confirming
+`up_source`/`up_disagree_deg` are present and well-formed in a real pipeline result, not
+just the isolated unit test.
+
+**"Zero numeric change" reasoned, not re-benchmarked over all 8 presets.** This pass adds
+no code on any path that computes `net_volume_m3`, `cut_volume_m3`, `scale`, or any other
+existing numeric field — `estimate_up`'s return value is identical whether or not `info` is
+passed (the new parameter only writes into a dict the caller supplies; every existing
+`return` statement returns the exact same vector it did before). The new gate can only ever
+add an `"indicative"` entry to `reasons`; per `POST_AUDIT_HIGH_VALUE_PLAN.md` §0.2, no
+preset in the benchmark reaches `status = "ok"` (G6's coverage gate alone already forces
+`indicative` or `rejected` on all eight), so the new gate cannot change any preset's
+`status` — only whether one additional reason string is present, which is the change's
+entire intended effect. A full `tools/benchmark.py` re-run was not needed to confirm this
+and was not run.
+
+## Deviations from the plan
+
+None. `disagree_deg` is `None` (rather than always a float) in the two branches where no
+genuine two-candidate comparison happens (`scene_up is None`; collinear camera path) — not
+specified either way by the plan, and the only sensible value when the "disagreement"
+being asked about was never computed.
+
+## Acceptance status against the plan's criteria
+
+1. **New `tests/test_up.py` case, disagree_deg within 2° of a constructed 25° tilt,
+   `up_source` names the branch taken — MET.**
+2. **`up_source`/`up_disagree_deg` present in every `measure()` result — MET for photo
+   mode** (the mode `estimate_up` is actually called from at measure time); **not extended
+   to ortho mode**, per the scope note above.
+3. **Zero numeric change across all eight presets' benchmark volume/scale columns — MET
+   by construction** (reasoned above; no numeric-producing code path touched).
+4. **Compatibility risk: none — MET.** Additive result fields plus one optional parameter
+   with a safe default; no `response_model` constrains the measure endpoint's returned
+   dict (`server/routes.py`); no existing test's assertions changed.
+
+## Status
+
+**Implemented, tested, acceptance met (with the ortho-mode scope note above, not a
+deviation from what was approved but a boundary this pass chose conservatively).** Safe to
+ship as-is.
+
+## Remaining risks / follow-up (not undertaken here — out of P4's scope)
+
+- Ortho-mode results do not carry `up_source`/`up_disagree_deg` (see scope note). If this
+  is wanted later, the lowest-risk route is a second, cheap `estimate_up(..., info=...)`
+  call in `pipeline.py`'s ortho branch purely to populate the reporting fields (discarding
+  its returned vector — the actual computation keeps using `ortho.json`'s cached `up`), not
+  a change to `ortho.json` itself.
+- P4 makes the up-vector disagreement *visible* and flags it; it does not resolve H1's
+  original concern (a hillside scene has no `hillside25` preset to validate against, and
+  the "level the marker" gravity override remains deferred) — unchanged from the plan's own
+  "Deferred from H1" note.
+- P3, P5, P6 and V1 remain as scoped in `POST_AUDIT_HIGH_VALUE_PLAN.md`, untouched.
+
+---
+
 # High-value pass — P2 progress
 
 Implements `POST_AUDIT_HIGH_VALUE_PLAN.md` §2 P2 only ("ArUco detection at severe

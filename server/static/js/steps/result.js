@@ -56,6 +56,11 @@ export function showResult(r) {
   if (r.region_method) {
     rows.push(["region selection", r.region_method]);
   }
+  if (r.up_source) {
+    rows.push(["up vector source", r.up_source
+      + (typeof r.up_disagree_deg === "number"
+         ? ` (candidates disagreed by ${r.up_disagree_deg.toFixed(0)}°)` : "")]);
+  }
   if (typeof r.coverage_frac === "number") {
     rows.push(["coverage of traced region", `${(r.coverage_frac * 100).toFixed(0)}%`
       + (r.largest_void_m2 ? ` (largest gap ${r.largest_void_m2.toFixed(1)} m²)` : "")]);

@@ -542,7 +542,8 @@ def _scene_plane_up(sparse: np.ndarray, cam_centroid: np.ndarray) -> np.ndarray 
     return n / np.linalg.norm(n)
 
 
-def estimate_up(views: dict, sparse: np.ndarray, log: Log | None = None) -> np.ndarray:
+def estimate_up(views: dict, sparse: np.ndarray, log: Log | None = None,
+                info: dict | None = None) -> np.ndarray:
     """Scene-vertical "up" vector, robust to the shape of the camera path.
 
     Two candidates: the normal of the dominant plane of the SPARSE CLOUD
@@ -553,18 +554,32 @@ def estimate_up(views: dict, sparse: np.ndarray, log: Log | None = None) -> np.n
     shot). The scene plane is trusted whenever the cameras are collinear or
     the two candidates roughly agree; on genuine disagreement, whichever
     normal more of the cloud's own local surfaces call "ground-like" wins.
+
+    `info`, when given, is filled with `up_source` ("scene_plane" or
+    "camera_plane"), `disagree_deg` (angle between the two candidates, or
+    None when only one was computed/compared) and `collinearity` (H1) —
+    for the caller to report which branch decided and how confidently.
     """
     centers = np.array([v.center for v in views.values()])
     cam_up, collinearity = _camera_plane_up(views, sparse)
     scene_up = _scene_plane_up(sparse, centers.mean(axis=0))
     if scene_up is None:
+        if info is not None:
+            info.update(up_source="camera_plane", disagree_deg=None,
+                        collinearity=collinearity)
         return cam_up
     if collinearity < 0.10:
         if log:
             log("[up] collinear camera path — using the scene's ground plane")
+        if info is not None:
+            info.update(up_source="scene_plane", disagree_deg=None,
+                        collinearity=collinearity)
         return scene_up
     agree_deg = float(np.degrees(np.arccos(np.clip(abs(scene_up @ cam_up), -1, 1))))
     if agree_deg <= 20.0:
+        if info is not None:
+            info.update(up_source="scene_plane", disagree_deg=agree_deg,
+                        collinearity=collinearity)
         return scene_up
     n_scene = int(surface_filter(sparse, scene_up).sum())
     n_cam = int(surface_filter(sparse, cam_up).sum())
@@ -572,7 +587,11 @@ def estimate_up(views: dict, sparse: np.ndarray, log: Log | None = None) -> np.n
         log(f"[up] scene-plane vs camera-plane vertical disagree by "
             f"{agree_deg:.0f}° — ground-like vote: scene {n_scene}, "
             f"camera-path {n_cam}")
-    return scene_up if n_scene >= n_cam else cam_up
+    chose_scene = n_scene >= n_cam
+    if info is not None:
+        info.update(up_source="scene_plane" if chose_scene else "camera_plane",
+                    disagree_deg=agree_deg, collinearity=collinearity)
+    return scene_up if chose_scene else cam_up
 
 
 def surface_filter(points: np.ndarray, up: np.ndarray, k: int = 16,

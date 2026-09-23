@@ -1,7 +1,8 @@
 """Ground-frame ray-casting geometry (T1.2), no SfM needed."""
 import numpy as np
 
-from landslide.ground import build_dsm, cast_polygon_to_ground, estimate_cell_size
+from landslide.ground import (build_dsm, cast_polygon_to_ground, estimate_cell_size,
+                              fill_dsm_holes)
 from landslide.ortho import ground_basis
 from landslide.sfm import ImageView
 
@@ -92,3 +93,39 @@ def test_cast_polygon_respects_scale():
     ground_poly, hit_frac, _ = cast_polygon_to_ground(view, uv, dsm, up, e1, e2, scale=scale)
     assert hit_frac > 0.8
     np.testing.assert_allclose(ground_poly[0], corners_world[0, :2] * scale, atol=1e-6)
+
+
+def test_cast_polygon_tolerates_20pct_random_dsm_holes():
+    """P6 (H3 remainder): the audit's own regression criterion — a DSM with
+    20% of its cells randomly blanked, run through the exact production
+    order (`fill_dsm_holes(build_dsm(...))`, see `select_region_ground`),
+    still ray-casts a known polygon at hit_frac >= 0.95 and recovers a
+    ground polygon within one cell of the no-holes result."""
+    view = _oblique_view(center=(0.0, -8.0, 4.0), look_at=(0.0, 0.0, 0.0))
+    corners_world = np.array([[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0],
+                              [1.0, 1.0, 0.0], [-1.0, 1.0, 0.0]])
+    uv, depth = view.project(corners_world)
+    assert (depth > 0).all()
+
+    pts = _flat_ground_cloud()
+    up = np.array([0.0, 0.0, 1.0])
+    e1, e2 = ground_basis(up)
+    cell = estimate_cell_size(pts, e1, e2)
+    dsm = build_dsm(pts, up, e1, e2, cell)
+    base_poly, base_hit, _ = cast_polygon_to_ground(view, uv, dsm, up, e1, e2, scale=1.0)
+    assert base_hit == 1.0
+
+    rng = np.random.default_rng(42)
+    valid = np.flatnonzero(~np.isnan(dsm["z"]))
+    blank = rng.choice(valid, size=int(0.2 * valid.size), replace=False)
+    z = dsm["z"].reshape(-1).copy()
+    z[blank] = np.nan
+    holed = dict(dsm, z=z.reshape(dsm["z"].shape))
+
+    filled = fill_dsm_holes(holed)
+    poly, hit_frac, max_miss_run = cast_polygon_to_ground(
+        view, uv, filled, up, e1, e2, scale=1.0)
+
+    assert hit_frac >= 0.95
+    assert len(poly) == len(base_poly)
+    assert np.linalg.norm(poly - base_poly, axis=1).max() <= cell

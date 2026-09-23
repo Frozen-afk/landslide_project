@@ -887,3 +887,105 @@ regression test, verified to actually reproduce the hang before the fix.
   description was specific to `load_persisted_jobs`'s promotion decision;
   broadening this further is a judgment call beyond what was asked.
 - P6 and V1 remain as scoped in `POST_AUDIT_HIGH_VALUE_PLAN.md`, untouched.
+
+---
+
+# High-value pass — P6 progress
+
+Implements `POST_AUDIT_HIGH_VALUE_PLAN.md` §2 P6 only ("The missing
+hole-tolerance regression test", H3 remainder). Test-only, per the plan's own
+"Compatibility risk: none (test-only)" scoping. No application code touched;
+P1-P5 (above) and V1 remain as they were left by prior passes.
+
+## What was implemented
+
+`tests/test_ground.py::test_cast_polygon_tolerates_20pct_random_dsm_holes` —
+the plan's own design, run through the exact production call order
+`select_region_ground` already uses (`fill_dsm_holes(build_dsm(...))`, then
+`cast_polygon_to_ground`), not a synthetic shortcut around it:
+
+1. Build a flat-ground DSM from the same `_flat_ground_cloud` /
+   `_oblique_view` fixtures the existing three tests in this file already
+   use, and ray-cast the known 2x2 m square polygon against it with no holes
+   — this is the "no-holes result" the plan's second criterion compares
+   against (`base_hit == 1.0`, confirmed before the hole is introduced).
+2. With a fixed `np.random.default_rng(42)`, blank exactly 20% of the DSM's
+   populated cells to `NaN` (`dsm["z"]`, `estimate_cell_size`'s own 0.132 m
+   cell at this cloud density → 77x77 grid).
+3. Run `fill_dsm_holes` (EDT nearest-valid-cell fill, `max_dist_m=2.0`
+   default) then `cast_polygon_to_ground` on the holed DSM.
+4. Assert `hit_frac >= 0.95` (the plan's own bar) and every recovered ground
+   vertex is within one DSM cell of the no-holes baseline's corresponding
+   vertex (`np.linalg.norm(poly - base_poly, axis=1).max() <= cell`).
+
+## Measured results
+
+Probed the same scenario standalone (5 seeds, 0-4, before picking the fixed
+seed=42 used in the shipped test) to confirm the result isn't a lucky draw:
+
+| seed | hit_frac | max_miss_run | max vertex diff vs. no-holes | cell |
+| --- | --- | --- | --- | --- |
+| 0 | 1.000 | 0 | 0.000 m | 0.1318 m |
+| 1 | 1.000 | 0 | 0.000 m | 0.1318 m |
+| 2 | 1.000 | 0 | 0.000 m | 0.1318 m |
+| 3 | 1.000 | 0 | 0.000 m | 0.1318 m |
+| 4 | 1.000 | 0 | 0.000 m | 0.1318 m |
+| 42 (shipped) | 1.000 | 0 | 0.000 m | 0.1318 m |
+
+At 20% *random* (not clustered) blanking, no ray in this fixture ever
+crosses a contiguous NaN run longer than `cast_polygon_to_ground`'s own
+`max_gap_cells=8` tolerance, and `fill_dsm_holes`'s 2 m radius (≈15 cells at
+this density) closes every remaining gap before the cast even runs — this
+directly reproduces the plan's H3 verdict text ("`ground.py:151-235` ...
+tolerates an 8-cell NaN gap ... `fill_dsm_holes` ... runs first") rather than
+just asserting it. A same-seed probe with `fill_dsm_holes` skipped (holed DSM
+cast directly) also still hit 1.0/0 at seed 42 — the cast's own in-flight gap
+tolerance alone already covers this scene at this hole density; the shipped
+test exercises the full production order (`fill_dsm_holes` + cast together),
+matching what `select_region_ground` actually runs rather than testing either
+mechanism in isolation.
+
+## Focused validation
+
+`.venv/bin/python -m pytest -q tests/test_ground.py -v`: **4 passed** (3
+baseline + 1 new).
+
+`.venv/bin/python -m pytest -q -k "not e2e"`: **176 passed, 1 skipped** (175
+baseline from the P3 pass + 1 new). No existing assertion changed.
+
+## Deviations from the plan
+
+None. The plan specifies "blank 20% of its cells at random (fixed seed)"
+and "within one cell of the no-holes result" without naming a seed value or
+requiring the hole to be adversarially clustered; `seed=42` was chosen
+arbitrarily and confirmed representative (table above) rather than
+cherry-picked to pass.
+
+## Acceptance status against the plan's criteria
+
+1. **`hit_frac >= 0.95` — MET** (1.0 measured).
+2. **Recovered ground polygon within one cell of the no-holes result — MET**
+   (max vertex deviation 0.0 m against a 0.1318 m cell).
+3. **Compatibility risk: none (test-only) — MET.** Only `tests/test_ground.py`
+   changed; `git diff --stat` confirms no `landslide/` or `server/` file was
+   touched.
+
+**Status: implemented, tested, both measurable acceptance criteria met, on
+the plan's own terms and without weakening any existing threshold** — G6's
+coverage gate, G5's `max_miss_run` gate, `min_hit_frac`'s 0.5 fallback
+threshold, and every pre-existing `tests/test_ground.py` assertion are
+untouched (3/3 prior cases still pass with their original bounds).
+
+## Remaining risks / follow-up (not undertaken here — out of P6's scope)
+
+- The plan's H3 verdict already noted the paired "arc photo-mode error ≤ 8%"
+  criterion is invalidated by A1 (`cut_volume_m3` is measured-only,
+  24-47% below truth by design) and is correctly **not** adopted here —
+  unchanged from the plan's own text, not a new finding of this pass.
+- This test uses a flat synthetic ground and a single oblique view, matching
+  the file's existing fixtures; it does not exercise hole tolerance on a
+  sloped or multi-view scene (H1's still-deferred `hillside25` preset would
+  be the natural place to extend this, not P6's scope).
+- V1 remains as scoped in `POST_AUDIT_HIGH_VALUE_PLAN.md`, untouched. All of
+  P1-P6 are now implemented; V1 is the only item from the approved plan not
+  yet attempted.

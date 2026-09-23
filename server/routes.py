@@ -448,10 +448,18 @@ def job_artifact(job_id: str, name: str):
 
 @router.delete("/api/jobs/{job_id}")
 def delete_job(job_id: str):
+    job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(404, "unknown job")
+    # P3a: a worker (reconstruct/measure/ortho) writes into job.dir; deleting
+    # it out from under a running worker leaves the worker recreating
+    # artifacts/ into a directory that no longer exists.
+    with job.lock:
+        if job.status in BUSY_STATUSES or job.status == "reconstructing":
+            raise HTTPException(409, "the server is busy on this job — wait "
+                                     "for it to finish before deleting it")
     with JOBS_LOCK:
-        job = JOBS.pop(job_id, None)
-        if job is None:
-            raise HTTPException(404, "unknown job")
+        JOBS.pop(job_id, None)
         for key in [k for k in _photo_cache if k[0] == job_id]:
             _photo_cache.pop(key, None)
     shutil.rmtree(job.dir, ignore_errors=True)

@@ -246,3 +246,70 @@ def test_worker_crash_is_isolated_and_pool_recovers(ready_job):
             f"pool did not recover after a killed worker: {done2}")
     finally:
         shutil.rmtree(ready_job2.dir, ignore_errors=True)
+
+
+# ---------- P3a: DELETE must not race a running worker ----------
+
+def test_delete_busy_job_rejected_then_succeeds_once_ready(ready_job):
+    ready_job.status = "measuring"
+    r = client.delete(f"/api/jobs/{ready_job.id}")
+    assert r.status_code == 409
+    assert ready_job.dir.exists()
+    with JOBS_LOCK:
+        assert ready_job.id in JOBS
+
+    ready_job.status = "ready"
+    r2 = client.delete(f"/api/jobs/{ready_job.id}")
+    assert r2.status_code == 200
+    assert not ready_job.dir.exists()
+    with JOBS_LOCK:
+        assert ready_job.id not in JOBS
+
+
+# ---------- P3c: shutdown must not wait out a running worker ----------
+
+def _sleep_worker(job_id, photos_dir, work_dir, queue):
+    import time as _t
+    _t.sleep(30)
+    return {"ok": True}
+
+
+def test_shutdown_now_terminates_running_worker(ready_job):
+    executor.submit_job(ready_job, _sleep_worker, on_done=lambda *a: None)
+
+    deadline = time.time() + 10
+    procs = []
+    while time.time() < deadline and not procs:
+        procs = list(executor._pool._processes.values())
+        if not procs:
+            time.sleep(0.05)
+    assert procs, "no worker process spawned in time"
+
+    t0 = time.time()
+    executor.shutdown_now()
+    dt = time.time() - t0
+    assert dt <= 2.0, f"shutdown_now() took {dt:.2f}s"
+
+    deadline = time.time() + 2
+    while time.time() < deadline and any(p.is_alive() for p in procs):
+        time.sleep(0.05)
+    assert all(not p.is_alive() for p in procs), "worker process(es) outlived shutdown_now()"
+
+
+def test_app_lifespan_shutdown_is_fast_with_a_running_worker(monkeypatch):
+    monkeypatch.setattr(main, "load_persisted_jobs", lambda: None)
+    job = Job("shut-" + uuid.uuid4().hex[:8])
+    (job.dir / "photos").mkdir(parents=True)
+    with JOBS_LOCK:
+        JOBS[job.id] = job
+    try:
+        with TestClient(main.app) as c:
+            executor.submit_job(job, _sleep_worker, on_done=lambda *a: None)
+            time.sleep(0.3)   # let the worker process actually start
+            t0 = time.time()
+        dt = time.time() - t0
+        assert dt < 5.0, f"app shutdown took {dt:.2f}s with a running worker"
+    finally:
+        with JOBS_LOCK:
+            JOBS.pop(job.id, None)
+        shutil.rmtree(job.dir, ignore_errors=True)

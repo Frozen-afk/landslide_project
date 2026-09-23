@@ -127,6 +127,26 @@ def _recreate_pool() -> None:
         _pool = _new_pool()
 
 
+def shutdown_now() -> None:
+    """Hard-stop the pool (P3c) so process shutdown doesn't wait out a
+    running SfM/dense-stereo job.
+
+    `concurrent.futures`' own atexit handler joins each worker process,
+    which blocks until it actually exits — fine for a task that finishes in
+    milliseconds, not for a multi-minute reconstruction. Terminating the
+    worker processes here first means that join is near-instant by the time
+    atexit (or this call) reaches it.
+    """
+    global _pool
+    with _state_lock:
+        pool, _pool = _pool, None
+    if pool is None:
+        return
+    for proc in list(getattr(pool, "_processes", {}).values()):
+        proc.terminate()
+    pool.shutdown(wait=False, cancel_futures=True)
+
+
 def _crash_message(exc: BaseException) -> str:
     if isinstance(exc, BrokenProcessPool):
         return f"worker process crashed (native crash): {exc}"

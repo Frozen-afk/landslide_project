@@ -141,7 +141,12 @@ export function initUpload() {
     const del = ev.target.closest("[data-del]");
     if (del) {
       if (!confirm("delete this job and its photos?")) return;
-      await api(`/api/jobs/${del.dataset.del}`, { method: "DELETE" });
+      try {
+        await api(`/api/jobs/${del.dataset.del}`, { method: "DELETE" });
+      } catch (e) {
+        alert("could not delete job: " + e.message);   // P3a: busy jobs 409
+        return;
+      }
       if (del.dataset.del === state.jobId) window.location.reload();
       refreshJobList();
       return;

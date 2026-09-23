@@ -17,6 +17,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
+from server import executor
 from server.jobs import load_persisted_jobs
 from server.routes import router
 
@@ -27,6 +28,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 async def lifespan(_app: FastAPI):
     load_persisted_jobs()
     yield
+    executor.shutdown_now()  # P3c: don't let a running job block shutdown
 
 
 app = FastAPI(title="Landslide Volume from Phone Photos", lifespan=lifespan)

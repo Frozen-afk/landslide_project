@@ -14,6 +14,7 @@ import json
 import os
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from pathlib import Path
 
@@ -45,7 +46,12 @@ class Job:
         self.scale_info = scale_info  # mirror of ctx.scale_info, persisted
         self.ortho = ortho            # orthophoto metadata, persisted
         self.dem_info = dem_info      # prior-DEM transform, persisted
-        self.lock = threading.Lock()
+        # RLock, not Lock: ensure_ctx() holds this for its whole body
+        # (including its evict_ctx() call), and evict_ctx() can pick this
+        # same job as an eviction candidate and call its own save_state(),
+        # which now also takes this lock (P3b) — on the same thread, a
+        # plain Lock would self-deadlock there.
+        self.lock = threading.RLock()
         self._ctx_loading = False     # guarded by self.lock (S4)
 
     # ---------- persistence ----------
@@ -54,19 +60,25 @@ class Job:
         return self.dir / "state.json"
 
     def save_state(self) -> None:
-        if self.ctx is not None and self.ctx.scale_info.get("applied"):
-            self.scale_info = self.ctx.scale_info
-        state = {
-            "status": self.status, "error": self.error, "created": self.created,
-            "log": self.log[-400:],
-            "scale_info": (lambda s: {k: v for k, v in s.items() if k != "marker_px"}
-                           if s else None)(self.scale_info),
-            "result": self.result, "ortho": self.ortho,
-            "dem_info": self.dem_info,
-        }
-        tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state))
-        os.replace(tmp, self.state_path)
+        # P3b: request threads and the worker-callback thread can call this
+        # concurrently; without the lock, two interleaved builds/writes can
+        # publish a torn or stale state.json. A per-call unique temp suffix
+        # means one caller's write can never be clobbered by another's
+        # before its own os.replace runs.
+        with self.lock:
+            if self.ctx is not None and self.ctx.scale_info.get("applied"):
+                self.scale_info = self.ctx.scale_info
+            state = {
+                "status": self.status, "error": self.error, "created": self.created,
+                "log": self.log[-400:],
+                "scale_info": (lambda s: {k: v for k, v in s.items() if k != "marker_px"}
+                               if s else None)(self.scale_info),
+                "result": self.result, "ortho": self.ortho,
+                "dem_info": self.dem_info,
+            }
+            tmp = self.state_path.with_suffix(f".tmp-{uuid.uuid4().hex[:8]}")
+            tmp.write_text(json.dumps(state))
+            os.replace(tmp, self.state_path)
 
     def say(self, msg: str) -> None:
         line = f"[{time.strftime('%H:%M:%S')}] {msg}"
@@ -206,6 +218,27 @@ def evict_ctx() -> None:
         gc.collect()   # hand the evicted point-cloud buffers back to the OS
 
 
+_MODEL_FILES = ("cameras", "images", "points3D")
+
+
+def _model_complete(sparse_dir: Path) -> bool:
+    """True if at least one model directory under `sparse_dir` has all
+    three COLMAP output files (P3d): `Job.reconstructable` accepts *any*
+    file under `sparse/*/`, which is also true mid-write, so it isn't
+    strict enough to decide whether an interrupted job's model is safe to
+    promote to `ready` on server restart.
+    """
+    if not sparse_dir.is_dir():
+        return False
+    for sub in sparse_dir.iterdir():
+        if not sub.is_dir():
+            continue
+        if all((sub / f"{name}.bin").exists() or (sub / f"{name}.txt").exists()
+               for name in _MODEL_FILES):
+            return True
+    return False
+
+
 def load_persisted_jobs() -> None:
     """Reattach jobs from a previous server run."""
     with JOBS_LOCK:
@@ -226,9 +259,11 @@ def load_persisted_jobs() -> None:
                       result=state.get("result"), ortho=state.get("ortho"),
                       dem_info=state.get("dem_info"))
             if job.status in ("reconstructing", "measuring", "orthorectifying"):
-                # no state file but a finished model on disk: a job from an
-                # older server version (which didn't persist state)
-                if job.reconstructable:
+                # a job that was mid-reconstruction (or mid-measure/-ortho,
+                # which both require a finished model) when the server
+                # stopped: only promote it if COLMAP finished writing a
+                # complete model, not merely started one (P3d).
+                if _model_complete(d / "work" / "sparse"):
                     job.status = "ready"
                 else:
                     job.status = "error"

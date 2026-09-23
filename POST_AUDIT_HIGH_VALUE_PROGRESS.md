@@ -710,3 +710,180 @@ byte-identical logic just relocated).
   "Excluded" note) — this pass's runtime win (2.86× not 12×) makes that tradeoff milder
   than the plan assumed but does not revisit the decision.
 - P3, P6 and V1 remain as scoped in `POST_AUDIT_HIGH_VALUE_PLAN.md`, untouched.
+
+---
+
+# High-value pass — P3 progress
+
+Implements `POST_AUDIT_HIGH_VALUE_PLAN.md` §2 P3 only ("Server lifecycle
+defects", H4 minus cancellation/SSE). P1/P2/P4/P5 (above) are untouched by this
+pass; P6 and V1 remain untouched, per this task's explicit "P3 only" boundary.
+Cancel endpoint and SSE disconnect handling stay excluded, exactly as the plan
+scopes them.
+
+## What was implemented
+
+**(a) Delete under a running worker** (`server/routes.py::delete_job`) — the
+job is now looked up and its status checked under `job.lock` before anything
+is removed; `409` is raised while `status in BUSY_STATUSES or status ==
+"reconstructing"`, leaving `JOBS` and the on-disk directory untouched. Only
+once that check clears does the job get popped from `JOBS` and its directory
+`rmtree`'d, unchanged from before. `server/static/js/steps/upload.js`'s
+delete-button handler now wraps the `DELETE` call in `try/catch` and
+`alert()`s `e.message` on failure — previously an error response there was an
+unhandled promise rejection with no user-visible surfacing at all (the plan's
+own compatibility note: "the UI's delete control must surface that message").
+
+**(b) Unlocked `save_state`** (`server/jobs.py::Job.save_state`) — the whole
+build-and-write body now runs under `self.lock`, and the temp file gets a
+per-call unique suffix (`state.tmp-<8 hex chars>` instead of the shared
+`state.tmp`) so one caller's write can never be clobbered by another's before
+its own `os.replace` runs.
+
+**Deviation, found during implementation, not in the plan:** `self.lock` had
+to become a `threading.RLock()` (was `threading.Lock()`). `ensure_ctx()` holds
+`self.lock` for its *entire* body, including its own call to `evict_ctx()`;
+`evict_ctx()` walks `JOBS` and can pick the very job currently inside
+`ensure_ctx()` as an eviction candidate (it hasn't been `touch()`-ed to the
+end of the LRU order yet) and calls that job's `save_state()` — which, after
+this pass's lock, tries to re-acquire `self.lock` on the *same thread*. A
+plain `Lock` self-deadlocks there; confirmed by temporarily reverting to
+`Lock` and watching `tests/test_jobs.py::test_ensure_ctx_evicting_itself_does_not_deadlock`
+hang until a 20 s external timeout killed the process, then re-confirmed
+passing (0.6 s) after switching to `RLock`. This is a real, reachable path
+(any `GET /api/jobs/{id}` poll on a job whose ctx isn't loaded triggers
+`start_ctx_reload` → `ensure_ctx` in a background thread; two-plus jobs with
+loaded contexts, `MAX_LOADED_CTX=2` on this codebase's default), not a
+theoretical one — recorded here rather than silently folded into "no
+deviation".
+
+**(c) Shutdown blocks on a running SfM** — new `server/executor.py::shutdown_now()`
+terminates every live worker process (`proc.terminate()` on the pool's
+`_processes`) and then calls `pool.shutdown(wait=False, cancel_futures=True)`,
+so `concurrent.futures`' own atexit join (which otherwise waits for each
+worker to actually exit) has nothing left to wait on. `server/main.py`'s
+`lifespan` now calls `executor.shutdown_now()` after `yield`, i.e. on app
+shutdown. The `multiprocessing.Manager` used for the log queue is
+deliberately left running — the plan doesn't ask for its teardown, and its
+own daemon drain-thread already logs a harmless `EOFError`/thread-exception
+at interpreter exit today (reproduced identically on the pre-existing
+`test_worker_crash_is_isolated_and_pool_recovers` test run in isolation, so
+this is not something this pass introduced).
+
+**(d) Interrupted reconstruction resumes as `ready`** — new
+`server/jobs.py::_model_complete(sparse_dir)` requires `cameras`, `images`
+and `points3D` (`.bin` or `.txt`) to all be present in at least one model
+subdirectory; `load_persisted_jobs()` now calls this instead of the loose
+`job.reconstructable` (which only asks "does any file exist under
+`sparse/*/`") to decide whether a job found `reconstructing`/`measuring`/
+`orthorectifying` at startup gets promoted to `ready` or `error`. Deliberately
+scoped to just this one call site — `job.reconstructable` itself is
+unchanged, since it's also used by `ensure_ctx`/measure/ortho's busy gates and
+tightening it there was not asked for and is not what the plan's failure
+description (specifically about the startup-promotion decision) targets.
+
+## Regression coverage added
+
+`tests/test_server.py` (+3): `test_delete_busy_job_rejected_then_succeeds_once_ready`
+(the plan's own (a) acceptance case); `test_shutdown_now_terminates_running_worker`
+(real `ProcessPoolExecutor`, a 30 s-sleep worker, asserts `shutdown_now()`
+returns in ≤ 2 s and every spawned process is dead within 2 s after);
+`test_app_lifespan_shutdown_is_fast_with_a_running_worker` (real `TestClient`
+lifespan, same sleep worker, asserts the `with TestClient(...)` block's exit —
+which runs the app's shutdown — completes in < 5 s).
+
+`tests/test_jobs.py` (new file, 5 cases): `test_concurrent_save_state_never_publishes_torn_json`
+(the plan's own (b) acceptance case — 100 concurrent `save_state()` calls from
+16 threads, then asserts `state.json` parses and no stray `state.tmp-*` file
+is left behind); `test_empty_sparse_dir_resumes_as_error` /
+`test_partial_model_resumes_as_error` / `test_complete_model_resumes_as_ready`
+(the plan's own (d) acceptance cases, via `monkeypatch.setattr(jobs,
+"DATA_DIR", tmp_path)` so nothing touches the repo's real `data/jobs/`);
+`test_ensure_ctx_evicting_itself_does_not_deadlock` (the RLock deviation's own
+regression test, described above).
+
+`.venv/bin/python -m pytest -q -k "not e2e"`: **175 passed, 1 skipped** (167
+baseline from the P5 pass + 3 `test_server.py` + 5 `test_jobs.py`). No
+existing assertion changed. `tests/test_server.py` alone: **22 collected**
+(19 baseline + 3 new), matching the plan's own "(d) ... `tests/test_server.py`
+(19 cases) passes unchanged" criterion exactly.
+
+## Focused validation
+
+Ran each acceptance case's own scenario directly (not just via the unit
+tests, to confirm the behavior end-to-end):
+
+- **(a)** `TestClient` DELETE against a job forced to `status="measuring"` →
+  `409`, directory still present, `JOBS` still holds the id; same DELETE
+  after `status="ready"` → `200`, directory gone, id removed from `JOBS`.
+- **(b)** 100 concurrent `save_state()` calls from 16 threads on one `Job` →
+  `state.json` parses as valid JSON every time; zero leftover
+  `state.tmp-*` files.
+- **(c)** Real pool, real 30 s-sleep worker process spawned and confirmed
+  alive, then `shutdown_now()` timed at **well under the 2 s bar** (returns as
+  soon as `terminate()` is sent to each process) and the process is confirmed
+  dead within the same 2 s follow-up window; separately, a real `TestClient`
+  app with the same sleeping worker in flight shuts down in **well under the
+  5 s bar**.
+- **(d)** Three `load_persisted_jobs()` fixtures against a monkeypatched
+  `DATA_DIR`: empty `sparse/0/` → `error` + "interrupted..." message; `sparse/0/`
+  with only `points3D.bin` (the exact "SfM died mid-write" shape) → same
+  `error`; `sparse/0/` with all three files → `ready`, `error is None`.
+
+## Deviations from the plan
+
+One, described in full under (b) above: `self.lock` changed from
+`threading.Lock()` to `threading.RLock()`, discovered because the plan's own
+(b) change (locking `save_state`) interacts with the pre-existing `ensure_ctx`
+→ `evict_ctx` → (possibly the same job's) `save_state` call chain. Confirmed
+as a genuine, reachable deadlock (not just a theoretical reentrancy concern)
+by reproducing the hang with a plain `Lock` before switching to `RLock`.
+No other deviation: (a), (c) and (d) match the plan's design exactly.
+
+## Acceptance status against the plan's criteria
+
+1. **(a) TestClient — a job forced to `measuring` returns 409 on DELETE, the
+   directory still exists, and DELETE succeeds once the status clears — MET.**
+2. **(b) 100 concurrent `save_state` calls, every subsequent read of
+   `state.json` parses as valid JSON — MET.**
+3. **(c) With a worker running a long sleep, `shutdown_now()` returns in ≤ 2 s
+   and no pool child process remains alive; a TestClient app shutdown
+   completes < 5 s — MET.**
+4. **(d) A fixture with an empty `sparse/0/` and one with a partial model both
+   resume as `error`; a complete model still resumes as `ready`;
+   `tests/test_server.py` (19 cases) passes unchanged — MET.**
+5. **Compatibility risk: low, one visible API change — DELETE now returns 409
+   while busy; the UI's delete control must surface that message — MET.** The
+   only behavior-visible change on an already-passing request is the new 409
+   on a busy delete; the UI change above surfaces it instead of an unhandled
+   rejection.
+
+**Status: implemented, tested, all four sub-items' acceptance criteria met.**
+One deviation (Lock → RLock) was required for (b) to be safe against the
+pre-existing `ensure_ctx`/`evict_ctx` interaction and is covered by its own
+regression test, verified to actually reproduce the hang before the fix.
+
+## Remaining risks / follow-up (not undertaken here — out of P3's scope)
+
+- **Cancel endpoint and SSE disconnect handling remain unimplemented**,
+  exactly as the plan excludes them (needs a per-job terminable process; no
+  `EventSource` client exists to disconnect). `shutdown_now()` (c) only
+  affects *process* shutdown, not a running job's completion — there is still
+  no way to stop one in-flight job without stopping the whole server.
+- **The `multiprocessing.Manager` (log queue) is not torn down** by
+  `shutdown_now()` — only the `ProcessPoolExecutor`. Its own daemon
+  drain-thread throws a harmless `Exception in thread ... EOFError`/
+  `PytestUnhandledThreadExceptionWarning` at interpreter exit once any test
+  has driven a real pool; confirmed pre-existing (reproduces identically on
+  `test_worker_crash_is_isolated_and_pool_recovers` run alone, unmodified by
+  this pass) and cosmetic (process exit code stays `0`), not attempted here
+  since the plan's (c) scope is specifically the pool, not the manager.
+- **`_model_complete` is not used to tighten `job.reconstructable` itself** —
+  measure/ortho's busy gates and `ensure_ctx`'s reload attempt still use the
+  looser "any file exists" check, so a request against a genuinely
+  mid-write model (as opposed to one discovered at server startup) still
+  reaches `reconstruct(reuse=True)` and surfaces whatever error pycolmap
+  raises, rather than the polished "interrupted" message. The plan's failure
+  description was specific to `load_persisted_jobs`'s promotion decision;
+  broadening this further is a judgment call beyond what was asked.
+- P6 and V1 remain as scoped in `POST_AUDIT_HIGH_VALUE_PLAN.md`, untouched.

@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import cv2
 import numpy as np
 import pytest
 
@@ -201,6 +202,87 @@ def test_manual_scale_rejects_reversed_endpoints_with_zero_residual(prior_ctx):
         np.testing.assert_allclose(uv, pixels, atol=1e-9)
     with pytest.raises(RuntimeError, match="finite positive depth"):
         manual_scale(ctx, sa, sb, LENGTH, log=lambda *_: None)
+
+
+def test_detector_params_tuned_for_severe_angle():
+    """P2 (POST_AUDIT_HIGH_VALUE_PLAN.md): the detector must not run with
+    OpenCV's stock defaults, which measurably missed oblique60/nadir."""
+    ar = cv2.aruco
+    stock = ar.DetectorParameters()
+    p = scaling._detector_params()
+    assert p.cornerRefinementMethod == ar.CORNER_REFINE_SUBPIX
+    assert p.cornerRefinementMethod != stock.cornerRefinementMethod
+    assert p.adaptiveThreshWinSizeMax > stock.adaptiveThreshWinSizeMax
+    assert p.adaptiveThreshWinSizeStep < stock.adaptiveThreshWinSizeStep
+    assert p.polygonalApproxAccuracyRate > stock.polygonalApproxAccuracyRate
+
+
+def _render_marker_photo(tmp_path, cx, cy, half, scale=1.0, blur=0):
+    """A synthetic full-res photo containing one ArUco marker (id 7) at a
+    known pixel square, optionally shrunk (`scale`) and blurred to emulate a
+    small/soft detection at severe viewing angle. Returns (path, true_corners
+    TL/TR/BR/BL at full resolution).
+    """
+    canvas = np.full((2400, 3200), 235, np.uint8)
+    pattern = cv2.aruco.generateImageMarker(
+        cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250), 7, 240, borderBits=1)
+    side = int(2 * half * scale)
+    pattern = cv2.resize(pattern, (side, side), interpolation=cv2.INTER_AREA)
+    x0, y0 = int(cx - side / 2), int(cy - half)
+    canvas[y0:y0 + side, x0:x0 + side] = pattern
+    if blur:
+        canvas = cv2.GaussianBlur(canvas, (blur, blur), 0)
+    path = tmp_path / "marker.png"
+    cv2.imwrite(str(path), canvas)
+    true_corners = np.array([[x0, y0], [x0 + side, y0], [x0 + side, y0 + side],
+                             [x0, y0 + side]], np.float64)
+    return path, true_corners
+
+
+def test_full_res_crop_refinement_beats_downscaled_subpix(tmp_path):
+    """P2: refining corners on a full-resolution crop must localize a small,
+    slightly-blurred marker at least as tightly as the old cornerSubPix(win=5)
+    on a coarse downscale — and strictly better once the marker is small
+    enough that the downscale leaves only a few px per edge."""
+    path, true_corners = _render_marker_photo(
+        tmp_path, cx=1600, cy=1200, half=150, blur=3)
+    img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    max_side = 400                                  # aggressive downscale
+    s = max_side / max(img.shape)
+    small = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+
+    found_downscale_only = scaling.detect_marker_corners(
+        small, s, "DICT_6X6_250")
+    found_full_res = scaling.detect_marker_corners(
+        small, s, "DICT_6X6_250", path=path)
+    assert 7 in found_downscale_only and 7 in found_full_res
+
+    err_downscale = np.linalg.norm(found_downscale_only[7] - true_corners, axis=1).mean()
+    err_full_res = np.linalg.norm(found_full_res[7] - true_corners, axis=1).mean()
+    assert err_full_res < err_downscale       # strictly tighter localization
+    assert err_full_res < 1.5                 # near-subpixel on the true corner
+
+
+@pytest.mark.parametrize("half,blur", [(10, 0), (15, 3), (20, 5), (30, 3), (45, 5)])
+def test_tuned_detector_never_loses_a_stock_detection(tmp_path, half, blur):
+    """Regression guard for a real P2 finding: the plan's original choice of
+    `CORNER_REFINE_APRILTAG` was measured to DISCARD valid detections that
+    the stock (unrefined) detector found — 21/21 -> 10/21 raw detections on
+    the `arc` preset's own photos, with no other parameter changed — so
+    `CORNER_REFINE_SUBPIX` is used instead (see `_detector_params`). This
+    pins the property that mattered: the tuned detector must be a strict
+    superset of the stock detector's raw hits, never a subset.
+    """
+    path, _ = _render_marker_photo(tmp_path, cx=1600, cy=1200, half=half, blur=blur)
+    gray = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    stock_detector = cv2.aruco.ArucoDetector(
+        cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250),
+        cv2.aruco.DetectorParameters())
+    _, stock_ids, _ = stock_detector.detectMarkers(gray)
+    if stock_ids is None or 7 not in stock_ids.flatten():
+        pytest.skip("stock detector itself misses this synthetic case")
+    tuned = scaling.detect_marker_corners(gray, 1.0, "DICT_6X6_250")
+    assert 7 in tuned
 
 
 def test_aruco_scale_clean_corners(monkeypatch):

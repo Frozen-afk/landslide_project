@@ -47,26 +47,106 @@ def _load_gray(path, max_side: int = 2200):
     return img, gray, s
 
 
+def _detector_params() -> "cv2.aruco.DetectorParameters":
+    """Tuned for severe viewing angles / small apparent marker size: a
+    grazing or distant marker can fail the default adaptive-threshold ladder
+    entirely, or get discarded by the default polygon-fit tolerance before
+    a corner is ever reported (measured: nadir's detection reprojects with a
+    38% side spread pre-tuning).
+
+    `CORNER_REFINE_APRILTAG` was tried first (the plan's original choice) and
+    measured to actively DISCARD valid detections on this codebase's
+    synthetic marker — 21/21 -> 10/21 raw detections on `arc` alone, with no
+    change to the threshold/polygon settings — so it is not used.
+    `CORNER_REFINE_SUBPIX` was verified (same isolated per-image count check)
+    to match the stock detector's raw detection count on every preset and
+    gain one view on `nadir`, with none of APRILTAG's losses.
+    """
+    ar = cv2.aruco
+    p = ar.DetectorParameters()
+    p.cornerRefinementMethod = ar.CORNER_REFINE_SUBPIX
+    p.adaptiveThreshWinSizeMin = 3
+    p.adaptiveThreshWinSizeMax = 53
+    p.adaptiveThreshWinSizeStep = 4
+    p.polygonalApproxAccuracyRate = 0.06
+    return p
+
+
+def _refine_corners_full_res(full_gray, corners_full: np.ndarray,
+                             crit, win: int) -> np.ndarray:
+    """`cornerSubPix` on a crop of the ORIGINAL full-resolution image around
+    the coarse hit, instead of a 5px window on the shared 2200px-downscaled
+    detection image. At a severe angle or distance the marker can span only
+    a handful of downscaled pixels per edge — too few for subpixel refinement
+    to do anything — while the native-resolution crop gives it real pixels.
+
+    `win` is measured in FULL-RES pixels and must be pre-scaled by the same
+    factor the image was downscaled by (`round(5 / s)`, see
+    `detect_marker_corners`) — a window sized in raw pixel counts without
+    accounting for the resolution gain is too large relative to the
+    marker's own bit-cell pitch and converges on the wrong (adjacent) corner
+    instead of refining the intended one (measured: an un-scaled (11, 11)
+    window on a full-res image that needed no downscale at all — most of
+    this benchmark's synthetic photos — jumped 10+ px onto a neighbouring
+    marker-pattern corner and made every scale estimate worse, not better).
+    """
+    h, w = full_gray.shape
+    pad = max(2 * win, 20)
+    x0 = max(0, int(corners_full[:, 0].min()) - pad)
+    x1 = min(w, int(corners_full[:, 0].max()) + pad)
+    y0 = max(0, int(corners_full[:, 1].min()) - pad)
+    y1 = min(h, int(corners_full[:, 1].max()) + pad)
+    if x1 - x0 < 2 * win or y1 - y0 < 2 * win:
+        return corners_full
+    crop = full_gray[y0:y1, x0:x1]
+    local = (corners_full - [x0, y0]).reshape(-1, 1, 2).astype(np.float32)
+    try:
+        cv2.cornerSubPix(crop, local, (win, win), (-1, -1), crit)
+    except cv2.error:
+        return corners_full
+    return local.reshape(-1, 2).astype(np.float64) + [x0, y0]
+
+
 def detect_marker_corners(gray, s: float, dict_name: str,
-                          marker_id: int | None = None):
-    """Return {marker_id: (4,2) corners in full-res pixel coords}."""
+                          marker_id: int | None = None, path=None):
+    """Return {marker_id: (4,2) corners in full-res pixel coords}.
+
+    Detection runs on `gray` (the shared, possibly downscaled, decode). When
+    `path` is given AND a downscale actually happened (`s < 1.0`), each
+    accepted marker's corners are refined on a crop of the ORIGINAL
+    full-resolution image (see `_refine_corners_full_res`) with a window
+    scaled up by the same factor the image was shrunk by, instead of
+    `cornerSubPix` on the downscale — a real photo that needed no downscale
+    (`s == 1.0`, the common case for this codebase's own synthetic
+    benchmark) gets exactly the old behaviour, since there is no extra
+    resolution to gain from re-reading it.
+    """
     ar = cv2.aruco
     dictionary = ar.getPredefinedDictionary(getattr(ar, dict_name))
-    detector = ar.ArucoDetector(dictionary, ar.DetectorParameters())
+    detector = ar.ArucoDetector(dictionary, _detector_params())
     corners, ids, _ = detector.detectMarkers(gray)
     out = {}
     if ids is None:
         return out
+    full_gray = None
+    if path is not None and s < 1.0:
+        full_gray = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    win = min(15, max(5, int(round(5 / s)))) if full_gray is not None else 5
     crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01)
     for crn, mid in zip(corners, ids.flatten()):
         if marker_id is not None and int(mid) != int(marker_id):
             continue
-        crn = crn.reshape(-1, 1, 2).astype(np.float32)
-        try:
-            cv2.cornerSubPix(gray, crn, (5, 5), (-1, -1), crit)
-        except cv2.error:
-            pass
-        out[int(mid)] = crn.reshape(-1, 2).astype(np.float64) / s
+        if full_gray is not None:
+            crn_full = crn.reshape(-1, 2).astype(np.float64) / s
+            crn_full = _refine_corners_full_res(full_gray, crn_full, crit, win)
+        else:
+            crn2 = crn.reshape(-1, 1, 2).astype(np.float32)
+            try:
+                cv2.cornerSubPix(gray, crn2, (5, 5), (-1, -1), crit)
+            except cv2.error:
+                pass
+            crn_full = crn2.reshape(-1, 2).astype(np.float64) / s
+        out[int(mid)] = crn_full
     return out
 
 
@@ -155,7 +235,8 @@ def aruco_scale(ctx: ReconCtx, side_m: float, dict_name: str = "auto",
         v = ctx.views[name]
         _, gray, s = _load_gray(v.path)
         for d in dicts:
-            for mid, corners in detect_marker_corners(gray, s, d, marker_id).items():
+            for mid, corners in detect_marker_corners(
+                    gray, s, d, marker_id, v.path).items():
                 found.setdefault((d, mid), {})[name] = corners
     if not found:
         raise RuntimeError(

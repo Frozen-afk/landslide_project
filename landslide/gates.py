@@ -92,5 +92,14 @@ def evaluate_gates(ctx: ReconCtx, res: dict, region_method: str) -> tuple[str, l
         elif cov < 0.85 or void > 2.0:
             flag("indicative", f"{cov:.0%} coverage, largest unmeasured patch "
                  f"{void:.1f} m² — the volume interpolates across it")
+    elif res.get("datum") == "dem":
+        # dem_volume has no G6 coverage gate: its interior points live in the
+        # DEM-aligned world frame, not the model's own (up, polygon_ground)
+        # frame G6 needs, so wiring a real coverage_frac would need a second
+        # coordinate transform this fix doesn't touch (B3 scope). Forcing
+        # "indicative" is the audit's documented fallback (FINAL_RELEASE_
+        # AUDIT.md §5, B3) so DEM mode can no longer report "ok" un-gated.
+        flag("indicative", "DEM mode has no coverage gate (G6) — treat the "
+             "bridged/unmeasured area as unverified")
 
     return status, reasons

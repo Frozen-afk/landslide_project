@@ -322,7 +322,7 @@ def _cv_rmse(kind: str, uv: np.ndarray, h: np.ndarray, folds: int = 3,
 
 def dem_volume(interior_xyz: np.ndarray, dem_fn, log: Log = print,
                max_edge_factor: float = 20.0,
-               max_edge_region_frac: float = 0.5) -> dict:
+               max_edge_abs_m: float = 0.5) -> dict:
     """Cut/fill of a surface against an imported pre-event DEM.
 
     `interior_xyz` are the region's points already mapped into the DEM's
@@ -357,13 +357,23 @@ def dem_volume(interior_xyz: np.ndarray, dem_fn, log: Log = print,
 
     d_self, _ = cKDTree(p[:, :2]).query(p[:, :2], k=2, workers=-1)
     spacing = float(np.median(d_self[:, 1]))
-    lo, hi = np.percentile(p[:, :2], [1, 99], axis=0)
-    diam = float(np.linalg.norm(hi - lo))
-    max_edge = max(max_edge_factor * spacing, max_edge_region_frac * diam)
+    # RC1/A1 (matches prism_volume): an absolute cap, not a fraction of the
+    # region's own diameter — the old `0.5 * diam` term let the TIN bridge a
+    # 30-60 m² unobserved patch with a handful of long triangles instead of
+    # excluding it (see FINAL_RELEASE_AUDIT.md §4.3/B3).
+    max_edge = max(max_edge_factor * spacing, max_edge_abs_m)
     edges = np.stack([np.linalg.norm(q1 - q0, axis=1),
                       np.linalg.norm(q2 - q1, axis=1),
                       np.linalg.norm(q0 - q2, axis=1)])
     keep_tri = edges.max(axis=0) <= max_edge
+    # per-vertex residual to each kept triangle's own mean height — a real
+    # local-roughness estimate. The old line compared h_tri (already the
+    # per-triangle mean) against itself recomputed the same way, so the
+    # "residual" was identically zero and sigma/LoD/est_volume_error_m3
+    # never reported any uncertainty (FINAL_RELEASE_AUDIT.md §4.3/B3).
+    verts_h = h[simp[keep_tri]] if keep_tri.any() else h[simp[:0]]
+    sigma = float(np.sqrt(((verts_h - verts_h.mean(axis=1, keepdims=True)) ** 2)
+                          .mean())) if len(verts_h) else 0.0
     if not keep_tri.all():
         bridged = float(area_tri[~keep_tri].sum())
         log(f"[dem-volume] dropping {int((~keep_tri).sum())} bridging "
@@ -378,9 +388,6 @@ def dem_volume(interior_xyz: np.ndarray, dem_fn, log: Log = print,
     cut = float(-v_tri[h_tri < 0].sum())
     net = fill - cut
     area = float(area_tri.sum())
-
-    sigma = float(np.sqrt(((h[simp][keep_tri].mean(axis=1) - h_tri) ** 2)
-                          .mean())) if len(h_tri) else 0.0
     max_slope, mean_slope, area_steep = slope_stats(p[:, :2], h + dem_fn(
         p[:, :2]))
     if area_steep > max(0.5, 0.02 * area):

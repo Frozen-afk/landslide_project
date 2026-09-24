@@ -150,3 +150,146 @@ job's lock while holding `JOBS_LOCK`, and no longer blocks on any job's lock
 at all — removing both the audit-identified deadlock and the related
 candidate-vs-candidate cycle the minimal fix would have left open. B3–B5 and
 F1–F3 remain open per `FINAL_RELEASE_AUDIT.md`, out of scope for this pass.
+
+## B3 — DEM mode: σ ≡ 0, RC1 bridging, no G6, can emit `ok`
+
+**Status: FIXED (σ and bridging cull fixed directly; G6 addressed via the
+audit's documented fallback — forced `indicative` — not by wiring a real
+`coverage_frac`; see Deviations).**
+
+### Root cause
+
+Three independent defects in `landslide/volume.py::dem_volume` (`:323-414`
+pre-fix), confirmed by direct reproduction against the function (script run
+under `.venv`, not the e2e presets — see Validation):
+
+1. **σ ≡ 0.** After the RC1/A1 bridging cull, `h_tri` was reassigned to
+   `h[simp].mean(axis=1)` restricted to kept triangles (`:374`). The sigma
+   line then recomputed `h[simp][keep_tri].mean(axis=1)` — the exact same
+   per-triangle mean, by the exact same formula — and diffed it against
+   `h_tri`, i.e. against itself. The residual was `0.0` by construction for
+   every input, so `datum_rms_m`, `lod_m`, `lod_max_m`, and
+   `est_volume_error_m3` were always 0 regardless of real surface noise.
+   Reproduced: a flat DEM against a surface with visible 3 cm noise
+   (`0.05·sin(x) + N(0, 0.03)`) reported `datum_rms_m = 0.0`.
+2. **Bridging cull used the pre-RC1 formula.** `max_edge = max(20·spacing,
+   0.5·region_diameter)` (`max_edge_region_frac=0.5`) — the exact "×
+   diameter" term `prism_volume`'s docstring says RC1/A1 *removed* in favor
+   of an absolute cap (`prism_volume`'s own default is `max_edge_abs_m=0.5`
+   **metres**, not a diameter fraction). On any scene wider than ~1 m, `0.5
+   × diameter` is tens of metres, so the cull essentially never fires and
+   the TIN bridges large unobserved voids with long triangles exactly as
+   RC1 was written to stop. Reproduced: a dense point grid (0.12 m spacing,
+   realistic dense-cloud density) with a 64 m² hole punched out measured
+   ~383 m² against a ~336 m² real footprint under the pre-fix formula — the
+   hole was bridged, not excluded.
+3. **No `coverage_frac`.** `dem_volume`'s signature never accepted `up` /
+   `polygon_ground`, and its two call sites (`pipeline.py:192-193,236-237`)
+   never passed them even though both have `up`/`polygon_ground` in scope
+   (used for `prism_volume` a few lines below in the same function). With
+   no `coverage_frac` in the result, `gates.py`'s G6 branch (`cov =
+   res.get("coverage_frac")`) is always skipped — DEM mode is the only path
+   where no gate can downgrade a result below `ok`.
+
+### Fix
+
+`landslide/volume.py::dem_volume`:
+- Renamed `max_edge_region_frac` → `max_edge_abs_m` (default `0.5`, metres)
+  and changed `max_edge = max(max_edge_factor·spacing, max_edge_region_frac·diam)`
+  to `max_edge = max(max_edge_factor·spacing, max_edge_abs_m)` — now
+  identical in form to `prism_volume`'s already-shipped, audit-verified
+  cull. No caller passed the old keyword by name (checked: `pipeline.py`,
+  `change.py`, `tests/test_dem.py` all call positionally/by other kwargs),
+  so this is not a breaking rename.
+- Sigma now measures each kept triangle's own vertex spread around its own
+  mean height (`verts_h = h[simp[keep_tri]]`; `sigma = rms(verts_h -
+  verts_h.mean(axis=1, keepdims=True))`) — a real local-roughness estimate,
+  computed *before* `h_tri`/`area_tri`/`v_tri` are overwritten by the
+  keep-mask slicing, so it no longer reads two copies of the same reduced
+  value.
+
+`landslide/gates.py::evaluate_gates`: added an `elif res.get("datum") ==
+"dem":` branch alongside the existing G6 `coverage_frac` check, which flags
+`indicative` whenever a DEM-mode result has no `coverage_frac` (i.e.
+always, per the Deviations note below). This is the mechanism that actually
+closes "can emit `ok`" — the σ/cull fixes above make the *number* more
+honest, but only this stops an un-gated coverage risk from reaching `ok`.
+
+### Regression coverage
+
+- `tests/test_dem.py::test_dem_volume_sigma_reflects_real_noise` (new): a
+  noisy flat surface must report `datum_rms_m > 0.01`,
+  `est_volume_error_m3 > 0`, `lod_m > 0`. Verified failing (all three ≡ 0)
+  against the pre-fix code, passing against the fix.
+- `tests/test_dem.py::test_dem_volume_bridging_cull_excludes_large_hole`
+  (new): a dense grid with a 64 m² punched-out hole must measure within 15
+  m² of the real ~336 m² footprint. Verified failing (~383 m², bridged)
+  against the pre-fix `× diameter` formula, passing against the fix.
+- `tests/test_gates.py` (new file): `test_dem_mode_status_never_ok` — a
+  DEM-datum result with no `coverage_frac` must not reach `status="ok"` and
+  must carry a reason mentioning the missing coverage gate. Verified failing
+  (`status="ok"`) against the pre-fix `gates.py`, passing against the fix.
+  `test_non_dem_mode_unaffected_by_dem_guard` confirms the new `elif` branch
+  doesn't fire for non-DEM results (a `rim_plane` datum with good
+  `coverage_frac` still reaches `ok`).
+
+### Validation
+
+**Fast suite:** `pytest -q -k "not e2e"` — 182 passed, 1 skipped, 23
+deselected (was 178/1/23 after B2; +4 is the new regression coverage
+above). No regressions. (The `_drain_log_queue` `EOFError` at interpreter
+exit is the pre-existing, documented cosmetic issue from audit §4.6, not
+new.)
+
+**Focused validation against B3's acceptance criteria** (direct calls to
+`dem_volume`/`evaluate_gates`, not a full e2e job — DEM mode has no
+benchmark preset per `architecture.md` §7.1, so there is no existing e2e
+DEM path to run; §6 item 5 of the audit — a real prior DEM — is explicitly
+listed as future field-validation work, out of scope here):
+1. Noisy synthetic surface vs. a flat DEM → `datum_rms_m = 0.0254`,
+   `est_volume_error_m3 = 2.45` (both `0.0` pre-fix).
+2. Dense grid with a 64 m² hole vs. a flat DEM → `area_m2 = 337.5` against
+   a real ~336 m² footprint (was `383.7`, bridging the hole, pre-fix).
+3. A DEM-datum result run through `evaluate_gates` → `status = "indicative"`
+   with reason `"DEM mode has no coverage gate (G6) — treat the
+   bridged/unmeasured area as unverified"` (was `status = "ok"` pre-fix).
+
+### Deviations from the audit's suggested fix scope
+
+- The audit's minimum fix scope says "Fix σ, apply the A1 cull and G6 to
+  `dem_volume`," and separately offers an explicit fallback: "Otherwise
+  disable DEM mode or force `indicative`." σ and the A1 cull are fixed
+  directly in `dem_volume`, matching the letter of the suggested scope. G6
+  is **not** wired as a real `coverage_frac` computation — that was a
+  deliberate scope decision, not an oversight: `dem_volume`'s
+  `interior_xyz` arrives already transformed into the DEM-aligned world
+  frame (`(pts[interior]·scale) @ R.T + t`, applied by the caller), while
+  the `up`/`polygon_ground` the existing `_coverage_gate` needs are still
+  in the *original* model frame. Reusing `_coverage_gate` correctly would
+  need a second coordinate transform (lifting the 2D traced polygon back to
+  3D, applying the same `R, t` as the interior points, in both the ortho
+  and ground-frame photo call sites) that touches geometry this task's B3
+  scope doesn't otherwise require and that the audit did not reproduce or
+  specify — attempting it without a DEM benchmark preset to validate
+  against risked introducing a new, unverified correctness bug under this
+  task's "smallest effective correction" instruction. The audit's own
+  stated fallback (force `indicative`) closes the actual defect named in
+  its verdict ("can report `status = ok`") without that risk, implemented
+  as one `elif` branch in `gates.py` alongside the real G6 check so a
+  future correct `coverage_frac` wiring for DEM mode will automatically
+  take over (the `if cov is not None` branch is tried first).
+- Did not touch `landslide/change.py::change_volume` (the CLI-only
+  two-epoch path, `architecture.md` §1.1 step 7), which also calls
+  `dem_volume` but never routes through `pipeline.measure`/`evaluate_gates`
+  at all — it has no `status` field today, DEM-mode gating or otherwise,
+  and adding one is out of B3's scope (B3 is about `pipeline.measure`'s DEM
+  path per the audit's §4.3 evidence, all of which is Probe D against
+  `dem_volume` directly).
+
+### Acceptance
+
+B3 is fixed and regression-tested against its three named defects: σ now
+reflects real surface noise, the bridging cull uses the same RC1 absolute
+cap as `prism_volume`, and DEM-mode results can no longer reach
+`status="ok"` un-gated. B4–B5 and F1–F3 remain open per
+`FINAL_RELEASE_AUDIT.md`, out of scope for this pass.

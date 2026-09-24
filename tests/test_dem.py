@@ -48,6 +48,38 @@ def test_dem_volume_recovers_pile():
     assert res["cut_volume_m3"] < 0.15 * truth
 
 
+def test_dem_volume_sigma_reflects_real_noise():
+    # B3 regression: sigma used to compare h_tri against itself recomputed
+    # the same way, so it was identically 0 regardless of actual surface
+    # noise. A visibly noisy flat surface must report sigma > 0.
+    rng = np.random.default_rng(0)
+    xy = rng.uniform(0, 10, (400, 2))
+    z = 0.05 * np.sin(xy[:, 0]) + 0.03 * rng.standard_normal(len(xy))
+    pts = np.column_stack([xy, z])
+    res = dem_volume(pts, lambda q: np.zeros(len(q)), log=lambda *_: None)
+    assert res["datum_rms_m"] > 0.01, res["datum_rms_m"]
+    assert res["est_volume_error_m3"] > 0.0
+    assert res["lod_m"] > 0.0
+
+
+def test_dem_volume_bridging_cull_excludes_large_hole():
+    # B3 regression: the cull used `0.5 * region diameter` (tens of metres
+    # on any real scene), so it never fired; the fix restores the RC1
+    # absolute cap `max(20 * spacing, 0.5 m)`, matching prism_volume.
+    xs, ys = np.meshgrid(np.arange(0, 20, 0.12), np.arange(0, 20, 0.12))
+    rng = np.random.default_rng(3)
+    xy = np.column_stack([xs.ravel(), ys.ravel()]) + rng.normal(0, 0.01, (xs.size, 2))
+    hole = (xy[:, 0] > 6) & (xy[:, 0] < 14) & (xy[:, 1] > 6) & (xy[:, 1] < 14)
+    xy = xy[~hole]                                    # 64 m^2 unobserved void
+    z = 0.02 * rng.standard_normal(len(xy))
+    pts = np.column_stack([xy, z])
+    res = dem_volume(pts, lambda q: np.zeros(len(q)), log=lambda *_: None)
+    real_footprint = 20.0 * 20.0 - 8.0 * 8.0
+    assert res["area_m2"] < real_footprint + 15.0, (
+        f"measured {res['area_m2']:.1f} m^2 bridges the 64 m^2 hole "
+        f"(real footprint ~{real_footprint:.0f} m^2)")
+
+
 def test_dem_volume_aligned_after_rigid_move():
     # same scene expressed in a rotated/translated world frame: the surface
     # and the DEM move together, differencing must be invariant

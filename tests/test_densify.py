@@ -1,10 +1,11 @@
 """Memory-bounding behaviour of the densify stage (no SfM needed)."""
 import numpy as np
 
+from landslide import densify
 from landslide.densify import (StereoConfig, _cap_voxel, _estimate_num_disp,
                                _fuse_depth_candidates, _pair_geometry_ok,
                                _sparse_extent, surface_filter, voxel_downsample)
-from landslide.sfm import ImageView
+from landslide.sfm import ImageView, ReconCtx
 
 
 def _scene(n_ground=4000, n_wall=400, seed=0):
@@ -161,3 +162,46 @@ def test_fuse_depth_candidates_single_candidate_self_agrees():
     assert count[0, 0] == 1
     assert which[0, 0] == 0
     assert fused[0, 0] == 5.0
+
+
+def test_dense_cloud_uncached_build_saves_cache(tmp_path, monkeypatch):
+    """B1 regression: an uncached/forced build must not raise NameError on
+    save, and must write the same cache path `load_cached_dense` reads.
+
+    Stereo/SfM internals are stubbed out (they need real imagery); only the
+    fusion/cache plumbing in `dense_cloud` itself is exercised.
+    """
+    rng = np.random.default_rng(0)
+    sparse = rng.uniform(0, 10, (50, 3))
+    view = ImageView(name="a", image_id=1, camera_id=1,
+                     R=np.eye(3), t=np.zeros(3),
+                     K=np.array([[500., 0, 320], [0, 500, 240], [0, 0, 1]]),
+                     dist=np.zeros(5), width=640, height=480,
+                     path=tmp_path / "a.jpg")
+    ctx = ReconCtx(rec=None, views={"a": view}, sparse=sparse,
+                   sparse_colors=np.zeros((50, 3), np.uint8),
+                   photos_dir=tmp_path, workdir=tmp_path,
+                   fingerprint="deadbeef")
+
+    fake_pts = rng.uniform(0, 10, (40, 3))
+    fake_cols = np.zeros((40, 3), np.uint8)
+    monkeypatch.setattr(densify, "covisibility_pairs", lambda rec: {})
+    monkeypatch.setattr(densify, "_neighbors_for_view",
+                        lambda ref, *a, **kw: [ref])
+    monkeypatch.setattr(densify, "_depth_map_for_view",
+                        lambda *a, **kw: (fake_pts, fake_cols))
+    monkeypatch.setattr(densify, "estimate_up",
+                        lambda *a, **kw: np.array([0., 0., 1.]))
+    monkeypatch.setattr(densify, "surface_filter",
+                        lambda pts, up: np.ones(len(pts), dtype=bool))
+
+    result = densify.dense_cloud(ctx, force=True)
+    assert len(result["points"]) > 0
+
+    expected_cache = tmp_path / "dense_1280_v2_deadbeef.npz"
+    assert expected_cache.exists()
+
+    ctx.dense = None
+    cached = densify.load_cached_dense(ctx)
+    assert cached is not None
+    assert len(cached["points"]) == len(result["points"])

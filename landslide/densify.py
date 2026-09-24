@@ -691,7 +691,8 @@ def dense_cloud(ctx: ReconCtx, log: Log = print, max_pairs: int = 30,
     """
     cfg = cfg or StereoConfig(max_pairs=max_pairs)
     # "v2" cache key: see `load_cached_dense`'s docstring for the fingerprint
-    # contract this relies on.
+    # contract this relies on. Must match the path `load_cached_dense` reads.
+    cache = ctx.workdir / f"dense_{stereo_width}_v2_{ctx.fingerprint}.npz"
     if not force:
         cached = load_cached_dense(ctx, log=log, stereo_width=stereo_width)
         if cached is not None:

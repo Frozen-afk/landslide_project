@@ -1,6 +1,6 @@
 # Release Blocker Progress
 
-Tracks fixes for the blockers in `FINAL_RELEASE_AUDIT.md` §5. This pass covers **B1 only**, per task scope.
+Tracks fixes for the blockers in `FINAL_RELEASE_AUDIT.md` §5. B1 and B2 are now covered.
 
 ## B1 — Fresh dense build `NameError`
 
@@ -56,3 +56,97 @@ Both steps of the ortho + dense-measure workflow completed successfully end-to-e
 ### Acceptance
 
 B1 is fixed and regression-tested. Ortho and dense-measure workflows complete for a new job. B2–B5 and F1–F3 remain open per `FINAL_RELEASE_AUDIT.md` — this document will gain a section per blocker as each is worked.
+
+## B2 — `ensure_ctx` / `evict_ctx` deadlock
+
+**Status: FIXED.**
+
+### Root cause
+
+Two locks, taken in opposite orders by two code paths:
+
+- `Job.ensure_ctx()` (`server/jobs.py:107-145`) takes `self.lock`, then — while still
+  holding it — calls `evict_ctx()`, which takes `JOBS_LOCK`. Order: `job.lock → JOBS_LOCK`.
+- The old `evict_ctx()` (`server/jobs.py:205-218`) took `JOBS_LOCK` and, still holding
+  it, called each eviction candidate's `save_state()`, which takes that job's
+  `job.lock`. Order: `JOBS_LOCK → job.lock`.
+
+With `MAX_LOADED_CTX` contexts already loaded, two jobs reloading concurrently —
+each an eviction candidate for the other's `evict_ctx()` call — can wait on each
+other forever: thread A holds job1's lock and blocks on `JOBS_LOCK` (held by
+thread B); thread B holds `JOBS_LOCK` and blocks on job1's lock (held by thread
+A). `JOBS_LOCK` stays held for good, so every other route that touches it
+(`list_jobs`, `touch`, the log-drain thread, every status poll) hangs too —
+confirmed matches the audit's Probe B (§4.2).
+
+Reproduced first: stashed the fix, ran the new regression test below against
+unmodified `server/jobs.py` — the two threads never rejoin and the test process
+has to be killed after a 30 s timeout (both are non-daemon and stay parked on
+each other's lock forever). Restored the fix and re-ran: passes in ~1.4 s.
+
+### Fix
+
+`server/jobs.py`, `evict_ctx()`: gather the eviction candidates under
+`JOBS_LOCK`, then release it before touching any job's lock (this alone
+restores `ensure_ctx`'s ordering, matching the audit's suggested scope). Went
+one step further for full safety: each candidate's `job.lock` is a
+**non-blocking** `acquire(blocking=False)` — a job that's genuinely in use
+right now is simply left loaded and retried on the next eviction, instead of
+being waited on. This also closes a second, harder-to-hit deadlock the
+suggested fix alone doesn't: two `evict_ctx()` calls picking each other's job
+as a candidate at the same time (an `AB↔BA` cycle on the two `job.lock`s
+directly, with `JOBS_LOCK` no longer involved). Since eviction is already
+documented as best-effort ("reloadable on demand"), skipping a momentarily
+busy candidate changes no user-visible behavior.
+
+No change to `ensure_ctx`, to the candidate-selection logic (still LRU,
+still skips busy statuses), or to what gets logged/saved on a successful
+eviction.
+
+### Regression coverage
+
+`tests/test_jobs.py::test_concurrent_ensure_ctx_does_not_deadlock_on_eviction`
+(new). Forces the exact interleaving from §4.2 with a real `job_a.ensure_ctx()`
+(fake `reconstruct`) racing a second thread that reproduces the other side of
+the old lock order (`job_b.lock` held, then `evict_ctx()` — job_a is made the
+older LRU candidate so it's the one evict_ctx must lock). An `Event` set at
+the start of the (monkeypatched) `evict_ctx()` call guarantees job_a's ctx is
+already assigned and its lock already held before the second thread starts,
+and a 0.2 s delay on thread A's side gives thread B time to reach (and,
+pre-fix, block on) job_a's lock first. Verified failing (hang) against the
+pre-fix code and passing against the fix, as described above.
+
+### Validation
+
+**Fast suite:** `pytest -q -k "not e2e"` — 178 passed, 1 skipped, 23 deselected
+(was 177/1/23 after B1; +1 is the new regression test). No regressions. (The
+`_drain_log_queue` `EOFError` printed at interpreter exit is the pre-existing,
+documented cosmetic issue from audit §4.6, not new.)
+
+**Focused validation:** the regression test above *is* the focused
+reproduction + fix validation for this blocker — B2 is a concurrency defect
+with no synthetic-preset or e2e angle (`architecture.md`'s server section and
+`tests/test_server.py` don't exercise concurrent `ensure_ctx`/`evict_ctx`
+races), so a second, separate check would just be the same test again. No
+further e2e run was needed or attempted.
+
+### Deviations from the audit's suggested fix scope
+
+- Implemented a stronger fix than "collect eviction candidates under
+  `JOBS_LOCK`, then `save_state` outside it" alone: that phrasing (candidates
+  collected, then locked one at a time outside `JOBS_LOCK`) still uses a
+  *blocking* acquire on each candidate's `job.lock`, which reopens a direct
+  `job.lock`-vs-`job.lock` deadlock between two concurrent `evict_ctx()` calls
+  that pick each other's job as a candidate (no `JOBS_LOCK` involved in that
+  cycle, since it's released before the loop). The non-blocking acquire used
+  here removes that cycle too, at no behavior cost given eviction is already
+  best-effort. This is a deliberate strengthening, not a scope departure —
+  same file, same function, no new abstractions.
+
+### Acceptance
+
+B2 is fixed and regression-tested. `evict_ctx()` no longer blocks on any
+job's lock while holding `JOBS_LOCK`, and no longer blocks on any job's lock
+at all — removing both the audit-identified deadlock and the related
+candidate-vs-candidate cycle the minimal fix would have left open. B3–B5 and
+F1–F3 remain open per `FINAL_RELEASE_AUDIT.md`, out of scope for this pass.

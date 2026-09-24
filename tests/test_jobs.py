@@ -135,6 +135,93 @@ def test_ensure_ctx_evicting_itself_does_not_deadlock(monkeypatch):
         shutil.rmtree(job_b.dir, ignore_errors=True)
 
 
+# ---------- B2 regression: evict_ctx() must not invert the lock order ----------
+
+def test_concurrent_ensure_ctx_does_not_deadlock_on_eviction(monkeypatch):
+    """ensure_ctx() takes job.lock then (via evict_ctx) JOBS_LOCK. The old
+    evict_ctx() took JOBS_LOCK then a candidate's job.lock (via save_state)
+    -- the reverse order. Two jobs reloading concurrently, each an eviction
+    candidate for the other, could then deadlock forever and wedge
+    JOBS_LOCK for every route (list_jobs, touch, status polls).
+
+    Forces the exact interleaving: job_b's evict_ctx runs first and must
+    try to lock job_a (held by job_a's own ensure_ctx, delayed past that
+    point) while still under the old code's JOBS_LOCK.
+    """
+    monkeypatch.setattr(jobs, "MAX_LOADED_CTX", 1)
+
+    job_a = Job("test-a-" + uuid.uuid4().hex[:8])
+    job_b = Job("test-b-" + uuid.uuid4().hex[:8])
+    for job in (job_a, job_b):
+        (job.dir / "photos").mkdir(parents=True)
+    sparse0 = job_a.dir / "work" / "sparse" / "0"
+    sparse0.mkdir(parents=True)
+    (sparse0 / "points3D.bin").write_bytes(b"x")
+    (job_a.dir / "work" / "database.db").write_bytes(b"x")
+    job_a.status = "ready"
+
+    job_old = Job("test-old-" + uuid.uuid4().hex[:8])
+    job_old.dir.mkdir(parents=True)   # evict_ctx() saves state on eviction
+    job_old.ctx = SimpleNamespace(scale_info={})   # already loaded, oldest slot
+    job_old.status = "ready"
+    job_b.ctx = SimpleNamespace(scale_info={})     # already loaded, next-oldest
+    job_b.status = "ready"
+    with JOBS_LOCK:
+        JOBS[job_old.id] = job_old
+        JOBS[job_a.id] = job_a     # inserted before job_b -> an older candidate
+        JOBS[job_b.id] = job_b
+
+    monkeypatch.setattr("landslide.sfm.reconstruct", lambda *a, **kw: SimpleNamespace(scale_info={}))
+
+    real_evict_ctx = jobs.evict_ctx
+    ctx_a_ready = threading.Event()
+
+    def delayed_evict_ctx():
+        if threading.current_thread().name == "A":
+            # job_a.ctx is set by this point (ensure_ctx sets it right
+            # before calling evict_ctx) and job_a.lock is still held
+            # (ensure_ctx's outer `with self.lock`) -- signal B, then hold
+            # both while B's evict_ctx reaches (and, pre-fix, blocks on)
+            # job_a's lock.
+            ctx_a_ready.set()
+            time.sleep(0.2)
+        real_evict_ctx()
+
+    monkeypatch.setattr(jobs, "evict_ctx", delayed_evict_ctx)
+
+    try:
+        result = {}
+
+        def run_a():
+            result["a"] = job_a.ensure_ctx()
+
+        def run_b():
+            # job_b.ctx is already set, so its own ensure_ctx would short-
+            # circuit; call evict_ctx() directly the way ensure_ctx does,
+            # under job_b.lock, to reproduce the second thread's lock order
+            # -- only once job_a's ctx assignment is confirmed done.
+            assert ctx_a_ready.wait(timeout=5)
+            with job_b.lock:
+                jobs.evict_ctx()
+
+        t_a = threading.Thread(target=run_a, name="A")
+        t_b = threading.Thread(target=run_b, name="B")
+        t_a.start()
+        t_b.start()
+        t_a.join(timeout=5)
+        t_b.join(timeout=5)
+        assert not t_a.is_alive() and not t_b.is_alive(), \
+            "deadlock: evict_ctx()'s lock order still inverts ensure_ctx()'s"
+    finally:
+        with JOBS_LOCK:
+            for j in (job_a, job_b, job_old):
+                JOBS.pop(j.id, None)
+        import shutil
+        shutil.rmtree(job_a.dir, ignore_errors=True)
+        shutil.rmtree(job_b.dir, ignore_errors=True)
+        shutil.rmtree(job_old.dir, ignore_errors=True)
+
+
 def test_complete_model_resumes_as_ready(tmp_path, monkeypatch):
     jid = "20990101-000002-cccccc"
     d = _make_job_dir(tmp_path, jid, "orthorectifying")

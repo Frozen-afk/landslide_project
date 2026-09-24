@@ -203,17 +203,33 @@ def touch(job: Job) -> None:
 
 
 def evict_ctx() -> None:
-    """Drop the least-recently-used idle contexts (they reload on demand)."""
-    dropped = False
+    """Drop the least-recently-used idle contexts (they reload on demand).
+
+    B2: `ensure_ctx()` takes `job.lock` then (via this function) `JOBS_LOCK`.
+    Taking `JOBS_LOCK` first and then blocking on a candidate's `job.lock`
+    (the old body did this via `save_state()`) is the reverse order, so two
+    threads picking each other's job as a candidate could deadlock forever,
+    wedging `JOBS_LOCK` for every other route. Candidates are gathered under
+    `JOBS_LOCK`, which is released before touching any job.lock, and each
+    candidate's lock is a non-blocking try: a job in active use is simply
+    left loaded and retried on the next eviction instead of being waited on.
+    """
     with JOBS_LOCK:
         loaded = [j for j in JOBS.values() if j.ctx is not None]
-        for job in loaded[:-MAX_LOADED_CTX] if len(loaded) > MAX_LOADED_CTX else []:
-            if job.status in ("measuring", "reconstructing", "orthorectifying"):
+        candidates = loaded[:-MAX_LOADED_CTX] if len(loaded) > MAX_LOADED_CTX else []
+    dropped = False
+    for job in candidates:
+        if not job.lock.acquire(blocking=False):
+            continue   # busy elsewhere right now; try again on the next eviction
+        try:
+            if job.ctx is None or job.status in ("measuring", "reconstructing", "orthorectifying"):
                 continue
             job.ctx = None
             job.save_state()
             job.say("context unloaded (reloadable on demand)")
             dropped = True
+        finally:
+            job.lock.release()
     if dropped:
         gc.collect()   # hand the evicted point-cloud buffers back to the OS
 

@@ -407,3 +407,118 @@ own memory limit during import alone on a many-core or small-RAM host — the
 audit's own reproduction figures for a "<4 GB, 1 worker" host now complete
 the identical import successfully with ~350 MB of headroom to spare. B5 and
 F1–F3 remain open per `FINAL_RELEASE_AUDIT.md`, out of scope for this pass.
+
+## B5 — README promises 1–8 % error and a single-sweep protocol
+
+**Status: FIXED.**
+
+### Root cause
+
+`README.md` predates the A1/RC1 measured-range model and G6 coverage gate.
+Four spots still describe the old, pre-gate behavior:
+
+- `README.md:6` (capture instructions) told users to sweep left → right in
+  one pass — a single-azimuth capture.
+- `README.md:12–14` claimed a single point-estimate accuracy ("scale error
+  < 2 %, volume error ≈ 1–8 %") as the thing users should expect.
+- `README.md:268` ("Capturing good photos") repeated the single-sweep,
+  left → right protocol with no azimuth guidance.
+- `README.md:286–287` (benchmark table) listed the same ~8 %/~1 % volume
+  errors with no caveat.
+
+Reproduced directly against the current gate/test behavior, not just read:
+`landslide/gates.py`'s G6 (`gates.py:84-96`) marks any result with
+`coverage_frac < 0.6` `rejected` and `< 0.85` `indicative` — `ok` requires
+≥ 0.85. `FINAL_RELEASE_AUDIT.md` §2 measured single-arc coverage at
+0.48–0.62 on every scale-able preset (never above the `ok` threshold), and
+`tests/test_e2e_synth.py:104-114` explicitly asserts this scene's ~60 %
+coverage "should never read as `status=ok`" and that the old single-number
+tolerance ("no longer applies") was replaced by the
+`cut_measured_m3 <= truth <= cut_upper_m3` range check. So a user following
+the README's single-sweep instructions gets a `status=indicative`/`rejected`
+result with a range roughly 50–140 m³ wide around a 67 m³ truth — not the
+"1–8 % error" the README promised. The two-azimuth capture protocol that
+can reach `coverage_frac ≥ 0.85` (and thus `ok`) is documented only in
+`REMAINING_ACCURACY_PLAN.md` (never shipped to `README.md`).
+
+### Fix
+
+Documentation only, `README.md`, four spots (matching the audit's named
+evidence lines):
+- Intro (`:6-19`): capture instructions now say two vantage points ≥60°
+  apart (or one elevated arc), state that a single sweep only reaches
+  48–62 % coverage and reads `indicative`/`rejected`, never `ok`, and
+  replace the single-number accuracy claim with the actual range + status
+  model (`cut_measured_m3`–`cut_upper_m3`, ~50–140 m³ around 67 m³ truth for
+  a single sweep).
+- Step 1 of the workflow (`:27-30` pre-edit): same two-azimuth guidance,
+  with a pointer to "Capturing good photos".
+- "Capturing good photos" (`:268-` pre-edit): leads with the two-azimuth
+  protocol, camera elevation ≥20°, and marker ≥50 cm facing the cameras
+  (values taken from `REMAINING_ACCURACY_PLAN.md`'s already-derived capture
+  protocol, not newly invented).
+- Benchmark table (`:286-287` pre-edit): the ~8 %/~1 % rows keep their
+  original numbers (still accurate as historical benchmark data) but gain a
+  footnote explaining they are the old bridged-interpolation metric, not
+  what `cut_volume_m3` reports today, and pointing to the actual
+  `status=indicative` range for the same single-sweep scene.
+
+No code, test, or gate logic changed — B5 is purely a documentation/gate
+mismatch per the audit's own classification.
+
+### Regression coverage
+
+Not applicable — no code path changed. The existing
+`tests/test_e2e_synth.py:104-114` assertions (`status` must be
+`indicative`/`rejected` for this scene, range must bracket truth) already
+guard the behavior the README now describes; a README-only change has
+nothing further to regress against.
+
+### Validation
+
+Focused check against B5's acceptance criterion ("rewrite accuracy and
+capture guidance to match gates: two azimuths, ranges, statuses"): re-read
+`README.md` end to end after editing and cross-checked every claim against
+current source —
+- `gates.py:84-96` — G6 thresholds (0.6 rejected, 0.85 indicative) now match
+  the stated coverage/status claims.
+- `FINAL_RELEASE_AUDIT.md` §2 arc-preset range (49.9–142.8 photo,
+  49.7–139.5 ortho against 67.16 truth) — matches the "~50–140 m³" figure
+  now in the README.
+- `REMAINING_ACCURACY_PLAN.md`'s capture protocol (two azimuths ≥60° apart,
+  elevation ≥20°, marker ≥50 cm facing cameras, ≥5 views) — matches the new
+  "Capturing good photos" wording.
+- `tests/test_e2e_synth.py:104-114` — the README no longer promises a
+  point-estimate error for the validated scene, matching what this test
+  actually asserts today.
+No remaining reference in `README.md` to a single left-to-right sweep as
+the recommended (unqualified) protocol; `grep -n "sweep\|left.*right"
+README.md` shows every remaining mention either describes the
+single-sweep case explicitly as the lesser option or is unrelated
+(the live-capture-helper's "sweep speed" quality metric).
+
+### Deviations from the audit's suggested fix scope
+
+- Left the benchmark table's ~8 %/~1 % numbers in place rather than
+  replacing them outright — they're real historical measurements of a
+  different (pre-A1/RC1) metric, and deleting them would lose information;
+  a footnote reframes what they do and don't mean today, which satisfies
+  "rewrite... to match gates" without discarding real benchmark data.
+- Did not touch `architecture.md` §3.9/§7.1 or the stale `results.md`
+  descending row the audit also flagged under its separate §4.6 "Minor"
+  doc-drift list — those are outside B5's named evidence lines
+  (`README.md:6,13-14,268,286-287`) and outside this task's B5-only scope.
+
+### Acceptance
+
+B5 is fixed. `README.md`'s capture instructions and accuracy claims now
+match `gates.py`'s actual thresholds and `tests/test_e2e_synth.py`'s actual
+assertions: two-azimuth capture is the documented path to `ok`, a
+single-sweep capture is documented as `indicative`/`rejected` with a wide
+range (not a tight point estimate), and the benchmark table's older numbers
+are correctly scoped. F1–F3 remain open per `FINAL_RELEASE_AUDIT.md`, out
+of scope for this pass. All five release blockers (B1–B5) are now fixed;
+per the audit's own path to conditional GO (§8), what remains before a
+pilot is the full e2e suite from deleted caches, a regenerated
+`data/bench/results.md`, and the hardware test in §6 item 6 — not part of
+B1–B5 and not attempted here.

@@ -3,15 +3,21 @@
 Estimate the volume of a landslide from a set of overlapping smartphone
 photos, using a reference object of known size for metric scale.
 
-You upload photos swept left → right with 60–80 % overlap, the app runs
-structure-from-motion (COLMAP via pycolmap) to reconstruct the scene in 3D,
-scales it from a reference marker, densifies it with multi-view stereo, and
-integrates the volume between the landslide surface (a polygon you draw on
-one photo) and an undisturbed-ground datum fitted to the polygon rim.
+You upload photos from **two vantage points ≥60° apart** (or one elevated
+arc looking down the steepest away-facing slope) — a single left-to-right
+sweep only sees 48–62 % of a bowl-shaped slide and reads `indicative` or
+`rejected`, never `ok`. The app runs structure-from-motion (COLMAP via
+pycolmap) to reconstruct the scene in 3D, scales it from a reference marker,
+densifies it with multi-view stereo, and integrates the volume between the
+landslide surface (a polygon you draw on one photo) and an undisturbed-ground
+datum fitted to the polygon rim.
 
-Validated end-to-end on a synthetic scene with known ground truth:
-scale error < 2 %, volume error ≈ 1–8 % on a 67 m³ bowl (ortho tracing ~1 %,
-photo tracing ~8 %; `tests/test_e2e_synth.py`).
+Every result is a range plus a status (`ok` / `indicative` / `rejected`), not
+a single number — `cut_measured_m3` to `cut_upper_m3` brackets the true
+volume, tightening as coverage improves. Validated end-to-end on a synthetic
+67 m³ bowl: scale error < 2 %; a single-sweep capture (48–62 % coverage)
+measures a ~50–140 m³ range around the 67 m³ truth (`tests/test_e2e_synth.py`,
+`FINAL_RELEASE_AUDIT.md` §2).
 
 ## Quick start
 
@@ -24,10 +30,13 @@ cd ~/Documents/landslide-volume
 
 Workflow in the browser:
 
-1. **Photos** — select 15–60 photos taken in capture order (left → right,
-   60–80 % overlap, same focal/zoom for all shots). Blurry frames and
-   near-duplicates are culled automatically; reconstruction runs
-   automatically (~1–3 min for 20 photos).
+1. **Photos** — select 15–60 photos from **two passes ≥60° apart** (or one
+   elevated pass above the steepest away-facing slope), 60–80 % overlap
+   within each pass, same focal/zoom for all shots. A single left-to-right
+   sweep still works but only reads `indicative`/`rejected`, never `ok`
+   (see Capturing good photos below). Blurry frames and near-duplicates are
+   culled automatically; reconstruction runs automatically (~1–3 min for 20
+   photos).
 2. **Reference for scale** — either
    - *ArUco marker*: print `aruco_marker.html` at 100 % scale (0.25 m side by
      default), put it in the scene where at least 2–3 photos see it, enter its
@@ -265,11 +274,17 @@ python -m landslide.cli marker --side 0.25 --out aruco_marker.png
 
 ## Capturing good photos
 
-- 60–80 % overlap between neighbours; sweep left → right in one pass;
-  15–60 photos for a typical slope.
+- **Two vantage points ≥60° apart** (or one elevated pass above the
+  steepest away-facing slope), each swept left → right with 60–80 % overlap
+  between neighbours; 15–60 photos total for a typical slope. A single
+  sweep from one side only covers 48–62 % of a bowl-shaped slide, so the
+  gates always mark it `indicative` or `rejected`, never `ok`.
+- Camera elevation ≥20° over the debris; avoid photos taken from below the
+  debris crown.
 - Same zoom for every shot (don't pinch-zoom mid-sweep).
 - Stand far enough that the whole landslide fits in ~half the frame, and keep
-  the reference marker/ruler visible and unblurred in at least 2–3 photos.
+  the reference marker/ruler visible and unblurred in at least 2–3 photos
+  (≥5 for best scale confidence, marker ≥50 cm facing the cameras).
   The reference should span ≥ 50 px in the image for ~2–3 % scale accuracy.
 - Avoid moving people/vehicles inside the marked area; overcast light is best
   (hard shadows confuse stereo).
@@ -283,8 +298,8 @@ vary a few points depending on which SfM/dense path wins and cache state.
 
 | Configuration | Metric | Result |
 | --- | --- | --- |
-| Full pipeline, photo tracing (e2e, ground-frame or image-plane fallback) | volume error vs truth | ~8% |
-| Full pipeline, ortho tracing (e2e) | volume error vs truth | ~1% |
+| Full pipeline, photo tracing (e2e, ground-frame or image-plane fallback) | volume error vs truth | ~8%² |
+| Full pipeline, ortho tracing (e2e) | volume error vs truth | ~1%² |
 | Dense stereo @1280 px | volume error vs truth | ~18%¹ |
 | Dense stereo @640 px (preview) | volume error vs truth | ~33%¹ (5× faster) |
 | Degraded photos (shadow+blur+JPEG), before quality gate | registered images / usable points | 19/21, 63 pts (unusable) |
@@ -300,6 +315,14 @@ vary a few points depending on which SfM/dense path wins and cache state.
 fusion (Tier 1) replaced the per-pair union; not yet re-benchmarked under the
 new pipeline, where each reference image's depth is a cross-neighbour
 consensus rather than one pair's raw output.
+
+² Against the true polygon, bridged across this single-sweep scene's ~60 %
+coverage gap — not what `cut_volume_m3` reports today. Since the A1/RC1
+measured-only range replaced that interpolated single number, this same
+single-sweep capture reports `status=indicative` with `cut_measured_m3`–
+`cut_upper_m3` ≈ 50–140 m³ around the 67 m³ truth, never a point estimate
+(`FINAL_RELEASE_AUDIT.md` §2). Two-azimuth capture is required for a
+tighter, `ok`-eligible result.
 
 ## Accuracy & limitations
 

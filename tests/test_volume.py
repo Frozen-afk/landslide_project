@@ -431,3 +431,78 @@ def test_s_curve_road_gets_membrane_datum():
     rel_no = abs(res_no_tps["fill_volume_m3"] - truth) / truth
     assert rel_no > 0.20, \
         f"quad-only fill {res_no_tps['fill_volume_m3']:.2f} unexpectedly close"
+
+
+# ---------- G9 datum stability (DATUM_STABILITY_PLAN.md §8) ----------
+
+def _circle_polygon(cx, cy, r, n=72):
+    theta = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    return np.stack([cx + r * np.cos(theta), cy + r * np.sin(theta)], axis=1)
+
+
+def test_g9_unstable_datum_downgrades_ok_to_indicative():
+    # R1: the S0b defect, reproduced without SfM. tools.synth's benchmark
+    # terrain (seed 7) is not planar at the rim's scale, so a perfect-point
+    # rim still yields a badly biased datum — G6 alone (full coverage, no
+    # void) would call this ok; G9 must catch what G6 cannot see.
+    from landslide.gates import evaluate_gates
+    from tools.synth import BOWL, POLY_R, build_terrain
+
+    from test_gates import _FakeCtx
+
+    X, Y, z, _, truth = build_terrain(seed=7)
+    cx, cy = BOWL["x"], BOWL["y"]
+    r = np.hypot(X - cx, Y - cy)
+    interior_m = r < POLY_R
+    rim_m = (r >= 6.1) & (r <= 8.1)
+    interior = np.stack([X[interior_m], Y[interior_m], z[interior_m]], 1)
+    rim = np.stack([X[rim_m], Y[rim_m], z[rim_m]], 1)
+    up = np.array([0.0, 0.0, 1.0])
+    polygon_ground = _circle_polygon(cx, cy, POLY_R)
+
+    res = prism_volume(interior, rim, log=lambda *_: None, up=up,
+                       polygon_ground=polygon_ground)
+    # G6 alone sees a clean, fully-covered region (the fixture reproduces the
+    # mechanism: no coverage gate would block this)
+    assert res["coverage_frac"] >= 0.85
+    assert (res["largest_void_m2"] or 0.0) <= 2.0
+    err = abs(res["cut_volume_m3"] - truth["vol_true_poly"]) / truth["vol_true_poly"]
+    assert err > 0.10, f"fixture should reproduce the datum bias, got {err:.1%}"
+
+    res["cloud"] = "dense"
+    status, reasons = evaluate_gates(_FakeCtx(), res, "ground_frame")
+    assert status == "indicative", reasons
+    assert any("datum uncertain" in msg for msg in reasons), reasons
+
+
+def test_g9_stable_planar_and_curved_fixtures_stay_ok():
+    # R2/R3: honest planar and correctly-modelled curved ground must not be
+    # penalized by the new gate.
+    from landslide.gates import evaluate_gates
+
+    from test_gates import _FakeCtx
+
+    up = np.array([0.0, 0.0, 1.0])
+    for interior, rim, _analytic in (make_bowl_points(), make_curved_bowl_points()):
+        polygon_ground = _circle_polygon(0.0, 0.0, 5.6)
+        res = prism_volume(interior, rim, log=lambda *_: None, up=up,
+                           polygon_ground=polygon_ground)
+        res["cloud"] = "dense"
+        status, reasons = evaluate_gates(_FakeCtx(), res, "ground_frame")
+        assert status == "ok", (res["datum"], reasons)
+
+
+def test_g9_no_rim_fallback_never_ok():
+    # R4: the surface-plane fallback (rim too thin to use) must never reach
+    # ok, however clean the rest of the pipeline looks.
+    from landslide.gates import evaluate_gates
+
+    from test_gates import _FakeCtx
+
+    interior, _rim, _analytic = make_bowl_points(rim_width=0.0)
+    res = prism_volume(interior, None, log=lambda *_: None)
+    assert res["datum"] == "surface_plane"
+    res["cloud"] = "dense"
+    status, reasons = evaluate_gates(_FakeCtx(), res, "ground_frame")
+    assert status != "ok"
+    assert any("no usable rim" in msg for msg in reasons), reasons

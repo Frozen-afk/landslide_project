@@ -14,6 +14,10 @@ from .sfm import FOCAL_SPREAD_RATIO_BAD, ReconCtx, _camera_center_collinearity, 
 
 _RANK = {"ok": 0, "indicative": 1, "rejected": 2}
 
+# G9 (DATUM_STABILITY_PLAN.md §6.2)
+DATUM_HOLDOUT_REL = 0.05   # the ±5% volume accuracy an "ok" result is held to
+DATUM_MIN_WINDOWS = 6      # of 8 overlapping 90° rim arcs that must be usable
+
 
 def evaluate_gates(ctx: ReconCtx, res: dict, region_method: str) -> tuple[str, list[str]]:
     """Returns (status, reasons) — status is the worst of every gate fired."""
@@ -101,5 +105,24 @@ def evaluate_gates(ctx: ReconCtx, res: dict, region_method: str) -> tuple[str, l
         # AUDIT.md §5, B3) so DEM mode can no longer report "ok" un-gated.
         flag("indicative", "DEM mode has no coverage gate (G6) — treat the "
              "bridged/unmeasured area as unverified")
+
+    # G9 — datum stability (DATUM_STABILITY_PLAN.md): the rim datum is
+    # extrapolated across the whole interior; G6 proves the interior was seen,
+    # not that the datum under it is right.
+    datum = res.get("datum")
+    if datum == "surface_plane":
+        flag("indicative", "no usable rim around the region — the datum was fitted "
+             "to the region itself and the volume is biased toward zero")
+    elif datum in ("rim_plane", "rim_quad", "rim_tps"):
+        dh, nwin = res.get("datum_holdout_m"), res.get("datum_holdout_windows", 0)
+        area = res.get("polygon_area_m2") or res.get("area_m2") or 0.0
+        net = abs(res.get("net_volume_m3") or 0.0)
+        if dh is None or nwin < DATUM_MIN_WINDOWS:
+            flag("indicative", f"undisturbed ground seen on only {nwin} of 8 sides "
+                 "of the region — the datum cannot be cross-checked")
+        elif dh * area > DATUM_HOLDOUT_REL * net:
+            flag("indicative", f"datum uncertain: the ground around the region "
+                 f"departs ±{dh:.2f} m from the fitted surface, about "
+                 f"{dh * area:.1f} m³ ({dh * area / max(net, 1e-9):.0%}) of the volume")
 
     return status, reasons

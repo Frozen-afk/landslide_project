@@ -25,6 +25,7 @@ def test_dem_mode_status_never_ok():
 
 def test_non_dem_mode_unaffected_by_dem_guard():
     res = {"cloud": "dense", "datum": "rim_plane", "coverage_frac": 0.9,
-           "largest_void_m2": 0.1}
+           "largest_void_m2": 0.1, "datum_holdout_m": 0.001,
+           "datum_holdout_windows": 8, "area_m2": 100.0, "net_volume_m3": 60.0}
     status, reasons = evaluate_gates(_FakeCtx(), res, "ground_frame")
     assert status == "ok", reasons

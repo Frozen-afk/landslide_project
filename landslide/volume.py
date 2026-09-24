@@ -320,6 +320,31 @@ def _cv_rmse(kind: str, uv: np.ndarray, h: np.ndarray, folds: int = 3,
     return float(np.sqrt(np.mean(errs))) if errs else float("inf")
 
 
+def _datum_holdout(kind: str, uv: np.ndarray, h: np.ndarray, center: np.ndarray,
+                   width_deg: float = 90.0, n_win: int = 8, min_pts: int = 20):
+    """Leave-one-arc-out check of the rim datum (DATUM_STABILITY_PLAN.md).
+    Fits `kind` with a `width_deg` arc of the rim ring (around `center`)
+    held out and returns (rms of the held-out median residuals, windows used).
+    The held-out arc spans about the interior's width, so this measures how
+    well the rim predicts ground it did not see at interior-like distances.
+    Holdout, not in-sample, residual: the in-sample fit absorbs the undulation
+    it is meant to detect."""
+    ang = np.degrees(np.arctan2(uv[:, 1] - center[1], uv[:, 0] - center[0])) % 360
+    meds = []
+    for k in range(n_win):
+        te = ((ang - k * 360.0 / n_win) % 360) < width_deg
+        if te.sum() < min_pts or (~te).sum() < 60:
+            continue
+        tr_uv, tr_h = uv[~te], h[~te]
+        if kind == "tps" and len(tr_uv) > 2500:       # same cap as _cv_rmse's caller
+            j = np.random.default_rng(0).choice(len(tr_uv), 2500, replace=False)
+            tr_uv, tr_h = tr_uv[j], tr_h[j]
+        f = _fit_surface(kind, tr_uv, tr_h)
+        if f is not None:
+            meds.append(float(np.median(h[te] - f(uv[te]))))
+    return (float(np.sqrt(np.mean(np.square(meds)))) if meds else None), len(meds)
+
+
 def dem_volume(interior_xyz: np.ndarray, dem_fn, log: Log = print,
                max_edge_factor: float = 20.0,
                max_edge_abs_m: float = 0.5) -> dict:
@@ -1008,6 +1033,15 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
                             f"{dev:.2f} m exceeds the rim's own variation — "
                             "region too large for rim-only curvature")
 
+    # G9 input: datum holdout (DATUM_STABILITY_PLAN.md §6.1). Detection only
+    # — does not touch `datum`, `sigma`, `quad`, `tps` or any volume number.
+    if datum_pts is rim:
+        kind = {"rim_plane": "plane", "rim_quad": "quad", "rim_tps": "tps"}[datum]
+        center = ((interior - c) @ basis.T).mean(axis=0)
+        datum_holdout_m, datum_holdout_windows = _datum_holdout(kind, uv_r, h_r, center)
+    else:
+        datum_holdout_m, datum_holdout_windows = None, 0
+
     cap = max_above_datum if max_above_datum is not None else max(1.5, 8.0 * sigma)
     h = (interior - c) @ n                    # signed heights above datum
     uv2 = (interior - c) @ basis.T            # in-plane 2D coords
@@ -1214,6 +1248,8 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
         "unmeasured_area_m2": unmeasured_area,
         "datum": datum,
         "datum_rms_m": sigma,
+        "datum_holdout_m": datum_holdout_m,
+        "datum_holdout_windows": datum_holdout_windows,
         "est_volume_error_m3": sigma * area,
         "n_points": int(len(interior)),
         "n_rim_points": int(len(rim)) if rim is not None else 0,

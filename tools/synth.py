@@ -78,7 +78,16 @@ PRESETS = {
     # into one model.
     "twosided": dict(path="arc2", n_views=30, yaw_span=96.0, radius=26.0,
                       height=7.0, height_ramp=0.0, f_px=1600.0, tex_scale=1.0,
-                      k1=0.0, arc_offset=180.0),
+                      k1=0.0, arc_offset=90.0),
+    # S0b (GUIDED_CAPTURE_PLAN.md SS12a): twosided + the two protocol fixes.
+    # height 9 m -> 20.5 deg above the ROI centroid (S0's 7 m gave 16.5 deg, below
+    # the protocol's 20 deg). Each arm 2 views wider at each end (6.86 deg step kept):
+    # arc2 widens arms symmetrically, so 2 of the 4 extra views per arm land in the
+    # inter-arm overlap and are protocol-neutral; the field protocol adds only the
+    # 2 outer-end views per arm (34 photos total).
+    "twosided_b": dict(path="arc2", n_views=38, yaw_span=123.43, radius=26.0,
+                        height=9.0, height_ramp=0.0, f_px=1600.0, tex_scale=1.0,
+                        k1=0.0, arc_offset=90.0),
 }
 
 EXTS_OK = (".jpg", ".jpeg", ".png")

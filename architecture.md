@@ -345,6 +345,15 @@ Applied to rim points (falls back to the interior itself with a warning when <15
    `max(0.02 m, 15 %)` **and** its maximum deviation from the incumbent over the interior
    is `≤ max(0.10 m, 1.5σ)`.
 
+5. **Datum holdout** (`_datum_holdout`, DATUM_STABILITY_PLAN.md §6.1, G9 input only —
+   no volume, `datum` or `sigma` is affected): leave-one-arc-out check of the adopted
+   model. 8 overlapping 90° azimuthal windows around the interior centroid; each fits the
+   adopted `kind` with that arc's rim held out and takes the median residual on the held-out
+   arc. `datum_holdout_m` = RMS of those medians (or `None` if <6 windows have both ≥20
+   held-out and ≥60 training points); `datum_holdout_windows` = windows used. Detects
+   extrapolation bias a plane/paraboloid/TPS can fit tightly on the ring while still missing
+   the interior it never saw (`surface_plane` sets both to `None`/`0`).
+
 Datum labels: `rim_plane`, `rim_quad`, `rim_tps`, `surface_plane`, `dem`, `prior_epoch`.
 
 ### 3.7 Volume integration — `volume.prism_volume` (`:517`)
@@ -449,6 +458,17 @@ REMAINING_ACCURACY_PROGRESS.md for why), not the mitigations themselves:
 * **G7 scale honesty floor** (`pipeline.measure`): `scale_rel_error = max(reported, 0.03)`
   unless the ArUco per-view PnP cross-check spread is ≤2% (an actual second, independent scale
   estimate agreeing closely) — a single marker/click measurement rarely earns <3% honestly.
+* **G9 datum stability** (DATUM_STABILITY_PLAN.md): G6 proves the interior was *seen*, not
+  that the rim datum extrapolated across it is *right* — a plane/paraboloid/TPS can fit the
+  ring tightly while still missing undulating ground the ring never sampled (S0b's
+  `twosided_b`: 98.6% coverage, sub-1-m² void, `status=ok`, +16.8% volume error). `indicative`
+  when `datum == "surface_plane"` (no usable rim — a separate, previously ungated false-`ok`
+  path); `indicative` when `datum_holdout_windows < 6` (rim not seen all around, the datum
+  cannot be cross-checked); `indicative` when `datum_holdout_m × polygon_area_m2 >
+  0.05 × |net_volume_m3|` (implied datum uncertainty exceeds 5% of the volume — the same ±5%
+  accuracy target an `ok` result is meant to meet). Silent on planar/correctly-curved ground
+  and on the two real presets' non-G9 gates; does not change `datum` selection, `cut`/`net`/
+  `fill`, `net_volume_ci95_m3`, or G6's own thresholds.
 * **G8 UI** (`server/static/js/steps/result.js`): `status`, `reasons`, `region_method`,
   `hit_frac`, `coverage_frac`/`largest_void_m2`, `cut_upper_m3` are shown in the result table;
   gate reasons are folded into the existing warnings panel when `status != "ok"`.
@@ -555,7 +575,9 @@ net_volume_m3 cut_volume_m3 fill_volume_m3 area_m2
 volume_raster_m3? (T2.1 cross-check, prism_volume only) unmeasured_area_m2 (prism_volume only)
 net_volume_ci95_m3? [lo, hi] (T2.2, prism_volume only, rim datum + ≥15 rim points)
 datum ∈ {rim_plane, rim_quad, rim_tps, surface_plane, dem, prior_epoch}
-datum_rms_m est_volume_error_m3 n_points n_rim_points n_rim_outliers n_high_dropped n_low_dropped
+datum_rms_m datum_holdout_m? datum_holdout_windows (G9 input, prism_volume only;
+  None/0 for surface_plane and dem) est_volume_error_m3 n_points n_rim_points n_rim_outliers
+  n_high_dropped n_low_dropped
 mean_height_m max_depth_m max_height_m
 max_slope_deg mean_slope_deg area_steep_m2
 lod_m lod_max_m sig_area_frac warnings[]

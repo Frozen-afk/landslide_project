@@ -1,6 +1,6 @@
 # Release Blocker Progress
 
-Tracks fixes for the blockers in `FINAL_RELEASE_AUDIT.md` §5. B1 and B2 are now covered.
+Tracks fixes for the blockers in `FINAL_RELEASE_AUDIT.md` §5. B1–B4 are now covered.
 
 ## B1 — Fresh dense build `NameError`
 
@@ -293,3 +293,117 @@ reflects real surface noise, the bridging cull uses the same RC1 absolute
 cap as `prism_volume`, and DEM-mode results can no longer reach
 `status="ok"` un-gated. B4–B5 and F1–F3 remain open per
 `FINAL_RELEASE_AUDIT.md`, out of scope for this pass.
+
+## B4 — `RLIMIT_AS` smaller than import-time VM on small or many-core hosts
+
+**Status: FIXED.**
+
+### Root cause
+
+`numpy`/`scipy`/`cv2`/`pycolmap` size their BLAS/OpenMP thread pools off
+`nproc` at import time (not at first use), and each thread's scratch buffers
+cost real virtual address space even though RSS stays flat — the audit
+measured 1.2 GB VM at 1 thread, 1.9 GB at 4, 3.9 GB at 12, with RSS ~150 MB
+in all three (§4.5). `server/worker.py`'s functions import these lazily,
+inside the worker process, so on a many-core host (or a host whose per-worker
+RAM share is small) the import alone can exceed `_worker_mem_limit_bytes()`
+before any real work starts — the RLIMIT_AS then kills the import itself,
+either as a native crash (thread creation failing under the address-space
+cap) or a caught `MemoryError`, depending on exactly where the allocation
+lands.
+
+Reproduced directly: a `ProcessPoolExecutor` worker with `RLIMIT_AS` set to
+1.6 GB (the audit's own "<4 GB host, 1 worker" figure) and no thread cap,
+importing `numpy`/`cv2`/`scipy`/`pycolmap` on this 12-core box —
+`BrokenProcessPool` every time, before the imports even return.
+
+### Fix
+
+`server/executor.py`, new `_cap_blas_threads()`, called first thing in
+`_worker_init()` (i.e. in the pool initializer, in the worker process, before
+`server/worker.py`'s per-task functions get a chance to import anything):
+sets `OPENBLAS_NUM_THREADS`, `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, and
+`NUMEXPR_NUM_THREADS` to `"1"`. This has to run before the first heavy import
+in that worker process — setting these afterward is too late, since the
+thread pool is sized once at import and cached for the life of the process.
+It works because `server/worker.py` never imports numpy/cv2/pycolmap at
+module level (only lazily, inside each top-level function), and the server's
+`ProcessPoolExecutor` uses Python 3.14's default `forkserver` start method,
+so each worker process gets a fresh, not-yet-imported copy of those modules
+— the initializer's env change lands before anything reads it.
+
+No change to `_worker_mem_limit_bytes()`'s sizing formula or its 1.5 GB
+floor: with threads capped to 1, measured import-time VM (~1.2 GB) already
+sits comfortably under that floor on every host tier the formula produces,
+so the existing floor was already "sized from measured baseline VM" once the
+many-core inflation is removed — no new number was needed. No change to
+`max_workers()` or the pool's worker count.
+
+### Regression coverage
+
+`tests/test_executor.py` (new file):
+- `test_worker_init_caps_blas_threads_before_heavy_import`: drives the real
+  `executor._worker_init` as a real `ProcessPoolExecutor` initializer (with
+  `SLOPELENS_WORKER_MEM_MB` forcing the audit's small-host figure) and
+  asserts the four env vars read back as `"1"` inside the worker, after the
+  heavy imports.
+- `test_heavy_import_fits_small_host_rlimit_with_thread_cap`: same setup,
+  asserts the import task completes without `BrokenProcessPool`. This is the
+  direct §4.5 repro.
+
+Both verified failing against the pre-fix `_worker_init` (which only sets
+`RLIMIT_AS`, no thread cap) — `BrokenProcessPool` on this 12-core dev box,
+matching the audit's "many-core host" failure mode — and passing against the
+fix.
+
+### Validation
+
+**Fast suite:** `pytest -q -k "not e2e"` — 184 passed, 1 skipped, 23
+deselected (was 182/1/23 after B3; +2 is the new regression coverage above).
+No regressions. (The `_drain_log_queue` `EOFError`-at-exit is the
+pre-existing, documented cosmetic issue from audit §4.6, not new.)
+
+**Focused validation against B4's acceptance criterion** ("size the limit
+from measured baseline VM… cap BLAS threads… test on a < 4 GB host" —
+§5): a standalone script mirroring `server/executor.py`'s real pool
+initializer, run on this box's real hardware (12 cores, 23 GB — the same
+box the audit's §4.5 numbers came from):
+- `RLIMIT_AS` = 1.6 GB (the audit's own "<4 GB host, 1 worker" figure), **no**
+  thread cap → `BrokenProcessPool` (repro of the named defect).
+- Same 1.6 GB limit, **with** the fix's thread cap → import succeeds;
+  `/proc/self/status` inside the worker reports `VmSize` 1,265,652 kB
+  (~1.24 GB) and `VmRSS` 105,580 kB (~103 MB) — under the limit with ~350 MB
+  of headroom, and matching the audit's own "1 thread → ~1.2 GB VM, ~150 MB
+  RSS" baseline (§4.5).
+
+### Deviations from the audit's suggested fix scope
+
+- The audit's minimum fix scope names two actions ("size the limit from
+  measured baseline VM… Cap BLAS threads in workers") and a validation step
+  ("test on a < 4 GB host"). Only the thread cap changes code — see Fix
+  above for why the existing 1.5 GB floor already satisfies "sized from
+  measured baseline VM" once the cap removes the many-core inflation, so no
+  second, independent change was made there. The "< 4 GB host" test was done
+  by forcing `_worker_mem_limit_bytes()`'s own real formula to the audit's
+  own measured figure for that tier (`SLOPELENS_WORKER_MEM_MB=1600`) rather
+  than provisioning an actual small-RAM machine, which this environment
+  doesn't have — the override exists in production code for exactly this
+  (an operator sizing their own hardware), so this exercises the real code
+  path, not a stand-in.
+- Did not address the audit's separately-noted §4.5 Probe C result that a
+  *real* `dense_cloud(force=True)` run (not just imports) still hit `OpenCV
+  Insufficient memory` at 1.6 GB even with 1 BLAS thread. That is a genuine
+  hardware-capacity limit on the smallest RAM tier — the RLIMIT_AS design's
+  own stated purpose (`executor.py`'s docstring) is to convert an
+  uncatchable kernel OOM-kill into a catchable `MemoryError`, not to
+  guarantee every workload fits on every machine, and a clean `MemoryError`
+  is exactly that intended behavior, not the "smaller than import-time VM"
+  defect B4 names. Out of this pass's scope.
+
+### Acceptance
+
+B4 is fixed and regression-tested: worker processes no longer exceed their
+own memory limit during import alone on a many-core or small-RAM host — the
+audit's own reproduction figures for a "<4 GB, 1 worker" host now complete
+the identical import successfully with ~350 MB of headroom to spare. B5 and
+F1–F3 remain open per `FINAL_RELEASE_AUDIT.md`, out of scope for this pass.

@@ -73,7 +73,25 @@ def _worker_mem_limit_bytes() -> int:
     return max(int(1.5 * 1024 ** 3), int(0.8 * total) // max(max_workers(), 1))
 
 
+def _cap_blas_threads() -> None:
+    """Force single-threaded BLAS/OMP before any worker function imports
+    numpy/cv2/scipy/pycolmap (B4): those libraries size per-thread scratch
+    buffers off `nproc` at first import, not at first use, so on a
+    many-core host the import alone reserves multiple GB of address space
+    (measured: ~1.2 GB at 1 thread, ~1.9 GB at 4, ~3.9 GB at 12 — RSS stays
+    ~150 MB regardless) — comfortably more than `_worker_mem_limit_bytes()`
+    gives a small/many-core host, so the worker never gets past its own
+    imports. Must run here, in the pool initializer, before `server/worker.py`'s
+    per-task lazy imports do their thing — setting these after import is too
+    late, the thread pool is already sized.
+    """
+    for var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS"):
+        os.environ[var] = "1"
+
+
 def _worker_init() -> None:
+    _cap_blas_threads()
     limit = _worker_mem_limit_bytes()
     if not limit:
         return

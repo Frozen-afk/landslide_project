@@ -6,6 +6,7 @@ import { initUpload, resumeLastJob } from "./steps/upload.js";
 import { initScale } from "./steps/scale.js";
 import { initMark } from "./steps/mark.js";
 import { initResult } from "./steps/result.js";
+import { initCapture } from "./steps/capture.js";
 
 window.addEventListener("DOMContentLoaded", async () => {
   const markCanvas = setupCanvas($("mark-canvas"));
@@ -16,6 +17,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   initMark(markCanvas);
   initResult();
   initUpload();
+  initCapture();
 
   await resumeLastJob();
 });

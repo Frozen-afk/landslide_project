@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Landslide Volume from Phone Photos</title>
-<link rel="stylesheet" href="/static/style.css?v=4">
+<link rel="stylesheet" href="/static/style.css?v=5">
 </head>
 <body>
 <header>
@@ -29,6 +29,49 @@
     <pre id="progress-log"></pre>
   </div>
   <div id="job-list" class="note"></div>
+</section>
+
+<!-- 1b. guided capture (GUIDED_CAPTURE_PLAN.md S3) -->
+<section id="step-capture" class="card">
+  <h2>Guided capture (optional)</h2>
+  <p class="note">Take photos here instead of importing a batch above. Walk arm A around
+  the slide, cross to arm B (≥ 60° further around), and this checks photo count, overlap,
+  marker views, the arm-A→B link, and — where your phone's sensors allow it — camera height
+  and viewpoint spread as you go.
+  <a href="/static/capture.html">Live capture helper →</a></p>
+
+  <div id="capture-setup">
+    <label>marker side <input id="capture-marker-side" type="number" value="0.5" step="0.01" min="0.01"> m</label>
+    <label>dictionary
+      <select id="capture-marker-dict">
+        <option value="auto" selected>auto (try all)</option>
+        <option>DICT_6X6_250</option><option>DICT_5X5_100</option>
+        <option>DICT_4X4_50</option><option>DICT_7X7_250</option>
+      </select>
+    </label>
+    <button id="capture-start" class="primary">Start guided capture</button>
+    <div class="row">
+      <button id="capture-enable-sensors">Enable compass/tilt hints</button>
+      <span id="capture-sensor-note" class="note">optional — needs HTTPS; capture works fine without it</span>
+    </div>
+  </div>
+
+  <div id="capture-session" class="hidden">
+    <div class="row" id="capture-arm-select">
+      <span class="note">shooting:</span>
+      <button data-arm="A" class="primary">arm A</button>
+      <button data-arm="T">transition</button>
+      <button data-arm="B">arm B</button>
+    </div>
+    <div id="capture-arm-counts" class="note">A: 0   transition: 0   B: 0   total: 0</div>
+    <div class="row">
+      <label>Take photo <input type="file" id="capture-take" accept="image/jpeg" capture="environment"></label>
+      <button id="capture-retake">Exclude last photo</button>
+      <button id="capture-finish" class="primary" disabled>Finish and reconstruct</button>
+    </div>
+    <div id="capture-last-photo" class="capture-checks"></div>
+    <div id="capture-sequence" class="capture-checks"></div>
+  </div>
 </section>
 
 <!-- 2. scale -->

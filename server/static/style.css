@@ -78,6 +78,8 @@ figcaption { color: #9fb0c3; font-size: 0.82rem; margin-top: 4px; }
 .capture-checks { margin-top: 10px; font-size: 0.82rem; color: #9fb0c3; }
 .capture-checks div { margin: 2px 0; }
 .capture-checks span[class] { margin-right: 4px; cursor: help; }
+.capture-checks ul { margin: 6px 0 0; padding-left: 18px; }
+.capture-checks li { margin: 2px 0; }
 
 .warnbox {
   background: #33270e; border: 1px solid #8a6d1f; border-radius: 8px;

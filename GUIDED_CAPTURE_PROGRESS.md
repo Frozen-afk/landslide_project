@@ -1044,3 +1044,255 @@ laptop, and is not a substitute for S3/S7's own measurement.
   unaffected (no change to that branch of `load_persisted_jobs`).
 - **S3–S7 remain not started**, per the instruction for this pass.
 
+## S3 — Guided UI: sequence and viewpoint guidance (approved slice)
+
+**Base:** `main` @ `232c6f7`. This pass added `server/static/js/steps/capture.js`,
+`server/static/js/capture_guidance.js`, `tests/test_capture_guidance.mjs`, and
+changed `server/static/index.html`, `server/static/js/main.js`,
+`server/static/js/state.js`, `server/static/js/steps/upload.js`,
+`server/static/style.css`. No `landslide/`, `server/*.py`, gate, or threshold
+file was touched. This pass implements an **approved narrower slice of the
+plan's full S3 row** ("`step-capture` section, `capture_store.js` IndexedDB
+queue, arms and counters ... rim-check step, marker checklist and chips,
+optional sensors"): connecting the existing S2 sequence checks to the capture
+UI and turning them into actionable guidance for photo count, overlap gaps,
+marker views, arm transition, camera height, and viewpoint diversity, with
+unavailable browser sensors treated as optional rather than as failures. The
+marker-placement checklist (§6), the rim-clearing step (§3 step 2), the
+top-down sketch (§5.4, needs S4), and an IndexedDB offline-blob queue (§10)
+are explicitly out of this slice — see "Deviations" below. **S4–S7 not
+started.**
+
+### Change made
+
+- **`server/static/js/capture_guidance.js`** (new, pure, no DOM — same
+  pattern as `capture_metrics.js` / `coords.js`): circular-statistics
+  helpers (`circularMeanDeg`, `circularDiffDeg`, `circularSpreadDeg`) and six
+  guidance builders that turn the server's T2 `sequence` dict
+  (`landslide/capture.py::sequence_checks`, unchanged) plus optional
+  client-side sensor arrays into `{level, id, text}` guidance items:
+  `photoCountGuidance` (§4.2 photo-count row, per-arm-of-12 and total-of-15),
+  `markerViewGuidance` (§4.2 marker-views row, total-of-5 and 2-per-arm),
+  `overlapGapGuidance` (§4.2 overlap-chain row, resolves a gap's uuid to a
+  photo number via a caller-supplied map), `viewpointDiversityGuidance`
+  (§4.2 heading-spread-per-arm and arm-separation rows, needs >= 2 heading
+  readings per arm or is silently skipped), `cameraHeightGuidance` (§4.2
+  elevation/pitch row, warns when > 30% of an arm's pitch readings are below
+  10°, same >= 2-reading floor), and `armTransitionGuidance` (§3 step 4 / the
+  `arm_bridge` T1 reason: a hint while on the transition arm, a warning if
+  the most recent bridge-eligible photo's check flagged a weak link).
+  `circularDiffDeg`/`circularSpreadDeg` are robust to an uncalibrated or
+  reversed compass convention because every guidance decision uses only
+  *differences* between readings, never an absolute bearing — the reasoning
+  the module's own header comment records, since no model-azimuth alignment
+  (§5.4, S4/S5 scope) exists yet to calibrate raw device headings against.
+- **`server/static/js/steps/capture.js`** (new, DOM orchestration, no
+  business logic beyond wiring): a minimal capture-session flow —
+  `POST /api/jobs/capture` (marker side + dict from two inputs) →
+  `<input type=file accept="image/jpeg" capture="environment">` per photo
+  (§8: the plain-HTTP-safe capture path) → client-side T0 blur pre-check
+  (reuses `capture_metrics.js`, best-effort — the server's T1 check is
+  authoritative, same division of labor as the existing upload step) →
+  `PUT .../capture/photos/{uuid}` (a client-generated UUID; `crypto.randomUUID`
+  when available, else a `crypto.getRandomValues`/`Math.random` fallback,
+  since `randomUUID` itself needs a secure context the field server may not
+  have, §8) → renders the returned per-photo `reasons` text directly (the
+  server already supplies `{id, text}` pairs, `landslide/capture.py::T1_MESSAGES`
+  — no separate client copy of that vocabulary) and the six
+  `capture_guidance.js` builders against the returned `sequence` plus the
+  session's accumulated `client.heading`/`client.pitch` values, grouped by
+  arm. An "Exclude last photo" button calls the existing soft-delete
+  endpoint and then re-fetches `GET .../capture` as the refreshed source of
+  truth (§10's own stated principle) rather than reimplementing
+  `sequence_checks` client-side. "Finish and reconstruct" calls
+  `POST .../capture/finalize` (`override` always `false` — S4's preview
+  report, the only thing that could set `blocking_at_finalize`, doesn't
+  exist yet, so there is nothing to override in this slice) and hands the
+  now-`reconstructing` job to the existing upload-flow poller by calling
+  `upload.js`'s own `resumeJob` (exported for this purpose) instead of
+  duplicating its polling/rendering logic.
+  - **Optional sensors** (§8, §4.2's "advisory only"): an "Enable
+    compass/tilt hints" button calls `DeviceOrientationEvent.requestPermission()`
+    where it exists (iOS, needs the user gesture §8 names) and otherwise
+    attaches a `deviceorientation` listener directly, but only when
+    `window.isSecureContext` — the plain-HTTP field server (`run_server.sh`)
+    never satisfies this, so on that deployment the button always reports
+    "unavailable" and every sensor-derived guidance line is simply absent
+    from the panel, never shown as a failed check. Heading uses
+    `event.webkitCompassHeading` when present, else raw `event.alpha` (no
+    reinterpretation — see the robustness note above). Pitch uses `event.beta`
+    through the plan's own named proxy formula, `90 - beta`, clamped to
+    [-90, 90] — an approximation, not a port of anything server-side (there
+    is nothing server-side to port; §4.2 calls this row "T0 (sensor only)"
+    and names the real elevation check as T3, not yet built).
+- **`server/static/index.html`**: a new `<section id="step-capture">` card
+  between the existing upload card and the scale step, with the marker-side/
+  dict inputs, a "Start guided capture" button, the sensor-enable button, an
+  arm selector (A / transition / B), a "Take photo" file input, "Exclude
+  last photo", "Finish and reconstruct", and two output panels
+  (`#capture-last-photo`, `#capture-sequence`) reusing the existing
+  `.capture-checks`/`.ok`/`.warn`/`.err`/`.note` classes from S1's upload
+  panel. Placed as an always-visible card alongside the existing upload
+  card, **not** behind the plan's own two-button entry-point toggle
+  (§9.4) — see "Deviations". `style.css?v=4` → `v=5` (cache-bust, same
+  convention S1 used).
+- **`server/static/js/state.js`**: `state.capture = {jobId, arm, seq,
+  photos}` (§9.4's own shape, minus the IndexedDB pieces this slice doesn't
+  build) and `LS_CAPTURE_KEY = "lsv-capture"` (§9.4), both additive.
+- **`server/static/js/steps/upload.js`**: `resumeJob` is now exported (was
+  previously module-private) so `capture.js` can hand off a finalized
+  session without a second copy of the ready/reconstructing poll loop. No
+  other line changed.
+- **`server/static/style.css`**: two small rules for the guidance `<ul>`
+  inside `.capture-checks`; every color/verdict class (`.ok`/`.warn`/`.err`)
+  and layout class (`.row`, `.note`, `.card`) already existed and needed no
+  change.
+
+### Focused validation (three runs)
+
+```
+node --test tests/test_capture_guidance.mjs tests/test_capture_metrics.mjs tests/test_coords.mjs
+.venv/bin/python -m pytest -q -k "not e2e"
+node --check server/static/js/steps/capture.js server/static/js/capture_guidance.js \
+             server/static/js/state.js server/static/js/main.js server/static/js/steps/upload.js
+```
+
+Results: **22 passed** (8 new in `test_capture_guidance.mjs`, covering the
+circular-stat wraparound, each guidance builder's warn/silent boundary, and
+the sensor-unavailable/`< 2`-reading silence case) — 0 failed. `pytest -q -k
+"not e2e"`: **209 passed, 3 skipped, 23 deselected**, identical to S2's own
+baseline (no `landslide/`/`server/*.py` file was touched, so this is exactly
+the expected outcome, not a re-run of unrelated work). `node --check` clean
+on all five changed/new JS files.
+
+**Server-contract check (real server, not just the unit tests):** started
+`uvicorn server.main:app`, then drove the exact HTTP contract `capture.js`
+uses with a small script — `POST /api/jobs/capture` → two
+`PUT .../capture/photos/{uuid}` calls (multipart `file` + form `meta`, real
+fixture JPEGs from `tests/fixtures/capture_t1/`) → `GET .../capture` →
+`DELETE .../capture/photos/{uuid}` → `POST .../capture/finalize` with only 2
+kept photos. Confirmed: the response and manifest shapes `capture.js` reads
+(`sequence.counts`/`marker_views`/`marker_views_total`/`overlap_gaps`,
+`reasons: [{id, text}]`, `server.arm_bridge`, `client` echoed back verbatim
+in the manifest) match what was assumed while writing it; finalize correctly
+400s below the 3-kept-photo floor. Also: `GET /`,
+`/static/js/steps/capture.js`, `/static/js/capture_guidance.js`,
+`/static/js/main.js`, `/static/style.css` all return 200 (new module wiring
+resolves, matching S1's own smoke-test pattern).
+
+### Deviations from the plan's full S3 row (this pass's approved scope)
+
+- **Not built: marker-placement checklist (§6), rim-clearing step (§3 step
+  2), top-down sketch (§5.4).** The rim-clearing step is UI text only and the
+  marker checklist is a static list — both are straightforward additions,
+  but neither was named in the approved instruction for this pass
+  ("photo count, overlap gaps, marker views, arm transition, camera height,
+  and viewpoint diversity"). The top-down sketch needs the preview SfM
+  camera positions (S4), which do not exist yet.
+- **Not built: IndexedDB offline-blob queue / retry backoff (§10,
+  `capture_store.js`).** This pass uses the server's `GET .../capture`
+  manifest as the resume source of truth (§10's own principle: "the server
+  manifest is the truth for accepted photos") instead of a client-side blob
+  queue for photos the server hasn't acked yet. This means a tab kill
+  *during* an in-flight `PUT` loses that one photo (the user sees the gap in
+  the count and retakes) rather than resuming the upload from a queued
+  blob — criterion 6(e)'s literal "kill the tab, reopen, see all 3" is met
+  for already-acked photos (confirmed by the server-contract check's `GET`
+  round-trip) but not for a photo lost mid-flight. A full offline queue is a
+  larger, separable addition and was not part of the approved slice.
+- **No specific "+2 outer-end photos" counter (§3 step 3/5, §12a.4).**
+  `photoCountGuidance` guides against the protocol's plain per-arm (12) and
+  total (15, target 25–35) numbers from §4.2's own table, not the
+  narrower field-protocol detail that two of those photos should be taken
+  past each arm's far end. General photo-count guidance was what was asked
+  for; the outer-end-specific counter is a refinement, not a different
+  check, and can be added without restructuring this pass's code.
+- **Two entry points, not a toggle (§9.4).** The plan's step 1 design is two
+  buttons that switch between an import view and a guided-capture view. This
+  pass instead places `#step-capture` as its own always-visible card next to
+  the existing upload card — both work independently and simultaneously
+  (they create different jobs), which is simpler to wire and does not
+  conflict with anything, but is visually a "two cards" layout rather than
+  the plan's "two entry buttons, one visible view" design. A cosmetic
+  difference, not a functional gap.
+- **"Exclude last photo" is not arm-scoped.** It excludes the most recently
+  kept photo across the whole session, not scoped to the arm currently
+  selected for the next shot. A user who switches arms without shooting and
+  then excludes will remove the last photo of whichever arm they shot last,
+  not necessarily the arm shown as selected. Narrow edge case, not fixed in
+  this pass.
+- **Retake reuses a new uuid, not the same one.** §10's idempotent-PUT retry
+  design (same uuid, new bytes) is for a *failed upload* retry. A user
+  wanting to redo a *kept, successfully-uploaded* photo instead excludes it
+  (soft delete) and shoots a fresh photo with a new uuid — functionally
+  equivalent (the excluded one is dropped from `sequence_checks`, per S2),
+  simpler to implement, and consistent with the endpoint's own semantics
+  (`DELETE` is documented as "a retake replaces" via a fresh entry, not via
+  reusing the old uuid).
+
+### Browser/field limitations (not testable outside a real device/browser)
+
+- **No headless browser in this environment**, same gap S1 and S2 both
+  recorded. `capture.js`'s DOM wiring (event listeners, `createImageBitmap`,
+  `FormData`/`fetch`, `deviceorientation`) is verified by `node --check`
+  (syntax only) and the real-server HTTP-contract script above (which
+  exercises the exact request/response shapes the DOM code depends on), not
+  by an actual in-browser run. Manual verification on a real phone is
+  recommended before field use, as it was for S1.
+- **Pitch is an unvalidated proxy.** `90 - beta` is the plan's own named
+  approximation (§4.2: "This is a proxy only. T3 measures the true
+  elevation.") and this pass does not correct it for portrait/landscape
+  orientation or a non-vertical holding angle — it was not checked against
+  a real device's actual `deviceorientation` output, only reasoned about
+  from the API's documented axis conventions.
+- **Heading calibration is unknown and, by design, unneeded.** Raw
+  `alpha`/`webkitCompassHeading` values are used without any offset
+  correction. This is safe for the *relative* guidance this pass computes
+  (spread within an arm, separation between arms — see the robustness note
+  under "Change made"), but the values are not meant to be, and are not,
+  compass-accurate bearings; anything that needs a true bearing (§5.4's
+  model-azimuth alignment) is S4/S5 scope.
+- **Criterion 5 (T0/T1 latency on a real mid-range phone/field laptop)** is
+  not measured here — no physical device was used in this pass, the same
+  gap S1/S2 recorded for their own pieces of the same criterion.
+  `capture.js`'s T0 work (one `createImageBitmap` decode + the pure
+  `capture_metrics.js` math) is a subset of what S1's upload-step preview
+  already does at the same resolution, so no new latency risk is expected,
+  but this is reasoning, not a measurement.
+- **Criterion 6(e)** (kill-the-tab-and-reopen device test) is only partially
+  addressed — see the IndexedDB deviation above. The `GET .../capture`
+  resume path itself (session id in `localStorage`, manifest re-fetched on
+  load) was exercised against the real server in the validation run, but not
+  from an actual killed mobile tab.
+- **`DeviceOrientationEvent.requestPermission` and `webkitCompassHeading`**
+  are iOS-specific APIs reasoned about from their documented behavior, not
+  exercised on an iOS device in this pass (none available in this
+  environment).
+
+### Acceptance status
+
+- **Photo count, overlap gaps, marker views, arm transition, camera height,
+  and viewpoint diversity guidance** — the instruction's explicit list — are
+  all wired from the existing S2 sequence checks (plus client sensor data
+  for the two sensor-derived items) to the capture UI, with unavailable
+  sensors omitting that guidance rather than showing a failure. Verified by
+  the new unit tests (`test_capture_guidance.mjs`, 8/8) and the real-server
+  contract check above; not verified in an actual browser (see
+  "Browser/field limitations").
+- **Plan criterion 5 (T0/T1/T3 latency)** — not measured (no device), same
+  gap as S1/S2's own T0/T1 pieces.
+- **Plan criterion 6(a–d)** — unaffected, still met (S2's own coverage;
+  this pass added no server-side code). **Criterion 6(e)** — partially met,
+  see the IndexedDB deviation above.
+- **Criterion 7 (no regression).** Met. `pytest -q -k "not e2e"`: 209 passed,
+  identical to S2's baseline; no `landslide/` or `server/*.py` file touched,
+  so every existing endpoint (including `POST /api/jobs`) is unchanged by
+  construction. `node --test` on the full existing JS suite
+  (`test_capture_metrics.mjs`, `test_coords.mjs`) plus the 8 new tests: 22/22
+  passed.
+- **Out of this pass's approved scope, not attempted:** marker checklist
+  (§6), rim-clearing step (§3 step 2), top-down sketch (§5.4), IndexedDB
+  offline queue (§10's blob-retry half), the two-button entry-point toggle
+  (§9.4). These are the remainder of the plan's full S3 row plus pieces of
+  S4/S5 the top-down sketch depends on.
+- **S4–S7 remain not started**, per the instruction for this pass.

@@ -99,6 +99,9 @@ function onReady(snap) {
   refreshJobList();
 }
 
+// Also used by capture.js (S3) to hand a freshly-finalized capture-session
+// job to the normal ready/reconstructing poll flow (GUIDED_CAPTURE_PLAN.md
+// §9.4), instead of duplicating this logic.
 export async function resumeJob(id) {
   switchJob(id);
   $("progress").classList.remove("hidden");

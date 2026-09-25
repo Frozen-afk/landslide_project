@@ -333,3 +333,149 @@ S0b. No rim-quality fix (robust segmentation, view-support filtering, a differen
 this: see `DATUM_STABILITY_PLAN.md` §2, §5 for the full evidence and the options considered. The
 correction is detection, not mitigation — see `DATUM_STABILITY_PROGRESS.md` for G9, the
 holdout-based datum-stability gate that now catches this class of error on both presets.
+
+## S0c — `twosided_cal`, a calibration scene whose datum the rim can predict (`GUIDED_CAPTURE_PLAN.md` §12b)
+
+**Base:** `main` @ `9bb999d`, plus the working tree's own uncommitted `GUIDED_CAPTURE_PLAN.md`
+revision (pre-existing at session start, not authored by this pass — see its own diff for
+§3/§3a/§3b/§7a/§12b). This pass changed `tools/synth.py`, `tools/benchmark.py` and
+`tests/test_volume.py` only, exactly as §12b.3 specifies. No application code (`landslide/`,
+`server/`) and no gate or threshold was touched. `GUIDED_CAPTURE_PLAN.md` was not edited by this
+pass (see "Deviations" below).
+
+### Change made
+
+Per §12b.3:
+
+- `tools/synth.py`: `build_terrain` gained an `octave_amps: tuple[float, float, float, float] =
+  DEFAULT_TERRAIN_AMPS` parameter (new module constants `DEFAULT_TERRAIN_AMPS = (0.35, 0.15,
+  0.08, 0.04)`, `TERRAIN_OCTAVE_CELLS = (6, 12, 24, 48)`). The loop still calls `value_noise` once
+  per octave regardless of its amplitude (so a zeroed octave still consumes the RNG stream
+  identically), matching §12b.3's requirement that the default reproduce every existing preset
+  byte-for-byte.
+- `PRESETS["twosided_cal"] = dict(PRESETS["twosided_b"], terrain_amps=(0.0, 0.0, 0.08, 0.04))` —
+  `twosided_b`'s cameras/bowl/marker/lens verbatim, only the two long-wavelength terrain octaves
+  (6, 12 cells) zeroed.
+- `main()` passes `p.get("terrain_amps", DEFAULT_TERRAIN_AMPS)` to `build_terrain` and records
+  `terrain_amps` in `ground_truth.json`, **only when the preset dict overrides it** (`"terrain_amps"
+  in p`) — so `arc`, `twosided_b`, and every other existing preset keep a byte-identical
+  `ground_truth.json` (§12b.2 requirement 4); only `twosided_cal`'s gains the new key.
+- `tools/benchmark.py`: `run_preset`'s `cloud_rms_m` computation now calls `build_terrain(seed,
+  tex_scale=..., octave_amps=PRESETS[preset].get("terrain_amps", DEFAULT_TERRAIN_AMPS))`, so the
+  RMS-scoring surface always matches the preset's own terrain, not just the benchmark default.
+- `tests/test_volume.py`: added `test_g9_calibration_terrain_stays_ok_seed7`, the positive-control
+  complement of the existing R1 fixture test — same recipe (perfect points, no SfM) on
+  `twosided_cal`'s terrain, seed 7, asserting `status == "ok"`, `reasons == []`,
+  `datum_holdout_windows == 8`, `|cut error| ≤ 1.5%`, G9 ratio ≤ 0.03 (§12b.5 item 1).
+
+### Benchmark command (clean cache — `data/bench/twosided_cal` did not exist before this pass)
+
+```
+.venv/bin/python -m tools.benchmark --presets twosided_cal --out data/bench --md-out /tmp/twosided_cal_bench.md
+```
+
+Result (38/38 registered, `/usr/bin/time -v`-measured, real 11m31s / peak RSS 1722 MB — inside
+the plan's "~13 min, < 2 GB" estimate):
+
+| preset | registered | scale err % | photo vol err % | ortho vol err % | cloud RMS (m) | runtime (s) | peak RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| twosided_cal | 38/38 | 0.02 | 1.48 | 1.71 | 0.20 | 689.57 | 1721.97 |
+
+As with S0/S0b, the full `measure()` result dict was read directly against the now-cached
+`data/bench/twosided_cal/work` (no new SfM), reusing the S0/S0b read pattern. Full per-mode gate
+results, and the item 3/4/5/10/11 geometry/marker/residual/DEM checks, needed three further
+read-only scratch scripts against the same cached model (no source file changed to produce any of
+these readings) — none are committed.
+
+### §12b.5 objective pass criteria, item by item
+
+**Item 1 — pre-check (fast test, new, in `pytest -q -k "not e2e"`).** Seed 7 on `twosided_cal`'s
+terrain (perfect points, no SfM): `status == "ok"`, `reasons == []`, `datum_holdout_windows == 8`,
+cut error 0.49% (≤ 1.5%), G9 ratio 0.0212 (≤ 0.03). **Pass.**
+
+The 40-seed sweep (re-run once, not a test): max\|cut error\| = 1.36%, max G9 ratio = 0.0254,
+**40/40 seeds `ok`**. Matches §12b.4's own recorded evidence (1.36% / 0.025 / 40-of-40) exactly.
+
+**Item 2 — no regression.** `arc` and `twosided_b` regenerated to a scratchpad dir (`tools.synth`,
+seed 7) are byte-identical — `ground_truth.json` and every `IMG_*.png` — to the committed
+`data/bench/arc` and `data/bench/twosided_b`. `pytest -q -k "not e2e"`: **186 passed, 3 skipped,
+23 deselected** (185 pre-existing + the 1 new test above; S0b's own baseline was 182 before the
+gate/thread-pool/deadlock commits between `d5653ba` and `9bb999d` added the rest). **Pass.**
+
+**Items 3–9 (both modes, clean-cache `twosided_cal`):**
+
+| # | Criterion | photo | ortho | Verdict |
+| --- | --- | --- | --- | --- |
+| 3 | Registration 38/38; G4 silent; median elevation ≥ 20° (GT poses); arm separation 80–100° (model) | 38/38, reasons=[], **22.9°**, **90.0°** | same ctx | **pass** (collinearity 0.602, far above the 0.10 G4 floor) |
+| 4 | `aruco_scale` clean; `views_used` ≥ 5, ≥ 2/arm; `side_spread_rel` ≤ 5% | warnings=[], views_used=29 (19 A / 10 B), side_spread_rel **1.98%**, pnp_spread 1.00% | same ctx | **pass** |
+| 5 | Dense residual vs true terrain: interior (r<5.6 m) RMS ≤ 0.05 m, \|mean\| ≤ 0.02 m; rim outside board footprint \|median\| ≤ 0.02 m | RMS **0.0256 m**, mean **0.0050 m**; rim median **0.0043 m** | same dense cloud | **pass** |
+| 6 | Coverage ≥ 0.85; largest + 2nd-largest void ≤ 2.0 m²; area/polygon_area ≥ 0.97 | 0.9874 / 1.06 / 0.0625 / 0.978 | 0.9873 / 1.125 / 0.0625 / 0.978 | **pass** |
+| 7 | `datum` in {rim_plane,rim_quad,rim_tps}; `datum_holdout_windows==8`; G9 ratio ≤ 0.04 | rim_plane, 8/8, **0.0212** | rim_plane, 8/8, **0.0261** | **pass** |
+| 8 | `status=="ok"`, `reasons==[]`; up-disagree < 20°; `hit_frac`≥0.85, `max_miss_run`≤3 | ok, [], up 5.98°, hit_frac 1.0, miss 0 | ok, [] | **pass** (`measurement_path` not checked — S6a not shipped) |
+| 9 | Scale error ≤ 3%; cut within ±5% of 67.16 m³; scale-removed cut within ±2% | scale err **0.0154%**, cut err **1.48%**, scale-removed err **1.43%** | scale err 0.0154%, cut err **1.71%**, scale-removed err **1.66%** | **pass** |
+
+**Item 10 — path 2 on the scene path 1 cannot measure (cached `twosided_b`, no new SfM).** True
+pre-slide surface (`build_terrain(7)`'s `h`, before the bowl cut, default amps — `twosided_b`'s own
+terrain) written as an XYZ grid; `align_to_dem` → `measure(dem=…)`: `rms_m = 0.0228` (≤ 0.05),
+`datum == "dem"`, `status == "indicative"` with the DEM-mode reason as the only reason (no G9),
+cut err **3.27%** (≤ 5%), scale-removed err **1.02%** (≤ 2%). **Pass.**
+
+**Item 11 — negative control.** `twosided_b` re-measured with the post-S0c `tools/synth.py`:
+`indicative` in both modes with `G9_datum_unstable`-class reasons, and every number equal to the
+`DATUM_STABILITY_PROGRESS.md` table to its own printed precision — photo: coverage 0.98588, void
+0.9375 m², cut 78.468 m³ (+16.84%), holdout 0.0683 m, 8/8 windows; ortho: coverage 0.98571, void
+0.9375 m², cut 77.487 m³ (+15.38%), holdout 0.0739 m, 8/8 windows. **Pass** (identical to the
+committed table; `twosided_b`'s images/`ground_truth.json` were independently confirmed
+byte-identical under item 2, so this also confirms `build_terrain`'s default path is unchanged).
+
+### Deviations from the plan's S0c description
+
+- **`GUIDED_CAPTURE_PLAN.md` was not edited.** §12b.7's GO branch names two direct consequences —
+  "`twosided_cal` becomes the S4/S5 path-1 reference and replaces `twosided_b` in that role. §3
+  drops 'provisional'." Those are plan-document wording changes, not `tools/`-file or
+  application-code changes, and the instruction for this pass was explicit: implement only S0c,
+  do not begin S1–S7, and record results/deviations/the decision in
+  `GUIDED_CAPTURE_PROGRESS.md`. Since §3's protocol wording feeds directly into the S1/S3 capture
+  UI text, editing it is left for whoever starts S4/S6a to do alongside that work, rather than
+  edited here as a side effect of a benchmark pass. The GO decision itself (below) is the
+  authoritative record for that edit to act on.
+- Building the second-largest-void, per-arm marker split, elevation/azimuth, and dense-residual
+  numbers (items 3–5 above) needed three read-only scratch scripts that duplicate small pieces of
+  `landslide/volume.py::_coverage_gate`'s label logic and `tools/benchmark.py::run_preset`'s own
+  reconstruct→scale→measure sequence, run against the already-cached `data/bench/twosided_cal` and
+  `data/bench/twosided_b` work dirs (no new SfM beyond the one clean-cache run above) — the same
+  read-only pattern S0/S0b/G9 used. None of these scripts are committed.
+- One of those scripts initially mis-measured item 5 (interior RMS 0.81 m instead of 0.026 m) by
+  calling `ctx.cloud(dense=True)` on a freshly-`reconstruct`ed `ReconCtx` without first populating
+  `ctx.dense` from the on-disk cache — `ReconCtx.cloud()` silently falls back to the sparse cloud
+  when `ctx.dense is None`, exactly the trap `DATUM_STABILITY_PROGRESS.md`'s own S0b investigation
+  hit and self-corrected. Fixed by calling `landslide.densify.load_cached_dense(ctx)` first, as
+  that investigation's correction did; the corrected numbers are what's reported in item 5 above.
+- Did not attempt the θ-proxy sweep or any other geometry variant — §12b.3's terrain design was
+  applied exactly as specified, with no tuning to the result (§12b.1: "the fix must be in the
+  scene, never in a gate").
+- Did not run the slow e2e preset suite (`tests/test_e2e_presets.py`) for the other 7 presets —
+  this pass touches no other preset's configuration or images (item 2 confirms `arc` and
+  `twosided_b` byte-identical), matching S0/S0b's own scoping of that check.
+
+### Go/No-Go decision
+
+**S0c: GO**, per the fixed decision rule (§12b.7, "All items pass"). Every item of §12b.5 (1
+through 11, both photo and ortho mode where applicable) passed with margin — most with
+substantial margin (G9 ratio ≤ 0.026 against a 0.04 scene-validity budget and a 0.05 gate; dense
+residual RMS 2.6 cm against a 5 cm budget; cut error ≤ 1.7% against a 5% budget).
+
+Consequences, per §12b.7's GO branch:
+
+- **`twosided_cal` is the S4/S5 path-1 reference**, replacing `twosided_b` in that role.
+  `twosided_b` keeps its role as the **negative datum control** (item 11: still `indicative`
+  through G9 on identical cameras/marker/bowl, differing only in terrain).
+- **S4 (preview SfM) is unblocked.** S5 (coverage/recapture calibration) was already gated on S4
+  as well as S0c, so it is unblocked in the same sense — both still need S4's own preview-report
+  code, which does not exist yet.
+- **§3's "provisional" wording is not yet dropped** — see "Deviations" above. This GO record is
+  what authorizes that edit; it was not made in this pass.
+
+Per the instruction for this pass, **S1–S7 remain not started.** This pass touched only
+`tools/synth.py`, `tools/benchmark.py`, and `tests/test_volume.py`, and changed no existing
+preset's output, no gate, no threshold, and no application behavior.

@@ -475,6 +475,44 @@ def test_g9_unstable_datum_downgrades_ok_to_indicative():
     assert any("datum uncertain" in msg for msg in reasons), reasons
 
 
+def test_g9_calibration_terrain_stays_ok_seed7():
+    # Positive-control complement of R1 (GUIDED_CAPTURE_PLAN.md SS12b.5 item 1):
+    # twosided_cal zeroes the two long-wavelength terrain octaves (6, 12 cells)
+    # that make R1's rim unable to predict the interior. On that terrain a
+    # perfect-point rim/interior must clear G9 with margin, on the same seed
+    # R1 uses to demonstrate the failure.
+    from landslide.gates import evaluate_gates
+    from tools.synth import BOWL, POLY_R, PRESETS, build_terrain
+
+    from test_gates import _FakeCtx
+
+    X, Y, z, _, truth = build_terrain(
+        seed=7, octave_amps=PRESETS["twosided_cal"]["terrain_amps"])
+    cx, cy = BOWL["x"], BOWL["y"]
+    r = np.hypot(X - cx, Y - cy)
+    interior_m = r < POLY_R
+    rim_m = (r >= 6.1) & (r <= 8.1)
+    interior = np.stack([X[interior_m], Y[interior_m], z[interior_m]], 1)
+    rim = np.stack([X[rim_m], Y[rim_m], z[rim_m]], 1)
+    up = np.array([0.0, 0.0, 1.0])
+    polygon_ground = _circle_polygon(cx, cy, POLY_R)
+
+    res = prism_volume(interior, rim, log=lambda *_: None, up=up,
+                       polygon_ground=polygon_ground)
+    assert res["datum_holdout_windows"] == 8
+    err = abs(res["cut_volume_m3"] - truth["vol_true_poly"]) / truth["vol_true_poly"]
+    assert err <= 0.015, f"expected a predictable datum, got {err:.1%} error"
+    area = res["polygon_area_m2"]
+    net = abs(res["net_volume_m3"])
+    ratio = res["datum_holdout_m"] * area / net
+    assert ratio <= 0.03, f"G9 ratio {ratio:.3f} should clear the gate with margin"
+
+    res["cloud"] = "dense"
+    status, reasons = evaluate_gates(_FakeCtx(), res, "ground_frame")
+    assert status == "ok", reasons
+    assert reasons == []
+
+
 def test_g9_stable_planar_and_curved_fixtures_stay_ok():
     # R2/R3: honest planar and correctly-modelled curved ground must not be
     # penalized by the new gate.

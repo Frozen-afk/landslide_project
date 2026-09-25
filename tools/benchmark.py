@@ -25,7 +25,9 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from tools.synth import PRESETS, terrain_height, build_terrain  # noqa: E402
+from tools.synth import (  # noqa: E402
+    PRESETS, terrain_height, build_terrain, DEFAULT_TERRAIN_AMPS,
+)
 
 
 def _umeyama_scale(P, Q, weights=None):
@@ -181,7 +183,9 @@ def run_preset(preset: str, work_root: Path, seed: int = 7) -> dict:
         if len(pts) > 5000:
             pts = pts[np.random.default_rng(0).choice(len(pts), 5000, replace=False)]
         world = (s_true * Rm @ pts.T).T + tm
-        _, _, z_grid, _, _ = build_terrain(seed, tex_scale=PRESETS[preset]["tex_scale"])
+        _, _, z_grid, _, _ = build_terrain(
+            seed, tex_scale=PRESETS[preset]["tex_scale"],
+            octave_amps=PRESETS[preset].get("terrain_amps", DEFAULT_TERRAIN_AMPS))
         # X,Y grid discarded above (not needed: terrain_height re-derives fx/fy from x,y)
         from tools.synth import L, N
         Xg, Yg = np.meshgrid(np.linspace(0, L, N), np.linspace(0, L, N), indexing="ij")

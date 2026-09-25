@@ -89,6 +89,14 @@ PRESETS = {
                         height=9.0, height_ramp=0.0, f_px=1600.0, tex_scale=1.0,
                         k1=0.0, arc_offset=90.0),
 }
+# S0c (GUIDED_CAPTURE_PLAN.md SS12b): twosided_b's exact cameras/bowl/marker,
+# with the two long-wavelength terrain octaves (6, 12 cells -- same scale as
+# the interior itself, so the rim band can't predict them) zeroed out. The
+# short-wavelength roughness (24, 48 cells) and the planar tilt are kept, so
+# the scene stays a realistic sloped/rough hillslope whose datum the rim can
+# actually infer.
+PRESETS["twosided_cal"] = dict(PRESETS["twosided_b"],
+                                terrain_amps=(0.0, 0.0, 0.08, 0.04))
 
 EXTS_OK = (".jpg", ".jpeg", ".png")
 
@@ -98,11 +106,20 @@ def value_noise(n: int, cells: int, rng) -> np.ndarray:
     return cv2.resize(r, (n, n), interpolation=cv2.INTER_CUBIC)
 
 
-def build_terrain(seed: int = 7, tex_scale: float = 1.0):
+DEFAULT_TERRAIN_AMPS = (0.35, 0.15, 0.08, 0.04)
+TERRAIN_OCTAVE_CELLS = (6, 12, 24, 48)
+
+
+def build_terrain(seed: int = 7, tex_scale: float = 1.0,
+                   octave_amps: tuple[float, float, float, float] = DEFAULT_TERRAIN_AMPS):
     rng = np.random.default_rng(seed)
     n = N
     h = np.zeros((n, n), np.float64)
-    for cells, amp in [(6, 0.35), (12, 0.15), (24, 0.08), (48, 0.04)]:
+    # value_noise is called for every octave regardless of amp (including a
+    # zeroed one, e.g. twosided_cal) so the RNG stream -- and therefore the
+    # texture octaves drawn after this loop -- is consumed identically to the
+    # default amps. Only the terrain height differs.
+    for cells, amp in zip(TERRAIN_OCTAVE_CELLS, octave_amps):
         h += amp * value_noise(n, cells, rng)
     xs = np.linspace(0, L, n)
     X, Y = np.meshgrid(xs, xs, indexing="ij")
@@ -318,7 +335,9 @@ def main():
     img_dir = out / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
 
-    X, Y, z, colors, gt_vol = build_terrain(args.seed, tex_scale=p["tex_scale"])
+    terrain_amps = p.get("terrain_amps", DEFAULT_TERRAIN_AMPS)
+    X, Y, z, colors, gt_vol = build_terrain(args.seed, tex_scale=p["tex_scale"],
+                                             octave_amps=terrain_amps)
     verts = np.stack([X.ravel(), Y.ravel(), z.ravel()], axis=1)
     vcolors = colors.reshape(-1, 3)
     tris = grid_tris(N)
@@ -369,6 +388,11 @@ def main():
         "polygon_image": f"IMG_{middle:02d}.png",
         "polygon_px": poly_px.tolist(),
     }
+    if "terrain_amps" in p:
+        # Only recorded for presets that override the default amps, so every
+        # preset that doesn't (all of them but twosided_cal) keeps a
+        # byte-identical ground_truth.json (GUIDED_CAPTURE_PLAN.md SS12b.2).
+        gt["terrain_amps"] = list(terrain_amps)
     (out / "ground_truth.json").write_text(json.dumps(gt, indent=1))
 
     spec = {

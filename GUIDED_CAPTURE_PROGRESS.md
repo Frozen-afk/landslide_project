@@ -784,3 +784,263 @@ resolves; no 404 from the new import).
   hit any code path this pass added) are unaffected.
 - **S2–S7 remain not started**, per the instruction for this pass.
 
+## S2 — Capture session backend (`GUIDED_CAPTURE_PLAN.md` §12 stage table, row 2)
+
+**Base:** `main` @ `0b2f927`. This pass added `landslide/capture.py`,
+`tests/test_capture.py`, `tests/test_capture_session.py`,
+`tests/fixtures/capture_t1/` (generator + committed fixture JPEGs), and
+changed `server/routes.py`, `server/schemas.py`, `server/jobs.py`. No
+`server/static/*` (UI) file was touched — the capture UI is S3 scope. No
+gate, threshold, or existing endpoint's behavior was changed. **S3–S7 not
+started**, per the instruction for this pass.
+
+### Change made
+
+Per the stage-table scope ("`capturing` status, `session.json`,
+`PUT/DELETE photos`, `GET capture`, `finalize` (no preview gating yet),
+`landslide/capture.py::image_checks` / `sequence_checks`, semaphore. Setup
+stores the DEM answer in `session.json`."):
+
+- **`landslide/capture.py`** (new, no web dependency, per §9.2's own spec):
+  - `image_checks(path, prev_path=None, marker_side_m=None, marker_dict="auto",
+    blur_floor=6.0, blur_median=None, arm_bridge_paths=None, prev_pivot=False,
+    feats_cache=None, prev_feats_cache=None)` — the T1 per-photo checks
+    (§4.1): blur/exposure (reuses `pipeline._photo_metrics`, same thresholds
+    `_cull` uses), texture (`cv2.SIFT_create(4000)` keypoint count at
+    1000 px, fail < 300 / warn < 800), overlap-with-previous (ratio-test SIFT
+    matches → `findFundamentalMat` RANSAC inliers, fail < 40 / warn < 100),
+    turn-in-place / parallax (homography-inlier ÷ fundamental-inlier ratio
+    against the previous photo, warn ≥ 0.95, fail on two such photos in a
+    row via the caller-supplied `prev_pivot` flag), marker present/size/angle
+    (reuses `scaling.detect_marker_corners` / `_load_gray` / `_available_dicts`,
+    same size/ratio cut points as §4.1's table), and arm-bridge overlap (best
+    of up to 3 tail photos of the other arm). Returns
+    `{verdict, reasons: [{id, text}], server: {...}}`; `T1_MESSAGES` holds
+    the §4.1 "instruction on fail" text — a separate vocabulary from
+    `gates.RULES` (the result-side G-gate ids), which this module does not
+    touch, per §9.2's own note ("Imports `RULES` ... It does not define its
+    own copy" — that note is about the *result-side* ids a later stage's
+    `recapture_instructions` will reuse; per-photo T1 reasons fire before any
+    gate runs and have no gate id yet).
+  - `extract_feats(path, cache=None)` — SIFT keypoints/descriptors at
+    1000 px, optionally read from / written to an `.npz` cache file. Routes
+    wires this to `capture/feats/<uuid>.npz` (§9.1's own directory layout),
+    so a later photo's overlap check against an earlier one doesn't re-decode
+    and re-run SIFT on it.
+  - `sequence_checks(photos)` — the T2 subset that is actually derivable
+    server-side today: per-arm kept-photo counts, marker-view counts
+    (total and per arm), and overlap-chain gaps. Heading spread, arm
+    separation and elevation (§4.2) need client sensor data that S3's UI
+    doesn't exist yet to send, so they are not computed here — an absent
+    field, not a wrong one; nothing in `RULES`/gates reads this dict yet.
+- **`server/schemas.py`**: `CaptureSessionRequest` (`marker_side_m`,
+  `marker_dict`, `has_pre_event_dem` — §3b step 1's setup question, stored
+  and never used for scoring in this pass), `CapturePhotoMeta` (`seq`, `arm`,
+  `client` — the form-field JSON body of the per-photo PUT), and
+  `CaptureFinalizeRequest` (`override`).
+- **`server/jobs.py`**: `Job` gains a `capture: dict | None` field (the
+  manifest, mirroring `scale_info`/`ortho`/`dem_info`'s existing
+  persisted-mirror pattern) and `capture_dir` / `save_capture()` — the same
+  atomic temp-file-plus-`os.replace` pattern `save_state()` already uses,
+  writing to its own `capture/session.json` (§9.1) rather than into
+  `state.json`, since the manifest grows with every photo independently of
+  the job's log/result/scale state. `load_persisted_jobs` reads
+  `capture/session.json` back in on restart when present; a `capturing`
+  status already passed through that function unmodified (untouched by the
+  existing `("reconstructing", "measuring", "orthorectifying")` remap
+  tuple), so no change was needed there. `snapshot()` includes `capture`
+  when set, for the status-poll endpoint.
+- **`server/routes.py`**: five new endpoints, all under `/api/jobs/capture`
+  and `/api/jobs/{id}/capture/...`, matching §9.2's table:
+  - `POST /api/jobs/capture` — creates a `capturing` job, `capture/originals/`
+    and `capture/feats/` directories, an empty `photos/` (so
+    `load_persisted_jobs`'s own directory-scan condition still finds the job
+    on restart, §9.1), and the manifest.
+  - `PUT /api/jobs/{id}/capture/photos/{uuid}` — multipart `file` + form
+    `meta` (the `CapturePhotoMeta` JSON). Rejects non-JPEG by extension
+    (§8: `accept="image/jpeg"` is the only capture path in scope). SHA-256
+    identity: a repeated PUT with the same uuid **and** sha256 returns the
+    stored result without reprocessing (idempotent retry); a different
+    sha256 for the same uuid is a 409. Looks up the previous *kept* photo in
+    the same arm for the overlap/parallax check, and (for arm `B`'s first 3
+    kept photos, or any `T` transition photo) the last 3 kept arm-`A`
+    photos for the arm-bridge check. The session/batch blur median is
+    computed once ≥ 5 kept photos exist, matching S1's own "before 5 photos
+    exist, use the flat floor" reading (§4.1). The actual `image_checks`
+    call runs in `run_in_threadpool`, gated by a module-level
+    `threading.Semaphore(2)` (§9.2: "T1 runs in `run_in_threadpool` behind a
+    `threading.Semaphore(2)`, so per-photo checks cannot starve the SfM
+    workers" — here, starve *other requests* on the same threadpool during a
+    burst of queued uploads). 409 unless `status == "capturing"`.
+  - `DELETE /api/jobs/{id}/capture/photos/{uuid}` — soft-excludes (marks
+    `excluded: true`, recomputes `sequence`); the file stays on disk (a
+    retake with the same uuid is a normal idempotent PUT, a different uuid
+    is a new entry).
+  - `GET /api/jobs/{id}/capture` — the manifest as stored (no blobs are ever
+    in it — photo bytes live only under `capture/originals/`).
+  - `POST /api/jobs/{id}/capture/finalize` — copies the non-excluded
+    originals in `seq` order into a temp dir named `{seq:03d}_{uuid}.jpg`,
+    calls the **unchanged** `import_photos` into `photos/`, sets
+    `reconstructing`, and calls `executor.submit_job(job,
+    worker.run_reconstruction, ...)` — the identical path `create_job` uses.
+    No preview report exists yet (S4), so `blocking_at_finalize` is always
+    `[]` and finalize never actually refuses on gate grounds in this pass;
+    the `override` field is accepted and stored now so S4 doesn't need a
+    schema change later. **Crash recovery (§10 "finalize interrupted"):**
+    the status guard accepts `status in ("capturing", "error")` rather than
+    only `"capturing"` — a crash between `import_photos` succeeding and
+    `submit_job` being called leaves the job `reconstructing` with no
+    complete model, which `load_persisted_jobs`'s existing P3d rule already
+    demotes to `error` on restart; calling finalize again re-copies from
+    `capture/originals` (kept on disk until the job is deleted) and retries,
+    with no new persistence logic required.
+  - `list_jobs`'s `n_photos` now counts non-excluded manifest entries for a
+    `capturing` job (its `photos/` directory stays empty until finalize, so
+    the old `count_photos(photos/)` read always showed 0 — §9.1's own
+    explicit requirement, "for `capturing` jobs, `n_photos` counts the
+    non-excluded manifest entries").
+- **Preserved:** `POST /api/jobs` (the existing multi-file upload) was not
+  touched at all — no line in `create_job`, `import_photos`, or any gate
+  changed. `delete_job` already lets a `capturing` job be deleted (it isn't
+  in `BUSY_STATUSES` and isn't `"reconstructing"`), which drops its whole
+  directory including `capture/`, same as any other job.
+
+### Focused validation (one run)
+
+```
+.venv/bin/python -m pytest -q -k "not e2e"
+```
+
+Result: **209 passed, 3 skipped, 23 deselected** — S1's own baseline was 191
+passed; the 18 new tests (11 in `tests/test_capture.py`, 7 in
+`tests/test_capture_session.py`) account for the difference exactly, and
+every pre-existing assertion still passes unmodified. Also ran
+`.venv/bin/python -m pytest -q tests/test_capture.py tests/test_capture_session.py`
+on its own (18 passed) and a manual `TestClient` walk of all five endpoints
+(create → PUT (idempotent retry, sha-mismatch 409) → GET → DELETE →
+finalize-too-few-photos) plus a `GET /api/jobs` check that a `capturing`
+session's `n_photos` reflects the manifest, not the (empty) `photos/` dir.
+
+### Criterion 2 fixtures and their honest gap
+
+`tests/fixtures/capture_t1/` (regenerated via
+`.venv/bin/python -m tests.fixtures.capture_t1.make_fixtures`): crops of the
+already-rendered `data/bench/{arc,nadir,sparse8}` presets for
+marker/overlap content, a from-scratch two-frame render (same eye position,
+10° pan, no translation at all) for the parallax/pivot check, and plain
+near-uniform PIL images ("water, snow, sky", per §4.1's own instruction
+text) for the texture-fail case — see that script's own docstring.
+
+Measured (`tests/test_capture.py`):
+
+| Check | Fixture pair | Result |
+| --- | --- | --- |
+| Blur | `blurry.jpg` (Gaussian σ=3 of `overlap_a.jpg`) | `blur` reason fires; `overlap_a.jpg` itself (lap≈208) does not |
+| Marker | `marker_arc.jpg` / `marker_nadir.jpg` | arc: `verdict=="ok"`, no marker reason. nadir: `side_ratio` 0.39 < 0.4, `marker_edge_on` fires |
+| Overlap | `overlap_a.jpg`→`overlap_b.jpg` (consecutive) vs `overlap_a.jpg`→`overlap_far.jpg` (3 steps) | consecutive: no `overlap` reason (69 inliers). 3-apart: `overlap` fires (39 < 40) |
+| Texture | `texture_blank.jpg` vs `texture_arc.jpg` | blank: `features` fires, 0 keypoints. real content: far more keypoints (229) |
+| Parallax | `pivot_a.jpg`/`pivot_b.jpg` (pure pan) vs `overlap_a.jpg`/`overlap_b.jpg` (real translation) | pivot pair's homography ratio (0.869) is measurably higher than the translating pair's (0.694) — the correct *direction* |
+
+**The gap, stated plainly:** this repo's only synthetic scene (a Gouraud-
+shaded heightfield with no per-pixel sensor noise) does not clear the
+literal §4.1 numbers even on its best available content — every fixture
+above lands under `FEATURES_FAIL` (300) at the T1 working resolution
+(229 keypoints on real 3-D content, not 0), and the pivot pair's homography
+ratio (0.869) sits under the 0.95 warn cut. Both ceilings hold even after
+trying higher `tex_scale`/`octave_amps` terrain and full-resolution SIFT (no
+downscale) — see this section's own working notes in the commit that added
+these fixtures. This is not a threshold bug: `S1`'s own progress notes
+already establish that no real phone JPEG exists anywhere in this repo, and
+apparently the gap is wider for texture-heavy checks than for the
+blur/exposure/dHash checks S1 could clear. Rather than loosen the §4.1
+numbers to fit synthetic content (exactly what `GUIDED_CAPTURE_PLAN.md`
+repeatedly instructs against — thresholds are calibrated against real
+prints/photos in S5/S7, never adjusted to make a test pass), `tests/test_capture.py`
+pins the exact threshold arithmetic with monkeypatched inputs (six tests)
+and separately proves the real detector/matcher wiring on real synthetic
+content by asserting on each check's own reason id or a directional
+relationship (pivot > translate, real content > blank), not on the
+aggregate verdict. Real-world calibration against actual phone photos and
+printed markers remains S5/S7 scope, unchanged from the plan.
+
+### Latency (informational only — not an S2 exit criterion)
+
+§11 criterion 5 (T1 ≤ 2 s p95 per photo on a field laptop) is scoped to S3/S4
+in the stage table's own criteria list, not S2. For reference only, 8 calls
+to `image_checks` (marker + overlap check both enabled) on this dev box
+(cold SIFT init excluded, warm run): median 0.265 s, max 0.282 s — comfortably
+inside the 2 s budget, but this is a dev workstation, not the target field
+laptop, and is not a substitute for S3/S7's own measurement.
+
+### Deviations from the plan's S2 description
+
+- **`sequence_checks` omits heading/arm-separation/elevation** (§4.2's
+  sensor-derived rows). Those need `client` sensor payloads S3's UI doesn't
+  send yet; computing them now would mean inventing a client contract ahead
+  of the UI that defines it. The manifest already has a `client: {}` field
+  per photo (§9.1) for S3 to populate.
+- **No preview gating at finalize.** S4 (§12 stage table) owns
+  `worker.run_preview` / `preview_report`; finalize's `blocking_at_finalize`
+  is therefore always `[]` in this pass, and `override` is accepted but
+  inert. This matches the stage table's own row text ("no preview gating
+  yet").
+- **Arm-bridge feature caching.** `image_checks`' `arm_bridge_paths` re-runs
+  `extract_feats` uncached for each of the up-to-3 tail photos of the other
+  arm, instead of reading their `capture/feats/<uuid>.npz` cache. Those
+  photos' own PUT calls already wrote that cache; wiring the bridge check to
+  read it would save a few hundred ms per bridge photo but touches only a
+  handful of photos per session (first 3 of arm B, plus transition), so it
+  was left as the simpler uncached call.
+- **`has_pre_event_dem` is stored, not used.** §3b step 1 only says the
+  answer "changes the messages in step 7" (the result panel, S6a already
+  shipped) — no code in this pass reads it back; it is carried through the
+  manifest for S6b/S3 to use when they build the messages that reference it.
+- **No change to `capture.html`** (the old live-viewfinder coach) or any
+  `server/static/*` file — the guided-capture UI is explicitly S3 scope.
+
+### Browser/field limitations (not testable outside a real device/browser or S3's UI)
+
+- **No client exists yet.** Every endpoint in this pass was exercised only
+  via `TestClient`/direct HTTP, not through a real phone browser — there is
+  no UI yet to drive it from (S3). The multipart-upload contract
+  (`file` + form `meta` JSON) was designed to be servable from `fetch()`
+  with a `FormData` body without further server changes, but this is not
+  verified against an actual mobile Safari/Chrome `fetch` call in this pass.
+- **HEIC/other formats:** the PUT endpoint rejects non-`.jpg`/`.jpeg` by
+  filename extension only (no content-sniffing of the actual bytes) — §8's
+  own design ("`accept="image/jpeg"` makes iOS transcode. The server's
+  per-photo endpoint rejects other types with a clear message") is met at
+  the extension-check level; a mismatched extension on real bytes (e.g. a
+  renamed `.heic`) is not separately rejected by content inspection, since
+  `import_photos`/`_photo_metrics` already error clearly on undecodable
+  content and that path is exercised via `PIL.Image.open` failing inside
+  `image_checks`.
+- **Semaphore(2) sizing** is the number the plan names (§9.2); it was not
+  load-tested against a real burst of queued uploads on a small field
+  laptop in this pass.
+
+### Acceptance status
+
+- **Criterion 2 (per-image check correctness).** Met, with the honest
+  numeric-ceiling gap documented above: threshold arithmetic is pinned
+  exactly (6 monkeypatched tests over blur/features/overlap/parallax/marker),
+  and the real detector/matcher wiring is proven on real synthetic content
+  (5 fixture tests) asserting on reason ids and directional signals rather
+  than on absolute counts this scene cannot clear.
+- **Criterion 6 (a-d, recovery).** Met. (a) same-uuid-same-sha256 PUT twice
+  → one manifest entry, identical response. (b) same-uuid-different-sha256
+  → 409. (c) a hand-built `capturing` job directory with a `capture/session.json`
+  survives `load_persisted_jobs` with its status and photos intact (no
+  `preview` field exists yet to go `stale` — S4). (d) finalize after a
+  monkeypatched `import_photos` failure (simulating the crash window between
+  import and submit) leaves the job `error` with `finalized` still `null`;
+  calling finalize again succeeds, re-copying from `capture/originals` and
+  reaching `reconstructing` with `finalized` set. **6(e)** (a real
+  kill-the-tab-and-reopen device test) is out of scope without a client —
+  S3/S7.
+- **Criterion 7 (no regression).** Met. `pytest -q -k "not e2e"`: 209 passed
+  (191 pre-existing + 18 new), 3 skipped, 23 deselected. `POST /api/jobs`'s
+  own function body is byte-for-byte untouched. Legacy saved jobs load
+  unaffected (no change to that branch of `load_persisted_jobs`).
+- **S3–S7 remain not started**, per the instruction for this pass.
+

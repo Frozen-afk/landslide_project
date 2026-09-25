@@ -11,15 +11,18 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import hashlib
 import shutil
+import statistics
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Optional
 
 import cv2
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response, StreamingResponse
 
@@ -27,19 +30,29 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from landslide.capture import image_checks, sequence_checks  # noqa: E402
 from landslide.pipeline import import_photos  # noqa: E402
 from landslide.scaling import aruco_scale, manual_scale  # noqa: E402
 from landslide.sfm import IMAGE_EXTS, count_photos  # noqa: E402
 from server import executor, jobs, worker  # noqa: E402
 from server.jobs import JOBS, JOBS_LOCK, Job, _photo_cache  # noqa: E402
-from server.schemas import ArucoScaleRequest, ManualScaleRequest, MeasureRequest  # noqa: E402
+from server.schemas import (ArucoScaleRequest, CaptureFinalizeRequest,  # noqa: E402
+                            CapturePhotoMeta, CaptureSessionRequest,
+                            ManualScaleRequest, MeasureRequest)
 
 MAX_PHOTOS = 200          # per job
 MAX_FILE_MB = 80          # per uploaded photo
+CAPTURE_IMAGE_EXTS = {".jpg", ".jpeg"}   # §8: file-input capture is JPEG only
 
 router = APIRouter()
 
 BUSY_STATUSES = ("measuring", "orthorectifying")
+
+# §9.2: T1 per-photo checks run in the FastAPI threadpool (not the SfM
+# process pool) — capped at 2 concurrent so a burst of queued uploads (e.g.
+# catching up after a connectivity gap) can't starve every other request on
+# a small field laptop.
+_T1_SEMAPHORE = threading.Semaphore(2)
 
 
 @router.get("/")
@@ -115,12 +128,223 @@ def _on_reconstruction_done(job: Job, result: dict | None, exc: BaseException | 
     job.say("ready — set the scale, then mark the region")
 
 
+# ---------------------------------------------------------------------------
+# S2 (GUIDED_CAPTURE_PLAN.md §9.2): capture-session backend. No preview
+# gating yet (S4) — finalize always proceeds once >=3 kept photos exist.
+# ---------------------------------------------------------------------------
+
+def _get_capturing_job(job_id: str) -> Job:
+    job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(404, "unknown job")
+    if job.status != "capturing":
+        raise HTTPException(409, f"job is not in a capture session (status={job.status})")
+    return job
+
+
+@router.post("/api/jobs/capture")
+def create_capture_session(spec: CaptureSessionRequest):
+    job_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
+    job = Job(job_id, status="capturing")
+    # photos/ empty at session start so load_persisted_jobs reattaches the
+    # job (its own scan requires the dir to exist, §9.1)
+    (job.dir / "photos").mkdir(parents=True, exist_ok=True)
+    (job.capture_dir / "originals").mkdir(parents=True, exist_ok=True)
+    (job.capture_dir / "feats").mkdir(parents=True, exist_ok=True)
+    job.capture = {
+        "version": 1,
+        "marker_side_m": spec.marker_side_m,
+        "marker_dict": spec.marker_dict,
+        "has_pre_event_dem": spec.has_pre_event_dem,
+        "roi": None,
+        "photos": [],
+        "sequence": {},
+        "preview": None,
+        "finalized": None,
+    }
+    with JOBS_LOCK:
+        JOBS[job_id] = job
+    job.save_state()
+    job.save_capture()
+    return {"id": job_id}
+
+
+@router.get("/api/jobs/{job_id}/capture")
+def get_capture_session(job_id: str):
+    job = JOBS.get(job_id)
+    if job is None or job.capture is None:
+        raise HTTPException(404, "no capture session for this job")
+    return job.capture
+
+
+@router.put("/api/jobs/{job_id}/capture/photos/{photo_uuid}")
+async def put_capture_photo(job_id: str, photo_uuid: str,
+                            file: UploadFile = File(...), meta: str = Form(...)):
+    job = _get_capturing_job(job_id)
+    try:
+        photo_meta = CapturePhotoMeta.model_validate_json(meta)
+    except Exception as e:
+        raise HTTPException(400, f"bad meta: {e}")
+
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in CAPTURE_IMAGE_EXTS:
+        raise HTTPException(400, f"'{file.filename}' is not a JPEG "
+                                 f"({suffix or 'no extension'}) — guided capture "
+                                 "only accepts image/jpeg (§8)")
+    data = await file.read()
+    if len(data) > MAX_FILE_MB << 20:
+        raise HTTPException(400, f"{file.filename} is larger than {MAX_FILE_MB} MB")
+    sha256 = hashlib.sha256(data).hexdigest()
+
+    with job.lock:
+        existing = next((p for p in job.capture["photos"] if p["uuid"] == photo_uuid), None)
+        if existing is not None:
+            if existing["sha256"] != sha256:
+                raise HTTPException(409, "uuid already used with different photo content")
+            # idempotent retry: return the stored result, don't reprocess
+            return {"verdict": existing["verdict"], "reasons": existing["reasons"],
+                    "server": existing["server"], "sequence": job.capture["sequence"]}
+
+    dest = job.capture_dir / "originals" / f"{photo_uuid}.jpg"
+    dest.write_bytes(data)
+
+    with job.lock:
+        photos = job.capture["photos"]
+        same_arm = [p for p in photos if p["arm"] == photo_meta.arm and not p["excluded"]]
+        prev = same_arm[-1] if same_arm else None
+        prev_path = (job.capture_dir / "originals" / f"{prev['uuid']}.jpg") if prev else None
+        prev_feats_cache = (job.capture_dir / "feats" / f"{prev['uuid']}.npz") if prev else None
+        prev_pivot = bool(prev and prev.get("_pivot_warn"))
+
+        bridge_paths = None
+        if photo_meta.arm in ("B", "T"):
+            arm_a = [p for p in photos if p["arm"] == "A" and not p["excluded"]]
+            b_count = len(same_arm) if photo_meta.arm == "B" else 0
+            if arm_a and (photo_meta.arm == "T" or b_count < 3):
+                bridge_paths = [job.capture_dir / "originals" / f"{p['uuid']}.jpg"
+                                for p in arm_a[-3:]]
+
+        laps = [p["server"]["lap"] for p in photos if not p["excluded"]]
+        blur_median = float(statistics.median(laps)) if len(laps) >= 5 else None
+        marker_side_m = job.capture["marker_side_m"]
+        marker_dict = job.capture["marker_dict"]
+
+    feats_cache = job.capture_dir / "feats" / f"{photo_uuid}.npz"
+
+    def _run():
+        with _T1_SEMAPHORE:
+            return image_checks(dest, prev_path=prev_path, marker_side_m=marker_side_m,
+                                marker_dict=marker_dict, blur_median=blur_median,
+                                arm_bridge_paths=bridge_paths, prev_pivot=prev_pivot,
+                                feats_cache=feats_cache, prev_feats_cache=prev_feats_cache)
+
+    try:
+        result = await run_in_threadpool(_run)
+    except Exception as e:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(400, f"could not check photo: {e}")
+
+    with job.lock:
+        entry = {
+            "uuid": photo_uuid, "seq": photo_meta.seq, "arm": photo_meta.arm,
+            "sha256": sha256, "client": photo_meta.client,
+            "server": result["server"], "verdict": result["verdict"],
+            "reasons": result["reasons"], "excluded": False,
+            "_pivot_warn": result["server"].get("parallax_pivot") is True,
+        }
+        job.capture["photos"].append(entry)
+        job.capture["photos"].sort(key=lambda p: p["seq"])
+        job.capture["sequence"] = sequence_checks(job.capture["photos"])
+        seq_snapshot = job.capture["sequence"]
+    job.save_capture()
+
+    return {"verdict": result["verdict"], "reasons": result["reasons"],
+            "server": result["server"], "sequence": seq_snapshot}
+
+
+@router.delete("/api/jobs/{job_id}/capture/photos/{photo_uuid}")
+def delete_capture_photo(job_id: str, photo_uuid: str):
+    job = _get_capturing_job(job_id)
+    with job.lock:
+        entry = next((p for p in job.capture["photos"] if p["uuid"] == photo_uuid), None)
+        if entry is None:
+            raise HTTPException(404, "no such photo in this session")
+        entry["excluded"] = True
+        job.capture["sequence"] = sequence_checks(job.capture["photos"])
+    job.save_capture()
+    return {"excluded": True}
+
+
+@router.post("/api/jobs/{job_id}/capture/finalize")
+async def finalize_capture(job_id: str, spec: CaptureFinalizeRequest):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(404, "unknown job")
+    with job.lock:
+        if job.status in ("reconstructing", "measuring", "orthorectifying"):
+            raise HTTPException(409, "the server is busy on this job")
+        if job.capture is None:
+            raise HTTPException(404, "no capture session for this job")
+        # §10 "finalize interrupted": a crash between import_photos and
+        # submit_job leaves the job `reconstructing` with no complete model,
+        # which load_persisted_jobs already demotes to `error` (P3d) on
+        # restart; retrying finalize from status=="error" re-runs it from
+        # capture/originals (kept on disk until the job is deleted), same
+        # as any normal first finalize.
+        if job.status not in ("capturing", "error"):
+            raise HTTPException(409, f"job is not in a capture session (status={job.status})")
+        photos = sorted((p for p in job.capture["photos"] if not p["excluded"]),
+                        key=lambda p: p["seq"])
+        if len(photos) < 3:
+            raise HTTPException(400, "need at least 3 kept photos to finalize")
+        # no preview report exists yet (S4), so nothing can block finalize
+        blocking_ids: list[str] = []
+        if blocking_ids and not spec.override:
+            raise HTTPException(409, {"blocking": blocking_ids})
+        job.status = "reconstructing"   # marks the session closed to further PUT/DELETE
+    job.save_state()
+
+    tmp_dir = job.dir / "capture_finalize_tmp"
+    tmp_dir.mkdir(exist_ok=True)
+    try:
+        tmp_paths = []
+        for p in photos:
+            src = job.capture_dir / "originals" / f"{p['uuid']}.jpg"
+            dst = tmp_dir / f"{p['seq']:03d}_{p['uuid']}.jpg"
+            shutil.copyfile(src, dst)
+            tmp_paths.append(dst)
+        names = await run_in_threadpool(import_photos, tmp_paths,
+                                        job.dir / "photos", log=job.say)
+        job.say(f"stored {len(names)} photos from the guided capture session")
+    except Exception as e:
+        job.set_status("error", f"finalize failed: {e}")
+        raise HTTPException(400, str(e))
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    with job.lock:
+        job.capture["finalized"] = {"at": time.time(), "override": spec.override,
+                                    "blocking_at_finalize": blocking_ids}
+    job.save_capture()
+
+    executor.submit_job(job, worker.run_reconstruction, on_done=_on_reconstruction_done)
+    return {"queued": True}
+
+
+def _n_photos(job: Job) -> int:
+    if job.status == "capturing" and job.capture is not None:
+        # photos/ stays empty until finalize (§9.1) — count the manifest
+        return sum(1 for p in job.capture["photos"] if not p["excluded"])
+    return count_photos(job.dir / "photos") if (job.dir / "photos").is_dir() else 0
+
+
 @router.get("/api/jobs")
 def list_jobs():
     with JOBS_LOCK:
         job_list = list(JOBS.values())
     return [{"id": j.id, "status": j.status, "created": j.created,
-             "n_photos": count_photos(j.dir / "photos") if (j.dir / "photos").is_dir() else 0,
+             "n_photos": _n_photos(j),
              "has_result": j.result is not None}
             for j in sorted(job_list, key=lambda j: -j.created)]
 

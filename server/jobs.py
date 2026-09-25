@@ -34,10 +34,10 @@ class Job:
                  status: str = "reconstructing", error: str | None = None,
                  log: list[str] | None = None, scale_info: dict | None = None,
                  result: dict | None = None, ortho: dict | None = None,
-                 dem_info: dict | None = None):
+                 dem_info: dict | None = None, capture: dict | None = None):
         self.id = job_id
         self.dir = DATA_DIR / job_id
-        self.status = status          # reconstructing|ready|measuring|orthorectifying|error
+        self.status = status          # reconstructing|ready|measuring|orthorectifying|error|capturing
         self.error = error
         self.log = log or []
         self.created = created or time.time()
@@ -46,6 +46,7 @@ class Job:
         self.scale_info = scale_info  # mirror of ctx.scale_info, persisted
         self.ortho = ortho            # orthophoto metadata, persisted
         self.dem_info = dem_info      # prior-DEM transform, persisted
+        self.capture = capture        # guided-capture session manifest (S2, §9.1)
         # RLock, not Lock: ensure_ctx() holds this for its whole body
         # (including its evict_ctx() call), and evict_ctx() can pick this
         # same job as an eviction candidate and call its own save_state(),
@@ -79,6 +80,24 @@ class Job:
             tmp = self.state_path.with_suffix(f".tmp-{uuid.uuid4().hex[:8]}")
             tmp.write_text(json.dumps(state))
             os.replace(tmp, self.state_path)
+
+    # ---------- guided-capture session manifest (S2, §9.1) ----------
+    @property
+    def capture_dir(self) -> Path:
+        return self.dir / "capture"
+
+    def save_capture(self) -> None:
+        """Same atomic temp + os.replace pattern as save_state, into its own
+        file (`capture/session.json`) — the manifest can grow with every
+        photo, independently of the job's log/result/scale state."""
+        with self.lock:
+            if self.capture is None:
+                return
+            self.capture_dir.mkdir(parents=True, exist_ok=True)
+            path = self.capture_dir / "session.json"
+            tmp = path.with_suffix(f".tmp-{uuid.uuid4().hex[:8]}")
+            tmp.write_text(json.dumps(self.capture))
+            os.replace(tmp, path)
 
     def say(self, msg: str) -> None:
         line = f"[{time.strftime('%H:%M:%S')}] {msg}"
@@ -175,6 +194,8 @@ class Job:
                 "ortho": self.ortho,
                 "ctx_loading": self._ctx_loading,
             }
+            if self.capture is not None:
+                out["capture"] = self.capture
             if self.ctx is not None:
                 from landslide.sfm import image_metadata
                 out["images"] = image_metadata(self.ctx)
@@ -268,12 +289,19 @@ def load_persisted_jobs() -> None:
                     state = json.loads(sp.read_text())
                 except Exception:
                     state = {}
+            capture = None
+            cp = d / "capture" / "session.json"
+            if cp.exists():
+                try:
+                    capture = json.loads(cp.read_text())
+                except Exception:
+                    capture = None
             job = Job(d.name, created=state.get("created"),
                       status=state.get("status", "reconstructing"),
                       error=state.get("error"), log=state.get("log"),
                       scale_info=state.get("scale_info"),
                       result=state.get("result"), ortho=state.get("ortho"),
-                      dem_info=state.get("dem_info"))
+                      dem_info=state.get("dem_info"), capture=capture)
             if job.status in ("reconstructing", "measuring", "orthorectifying"):
                 # a job that was mid-reconstruction (or mid-measure/-ortho,
                 # which both require a finished model) when the server

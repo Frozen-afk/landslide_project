@@ -1,5 +1,6 @@
 """Top-level, picklable worker functions for the process-isolated heavy
-stages: SfM reconstruction, dense stereo + orthophoto, measurement (S2).
+stages: SfM reconstruction, dense stereo + orthophoto, measurement (S2),
+guided-capture preview reconstruction (S4).
 
 A native crash inside pycolmap/OpenCV must not take down the server, so
 these run in a `ProcessPoolExecutor` (see `server/executor.py`), not a
@@ -11,6 +12,7 @@ context it needs from the on-disk COLMAP cache via `reconstruct(reuse=True)`.
 """
 from __future__ import annotations
 
+import shutil
 import time
 from pathlib import Path
 
@@ -57,6 +59,44 @@ def run_ortho(job_id: str, photos_dir, work_dir, queue,
     _, meta = render_orthophoto(ctx, jpg_path=art / "ortho.jpg",
                                 meta_path=art / "ortho.json", log=log)
     return meta
+
+
+def run_preview(job_id: str, photos_dir, work_dir, queue, capture_dir,
+                originals_order: list[dict], marker_side_m, marker_dict, roi) -> dict:
+    """S4 (GUIDED_CAPTURE_PLAN.md §9.2): one cheap SfM attempt (1000 px,
+    `max_attempts=1`) into `capture/preview/`, then `capture.preview_report`.
+
+    `photos_dir`/`work_dir` are `submit_job`'s fixed positional args (the
+    job's real `photos/`/`work/`) and are unused here — the preview stages
+    its own copy of the kept originals and reconstructs into
+    `capture_dir/preview`, never touching the job's real reconstruction.
+    `originals_order` is the manifest's kept photos, in `seq` order, each
+    `{uuid, seq, arm}`.
+    """
+    from landslide.capture import preview_report
+    from landslide.sfm import reconstruct
+    log = _log(queue, job_id)
+    capture_dir = Path(capture_dir)
+
+    stage_dir = capture_dir / "preview_stage"
+    shutil.rmtree(stage_dir, ignore_errors=True)
+    stage_dir.mkdir(parents=True)
+    name_to_arm: dict[str, str] = {}
+    for p in originals_order:
+        name = f"{p['seq']:03d}_{p['uuid']}.jpg"
+        src = capture_dir / "originals" / f"{p['uuid']}.jpg"
+        dst = stage_dir / name
+        try:
+            dst.symlink_to(src.resolve())
+        except OSError:
+            shutil.copyfile(src, dst)
+        name_to_arm[name] = p["arm"]
+
+    preview_dir = capture_dir / "preview"
+    ctx = reconstruct(stage_dir, preview_dir, max_image_size=1000,
+                      max_attempts=1, log=log)
+    return preview_report(ctx, arms=name_to_arm, marker_side_m=marker_side_m,
+                          marker_dict=marker_dict, roi=roi, log=log)
 
 
 def run_measure(job_id: str, photos_dir, work_dir, queue,

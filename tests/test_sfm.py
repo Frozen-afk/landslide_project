@@ -185,3 +185,57 @@ def test_build_attempts_is_deterministic():
     assert a1 == a2
     labels = [a["label"] for a in a1]
     assert len(labels) == len(set(labels))
+
+
+# ---- max_attempts (GUIDED_CAPTURE_PLAN.md §9.2, S4 preview reconstruction) --
+
+def test_max_attempts_caps_the_ladder_to_the_first_n_rungs(tmp_path, monkeypatch):
+    """`reconstruct(max_attempts=1)` must accept the first attempt's result
+    even when it doesn't reach the 'done' threshold, instead of continuing
+    down the retry ladder the way an unbounded call would."""
+    import pycolmap
+
+    rec = pycolmap.Reconstruction()
+    cam = pycolmap.Camera.create_from_model_id(
+        1, pycolmap.CameraModelId.SIMPLE_PINHOLE, 1300.0, 800, 600)
+    rec.add_camera_with_trivial_rig(cam)
+    for i in range(5):
+        rec.add_image_with_trivial_frame(
+            pycolmap.Image(name=f"{i}.jpg", camera_id=1, image_id=i + 1),
+            pycolmap.Rigid3d())
+
+    calls = {"n": 0}
+
+    def fake_run_attempt(*a, **kw):
+        calls["n"] += 1
+        # deliberately thin (not "done": nreg < 0.9*n) so an unbounded ladder
+        # would keep retrying with the next rung
+        return rec, 5, 1.0
+
+    monkeypatch.setattr(
+        sfm_mod, "_build_attempts",
+        lambda n, size: [
+            {"label": "first", "matcher": "exhaustive", "overlap": 12,
+             "size": size, "shared_camera": False},
+            {"label": "second", "matcher": "exhaustive", "overlap": 12,
+             "size": size, "shared_camera": False},
+            {"label": "third", "matcher": "exhaustive", "overlap": 12,
+             "size": size, "shared_camera": False},
+        ])
+    monkeypatch.setattr(sfm_mod, "_run_attempt", fake_run_attempt)
+
+    photos_dir = tmp_path / "photos"
+    photos_dir.mkdir()
+    for i in range(10):
+        (photos_dir / f"{i}.jpg").write_bytes(b"x")
+    workdir = tmp_path / "work"
+
+    ctx = sfm_mod.reconstruct(photos_dir, workdir, reuse=False,
+                              max_attempts=1, log=lambda *_: None)
+    assert calls["n"] == 1
+    assert ctx.rec is rec
+
+    # sanity: without the cap, the same thin result keeps the ladder going
+    calls["n"] = 0
+    sfm_mod.reconstruct(photos_dir, workdir, reuse=False, log=lambda *_: None)
+    assert calls["n"] == 3

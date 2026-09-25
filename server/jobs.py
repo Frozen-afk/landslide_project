@@ -296,6 +296,13 @@ def load_persisted_jobs() -> None:
                     capture = json.loads(cp.read_text())
                 except Exception:
                     capture = None
+            if capture and (capture.get("preview") or {}).get("status") == "running":
+                # S4/§9.1: the worker that was running this preview died with
+                # the server; nothing will ever finish it, so a poller
+                # waiting on "running" would hang forever. The manifest is
+                # rewritten on the job's next save_capture() (e.g. the next
+                # preview request), so this in-memory patch is enough.
+                capture["preview"]["status"] = "stale"
             job = Job(d.name, created=state.get("created"),
                       status=state.get("status", "reconstructing"),
                       error=state.get("error"), log=state.get("log"),

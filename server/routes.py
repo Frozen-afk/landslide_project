@@ -275,6 +275,60 @@ def delete_capture_photo(job_id: str, photo_uuid: str):
     return {"excluded": True}
 
 
+@router.post("/api/jobs/{job_id}/capture/preview")
+def start_capture_preview(job_id: str):
+    """S4 (§9.2): one preview SfM attempt (cheap: 1000 px, single attempt)
+    on the kept photos so far, run in the same worker pool as reconstruction
+    (`executor.submit_job`) so a crash there can't take the server down. One
+    preview in flight per job; a request that arrives mid-run is queued to
+    re-run once the current one finishes, per §9.2's own spec."""
+    job = _get_capturing_job(job_id)
+    with job.lock:
+        photos = sorted((p for p in job.capture["photos"] if not p["excluded"]),
+                        key=lambda p: p["seq"])
+        if len(photos) < 3:
+            raise HTTPException(400, "need at least 3 kept photos to preview")
+        preview = job.capture.get("preview")
+        if preview and preview.get("status") == "running":
+            preview["rerun_after"] = True
+            job.save_capture()
+            return {"running": True}
+        job.capture["preview"] = {"status": "running", "started": time.time(),
+                                  "finished": None, "n_photos": len(photos),
+                                  "report": None, "error": None}
+        originals_order = [{"uuid": p["uuid"], "seq": p["seq"], "arm": p["arm"]}
+                           for p in photos]
+        marker_side_m = job.capture["marker_side_m"]
+        marker_dict = job.capture["marker_dict"]
+        roi = job.capture.get("roi")
+    job.save_capture()
+    executor.submit_job(job, worker.run_preview, job.capture_dir, originals_order,
+                        marker_side_m, marker_dict, roi, on_done=_on_preview_done)
+    return {"queued": True}
+
+
+def _on_preview_done(job: Job, result: dict | None, exc: BaseException | None) -> None:
+    rerun = False
+    with job.lock:
+        preview = (job.capture or {}).get("preview")
+        if preview is None:
+            return
+        rerun = bool(preview.pop("rerun_after", False))
+        if exc is not None:
+            preview.update(status="error", finished=time.time(), error=str(exc),
+                           report=None)
+        else:
+            preview.update(status="done", finished=time.time(), report=result,
+                           error=None)
+    job.save_capture()
+    job.say("preview reconstruction done" if exc is None else f"preview failed: {exc}")
+    if rerun and job.status == "capturing":
+        try:
+            start_capture_preview(job.id)
+        except HTTPException as e:
+            job.say(f"preview re-run skipped: {e.detail}")
+
+
 @router.post("/api/jobs/{job_id}/capture/finalize")
 async def finalize_capture(job_id: str, spec: CaptureFinalizeRequest):
     with JOBS_LOCK:
@@ -298,10 +352,19 @@ async def finalize_capture(job_id: str, spec: CaptureFinalizeRequest):
                         key=lambda p: p["seq"])
         if len(photos) < 3:
             raise HTTPException(400, "need at least 3 kept photos to finalize")
-        # no preview report exists yet (S4), so nothing can block finalize
+        # S4: block on the most recent finished preview's own findings, if
+        # any — a job that never ran a preview (or whose preview is still
+        # running/stale) has nothing to block on, same as before S4.
+        preview = job.capture.get("preview")
         blocking_ids: list[str] = []
+        blocking: list[dict] = []
+        if preview and preview.get("status") == "done" and preview.get("report"):
+            report = preview["report"]
+            blocking_ids = list(report.get("blocking", []))
+            by_id = {c["id"]: c["text"] for c in report.get("checks", [])}
+            blocking = [{"id": rid, "text": by_id.get(rid, rid)} for rid in blocking_ids]
         if blocking_ids and not spec.override:
-            raise HTTPException(409, {"blocking": blocking_ids})
+            raise HTTPException(409, {"blocking": blocking})
         job.status = "reconstructing"   # marks the session closed to further PUT/DELETE
     job.save_state()
 
@@ -682,6 +745,12 @@ def delete_job(job_id: str):
         if job.status in BUSY_STATUSES or job.status == "reconstructing":
             raise HTTPException(409, "the server is busy on this job — wait "
                                      "for it to finish before deleting it")
+        # §9.1: a running preview writes into capture/preview/ from a worker
+        # process; same reasoning as the reconstructing/measuring guard above.
+        if job.capture and (job.capture.get("preview") or {}).get("status") == "running":
+            raise HTTPException(409, "a preview reconstruction is running for "
+                                     "this job — wait for it to finish before "
+                                     "deleting it")
     with JOBS_LOCK:
         JOBS.pop(job_id, None)
         for key in [k for k in _photo_cache if k[0] == job_id]:

@@ -287,7 +287,8 @@ def _attempt_score(nreg: int, npts: int, focal_ratio: float = 1.0) -> tuple[int,
 
 
 def reconstruct(photos_dir, workdir, max_image_size: int = 2400,
-                log: Log = print, reuse: bool = False) -> ReconCtx:
+                log: Log = print, reuse: bool = False,
+                max_attempts: int | None = None) -> ReconCtx:
     """Run the full COLMAP incremental SfM pipeline on a folder of photos.
 
     If too few images register with the fast default settings, progressively
@@ -297,6 +298,12 @@ def reconstruct(photos_dir, workdir, max_image_size: int = 2400,
     same zoom but EXIF focals are missing/unstable). The ladder only stops
     early on an attempt that registers ~all images AND triangulates at
     least MIN_SPARSE_PER_IMG points per image.
+
+    `max_attempts` (GUIDED_CAPTURE_PLAN.md §9.2, S4): caps the ladder to its
+    first N rungs — the guided-capture preview reconstruction uses
+    `max_attempts=1` (one cheap attempt, whatever it yields) instead of the
+    full retry ladder the final reconstruction pays for. `None` (default)
+    keeps every existing caller's behavior unchanged.
     """
     photos_dir = Path(photos_dir)
     workdir = Path(workdir)
@@ -317,6 +324,8 @@ def reconstruct(photos_dir, workdir, max_image_size: int = 2400,
         raise ValueError(f"need at least 3 photos, found {n}")
 
     attempts = _build_attempts(n, max_image_size)
+    if max_attempts is not None:
+        attempts = attempts[:max_attempts]
 
     best = None          # (score, rec, label, kp, attempt_idx, focal_ratio)
     last_idx = -1

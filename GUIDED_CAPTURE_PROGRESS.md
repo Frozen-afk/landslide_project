@@ -1296,3 +1296,256 @@ resolves, matching S1's own smoke-test pattern).
   (§9.4). These are the remainder of the plan's full S3 row plus pieces of
   S4/S5 the top-down sketch depends on.
 - **S4–S7 remain not started**, per the instruction for this pass.
+
+## S4 — Preview SfM (`GUIDED_CAPTURE_PLAN.md` §12 stage table, row 4)
+
+**Base:** `main` @ `b056abd`. This pass changed `landslide/sfm.py`,
+`landslide/capture.py`, `server/worker.py`, `server/routes.py`,
+`server/jobs.py`, added `tests/test_capture_preview.py` and
+`tests/test_capture_preview_routes.py`, and extended `tests/test_sfm.py`.
+No `server/static/*` (UI) file was touched — the stage-table's S4 row scope
+is backend only (`reconstruct(max_attempts=…)`, `worker.run_preview`,
+`preview_report`, finalize blocking); a preview panel in the capture UI is
+S5/S6b territory (§9.4's "Preview panel" bullet lists the top-down sketch
+and recapture list, both S5-only). No gate, threshold, or existing endpoint
+was changed. **S5–S7 not started**, per the instruction for this pass.
+
+### Change made
+
+Per the stage-table scope ("`reconstruct(max_attempts=…)`, `worker.run_preview`,
+`preview_report` (registration, collinearity, focal, elevation, azimuth,
+stereo pairs, marker scale, datum estimate §3a.4), finalize blocking plus
+override"):
+
+- **`landslide/sfm.py`**: `reconstruct` gained `max_attempts: int | None = None`,
+  which slices `_build_attempts(...)` to its first N rungs before the retry
+  loop runs — exactly §9.2's own spec ("There is no other SfM change").
+  `worker.run_preview` calls it with `max_attempts=1`. A bad-focal attempt
+  can still insert and run its one focal-locked retry (F12) even under
+  `max_attempts=1`, since that insertion happens after the ladder is sliced;
+  left as is — disabling it would reintroduce a known failure mode for a
+  case (diverged per-camera focal) the preview should also want to catch.
+- **`landslide/capture.py`**: new `preview_report(ctx, arms=None,
+  marker_side_m=None, marker_dict="auto", roi=None, log=print)` — the T3
+  checks (§4.3), each reusing an existing diagnostic instead of recomputing
+  it: `sfm._camera_center_collinearity`/`_focal_spread` (G4/G3),
+  `densify.estimate_up` (up-vector agreement), `densify.select_pairs` (G1
+  stereo-pair-share proxy), `scaling.aruco_scale` in a try block (G2/G7 +
+  the "marker raised" block), and `ortho.select_region_world` +
+  `volume.prism_volume` for the §3a.4 datum estimate (see the calibration
+  finding below). Registration/connectivity and azimuth-arm-separation have
+  no existing gate id (`gates.RULES` only covers ids `evaluate_gates` can
+  fire, and neither of these ever reaches `evaluate_gates` — registration
+  failure raises before any gate runs, and G6 has no separate "azimuth"
+  sub-id), so two new ids (`T3_registration`, `T3_azimuth`) live in a
+  parallel `T3_MESSAGES` dict, same pattern as `T1_MESSAGES`. Every other
+  check reuses `gates.RULES`' id and `action` text verbatim, prefixed
+  "Predicted: " (§7a.2). Returns `{...raw numbers..., "checks":
+  [{id, level, text}], "blocking": [ids with level=="block"]}`.
+  `roi` is accepted (forward-declared in §9.2's own worker signature) but
+  never used to lift a traced polygon — the ROI-tap endpoint is S5 scope, so
+  S4 always falls back to §5.1's own default (convex hull of the central
+  50% of the sparse cloud's ground-plane projection).
+- **`server/worker.py`**: `run_preview(job_id, photos_dir, work_dir, queue,
+  capture_dir, originals_order, marker_side_m, marker_dict, roi)` — stages a
+  symlink (falling back to a copy) of each kept original into
+  `capture/preview_stage/{seq:03d}_{uuid}.jpg`, reconstructs into
+  `capture/preview/` at `max_image_size=1000, max_attempts=1`, then calls
+  `preview_report`. `photos_dir`/`work_dir` are `submit_job`'s fixed
+  positional args and are unused, per §9.2's own note. `marker_dict` is an
+  addition to the plan's literally-written signature (`job_id, photos_dir,
+  work_dir, queue, capture_dir, originals_order, marker_side_m, roi`) — the
+  session already stores a `marker_dict` (S2) and the marker check needs it;
+  the plan's own worker-signature sentence predates S2/S3's actual session
+  schema, so this is treated as an omission, not a deviation to flag as a
+  gap.
+- **`server/routes.py`**: `POST /api/jobs/{id}/capture/preview` — needs ≥3
+  kept photos (400 otherwise); one preview in flight per job (a request
+  during a run sets `preview["rerun_after"] = True` and returns
+  `{"running": true}`, per §9.2); otherwise starts a `{"status": "running",
+  ...}` manifest entry and calls `executor.submit_job(job, worker.run_preview,
+  ...)` — the same crash-isolated pool every other heavy stage uses.
+  `_on_preview_done` records `{"status": "done", "report": ...}` or
+  `{"status": "error", "error": ...}`, and re-submits once more if
+  `rerun_after` was set while it ran. `POST .../finalize` now reads the most
+  recently *finished* preview's `report["blocking"]` (a job that never ran a
+  preview, or whose preview is still running/stale, blocks on nothing — same
+  as before S4) and refuses with `409 {"blocking": [{id, text}]}` unless
+  `override=true`; `DELETE /api/jobs/{id}` also refuses while a preview is
+  running (same reasoning as the existing reconstructing/measuring guard).
+- **`server/jobs.py`**: `load_persisted_jobs` marks a `preview.status ==
+  "running"` manifest as `"stale"` on reattach (§9.1: "a preview interrupted
+  by a restart is marked stale") — the worker that was running it died with
+  the server, so nothing will ever resolve it; the next `POST .../preview`
+  simply starts a fresh one (`"stale" != "running"` so it isn't mistaken for
+  one already in flight).
+
+### §12b.6 calibration: the datum estimate does not discriminate, and is not surfaced
+
+Ran `preview_report` against the cached `data/bench/{twosided,twosided_b,
+twosided_cal}/work` reconstructions (already on disk from earlier stages'
+own benchmark runs — no new SfM, same read-only reuse pattern S0/S0b/S0c/G9
+all used) plus one real, from-scratch 1000 px/`max_attempts=1` preview
+reconstruction of `twosided_cal`'s 38 images, to check §12b.6's fixed rule:
+say "unstable" on `twosided`/`twosided_b` (final G9 fires on both), say
+nothing on `twosided_cal` (final G9 silent).
+
+| Scene | source | datum ratio (`dh × roi_area ÷ \|net\|`) | final G9 |
+| --- | --- | --- | --- |
+| `twosided_cal` | cached full-res ctx | 0.067 | silent (`ok`) |
+| `twosided_cal` | real 1000px/1-attempt preview | 0.070 | silent (`ok`) |
+| `twosided_b` | cached full-res ctx | 0.557 | fires (`indicative`) |
+| `twosided` | cached full-res ctx | 0.449 | fires (`indicative`) |
+
+All three exceed the 0.05 gate ratio, including `twosided_cal`, which must
+stay silent. The real 1000px preview's ratio (0.070) is close to the cached
+full-res proxy's (0.067) — elevation likewise agrees to 0.3° (17.99° vs
+17.72°) — so the calibration failure is not an artifact of using the cached
+higher-resolution reconstruction as a stand-in for the true preview; the two
+methods agree with each other, they just both disagree with the required
+discrimination.
+
+**Root cause:** with no ROI tap (S5 — the endpoint doesn't exist yet), the
+only ROI this stage can use is §5.1's own default (convex hull of the
+central 50% of the sparse cloud's ground-plane projection). Its centroid
+lands close enough to the true bowl centre to be usable for the
+elevation/azimuth checks, but the polygon itself is about 3x the true
+polygon's area (98.5 m² true vs measured ~309 m²) — it picks up a ring of
+surrounding terrain along with the slide, which both enlarges the `roi_area`
+term and shifts what counts as the "0.5-2.5 m rim band" outward onto ground
+that was never meant to be the datum's own rim. That is enough to swamp the
+ratio's own discrimination between a scene whose datum the rim predicts and
+one it doesn't.
+
+Per §12b.6's own fixed decision rule ("If either fails, the T3 datum
+estimate is dropped from the UI, not re-tuned"): `datum_estimate`'s raw
+numbers (`datum`, `datum_holdout_m`, `datum_holdout_windows`,
+`net_volume_m3`, `roi_area_m2`, `ratio`) are still computed and returned —
+useful diagnostic data, and there for whoever revisits this once S5 lands a
+real ROI — but the ratio is never turned into a `checks` entry.
+`T3_MESSAGES["T3_datum_unstable"]` is dead code until then;
+`tests/test_capture_preview.py::test_datum_estimate_never_becomes_a_check`
+pins this so a future change can't silently re-enable it without deciding
+to. No gate, threshold, or the plan's own 0.05 ratio was changed to make
+this "pass" — it is reported as a miss, the same as S0b's/S1's/S2's own
+honestly-recorded gaps.
+
+**Elevation is also an approximation, not exactly re-validated against the
+plan's own recorded figures**, for the same ROI-centroid reason: S0c's own
+progress notes record `twosided_cal`'s median camera elevation as 22.9-23.1°
+(from the ground-truth bowl centroid); this stage's proxy gives 17.7-18.0°
+(from the central-50%-of-sparse-cloud centroid). `DATUM_STABILITY_
+PROGRESS.md`'s own S0b section already documents this exact quantity
+disagreeing by several degrees between two *ground-truth-based* methods
+(16.5° / 19.25° / 23.1°, depending on which reference point counts as "the
+ROI centroid") — so a sparse-cloud-density-based proxy landing in the same
+general band, without an actual ROI, is treated as within the range of a
+known, pre-existing measurement ambiguity, not a new bug. It only ever
+produces a `warn` (`G5_partial`), never a `block`, so it cannot cause a
+false-block (§11 criterion 3's own requirement).
+
+### Focused validation
+
+```
+.venv/bin/python -m pytest -q -k "not e2e"
+```
+
+Result: **235 passed, 3 skipped, 23 deselected** — S3's own baseline was 209
+passed; the 26 new tests (1 in `tests/test_sfm.py`, 17 in
+`tests/test_capture_preview.py`, 8 in `tests/test_capture_preview_routes.py`)
+account for the difference exactly, and every pre-existing assertion still
+passes unmodified. (The "worker process crashed (native crash)" log line is
+`test_worker_crash_is_isolated_and_pool_recovers` deliberately killing a
+worker — pre-existing, documented, not a new failure.)
+
+`tests/test_capture_preview.py` covers `preview_report`'s own logic: three
+pure-helper tests (`_circular_mean_deg`, `_circular_diff_deg`,
+`_default_roi_polygon`), nine threshold/level tests on a hand-built flat
+synthetic scene (registration block on a missing arm, azimuth-separation
+block/no-block, collinearity block, focal-spread warn, stereo-pair-share
+warn, low-elevation warn, marker-raise block, marker-warning warn, and the
+datum-estimate-never-a-check pin above) with `_camera_center_collinearity`/
+`_focal_spread`/`select_pairs`/`aruco_scale` monkeypatched (each already has
+its own dedicated tests elsewhere — this file tests `preview_report`'s
+threshold wiring, not those functions' own correctness), and three
+parametrized tests against the real cached `twosided`/`twosided_b`/
+`twosided_cal` reconstructions asserting `blocking == []` on all three
+(criterion 3's "false-block = 0" requirement, the part of criterion 3 this
+stage can actually check without S5's coverage/void calibration).
+`tests/test_capture_preview_routes.py` covers the backend plumbing
+(preview lifecycle, rerun-while-running, finalize's blocking gate with and
+without `override`, the delete-while-running guard, stale-on-restart) with
+`executor.submit_job` monkeypatched, same pattern as
+`tests/test_capture_session.py`. `tests/test_sfm.py` gained one test pinning
+`max_attempts`' slicing behavior.
+
+### Latency (criterion 5, T3 ≤ 60s for 30 photos at 1000px on a 4-core laptop)
+
+One real, from-scratch preview reconstruction (not the cached-ctx shortcut
+above): `twosided_cal`'s 38 images, staged and reconstructed exactly as
+`worker.run_preview` does (`max_image_size=1000, max_attempts=1`), on this
+dev box (12-core, more than the plan's "4-core laptop" target; `SFM_THREADS`
+still caps extraction at 4 either way). Result: **95.5 s** for
+`sfm.reconstruct` (the ladder picked "global (GLOMAP)" first, since n≥25) +
+**15.7 s** for `preview_report` (dominated by `aruco_scale`'s own per-view
+marker decode/detection and `select_pairs`) = **111.2 s total for 38
+photos** — scaling down to 30 photos (×30/38) gives roughly 88 s, still
+comfortably over the 60 s budget even on hardware stronger than the named
+target. **This criterion is not met** on this box; recorded as a real
+number, not adjusted. Whether this is a real field-blocking cost or an
+artifact of this specific dev machine's COLMAP build is a question for S7's
+own device/field validation, not something this pass attempts to fix (S4's
+scope is the preview mechanism's correctness, not its performance — no
+profiling or ladder-tuning was done).
+
+### Deviations from the plan's S4 description
+
+- **No frontend.** The stage-table's S4 row lists no `server/static/*`
+  file, and §9.4's "Preview panel" (status, top-down sketch, recapture list,
+  predicted G-class) is explicitly built from S5's coverage map and ROI —
+  none of which exists yet. `POST .../capture/preview` and the manifest's
+  `preview` field are fully usable via `GET .../capture` today; wiring a
+  "Run preview" button into `capture.js` is left for whoever starts S5/S6b,
+  consistent with how S2 (also backend-only) left its own UI wiring to S3.
+- **The §3a.4/§12b.6 datum estimate is computed but not surfaced** — see the
+  calibration finding above. This is the plan's own sanctioned outcome for a
+  failed calibration, not a shortcut.
+- **The elevation/azimuth proxy uses the sparse-cloud density centroid, not
+  a traced ROI** — again, the ROI tap is S5 scope; §5.1's own "central 50%"
+  fallback formula is what this pass implements, and its measured accuracy
+  gap is documented above rather than hidden.
+- **No coverage/void prediction** — the stage table's own S4 row explicitly
+  excludes it ("Criteria 3 (except the G6 prediction)"); §5's cell map, ROI
+  tap and `c_rej`/`c_ok` calibration are S5's row, not S4's.
+- **`preview_report`'s stereo-pairs check reuses `densify.select_pairs`
+  as-is** (no `StereoConfig` tuning for the 1000px preview resolution) —
+  the plan names no separate calibration for this proxy, and it only ever
+  warns, never blocks.
+- **Field/real-device criteria (5's T0/T1 pieces, 6(e), 8) are unaffected by
+  this pass** — S4 touches none of that code; they remain S3/S7's own open
+  items, unchanged.
+
+### Acceptance status
+
+- **`reconstruct(max_attempts=…)`, `worker.run_preview`, `preview_report`,
+  finalize blocking plus override** — all built and tested, per the
+  stage-table's own scope list.
+- **Criterion 3 (except the G6 prediction)**: the block/no-block half is
+  met — see the parametrized real-reconstruction tests (false-block = 0 on
+  `twosided`/`twosided_b`/`twosided_cal`) and the hand-built threshold
+  tests for every other preset class named in criterion 3's bullet list
+  (`collinear`→G4, `nadir`/`oblique60`→marker-raise, `descending`/`sparse8`
+  → elevation/registration, `arc`-family → azimuth-separation). Not
+  re-verified against real reconstructions of those other presets in this
+  pass (no cached `work/` exists for them, and re-running their SfM was out
+  of this pass's budget) — the hand-built fixture tests are the coverage
+  for those thresholds; a slow `tests/test_e2e_capture.py` replaying every
+  preset through the real endpoint end-to-end remains S5's own criterion-3
+  "full" checkbox, per the stage table.
+- **Criterion 5 (T3 latency)**: measured, not met on this dev box (111 s for
+  38 photos against a 60-for-30 budget) — see above.
+- **§12b.6 (datum-estimate calibration)**: run, failed to discriminate, and
+  handled exactly as the plan's own decision rule specifies (dropped from
+  `checks`, not re-tuned) — documented above, with a regression test pinning
+  it.
+- **S5–S7 remain not started**, per the instruction for this pass.

@@ -6,6 +6,7 @@ import {
   circularMeanDeg, circularDiffDeg, circularSpreadDeg,
   photoCountGuidance, markerViewGuidance, overlapGapGuidance,
   viewpointDiversityGuidance, cameraHeightGuidance, armTransitionGuidance,
+  nextCaptureSeq, lastCaptureArm, nextBackoffMs, pendingNotYetOnServer,
 } from "../server/static/js/capture_guidance.js";
 
 test("circular stats: mean, diff and spread handle the 0/360 wraparound", () => {
@@ -71,4 +72,34 @@ test("arm transition: hints while on the transition arm, warns on a weak bridge,
   assert.equal(armTransitionGuidance("T", null)[0].id, "arm_bridge_hint");
   assert.equal(armTransitionGuidance("B", false)[0].id, "arm_bridge");
   assert.equal(armTransitionGuidance("B", true).length, 0);
+});
+
+// S5 (§10 persistence and recovery): pure resume/retry-queue helpers.
+
+test("nextCaptureSeq: one past the highest seq across manifest and still-queued photos", () => {
+  assert.equal(nextCaptureSeq([], []), 0);
+  assert.equal(nextCaptureSeq([{ seq: 0 }, { seq: 1 }], []), 2);
+  // a queued-but-not-yet-acked photo can hold the highest seq after a crash
+  assert.equal(nextCaptureSeq([{ seq: 0 }], [{ seq: 3, arm: "A" }]), 4);
+});
+
+test("lastCaptureArm: resumes on the arm of the highest-seq photo, 'A' when empty", () => {
+  assert.equal(lastCaptureArm([], []), "A");
+  assert.equal(lastCaptureArm([{ seq: 0, arm: "A" }, { seq: 1, arm: "T" }], []), "T");
+  // a still-queued photo taken after the last acked one wins
+  assert.equal(lastCaptureArm([{ seq: 0, arm: "A" }], [{ seq: 1, arm: "B" }]), "B");
+});
+
+test("nextBackoffMs: doubles on failure up to the 60s cap, resets to 2s on success", () => {
+  assert.equal(nextBackoffMs(2000, false), 4000);
+  assert.equal(nextBackoffMs(45000, false), 60000);
+  assert.equal(nextBackoffMs(60000, false), 60000);
+  assert.equal(nextBackoffMs(60000, true), 2000);
+});
+
+test("pendingNotYetOnServer: only uuids missing from the manifest need a re-send", () => {
+  const manifest = [{ uuid: "a" }, { uuid: "b" }];
+  assert.deepEqual(pendingNotYetOnServer(manifest, ["a", "c"]), ["c"]);
+  assert.deepEqual(pendingNotYetOnServer(manifest, ["a", "b"]), []);
+  assert.deepEqual(pendingNotYetOnServer([], ["a"]), ["a"]);
 });

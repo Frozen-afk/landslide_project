@@ -158,6 +158,43 @@ export function cameraHeightGuidance(pitchesByArm) {
   return out;
 }
 
+/** §10 resume ("return to the same arm and seq"): the next 1-based seq for
+ * a new photo, given the server manifest plus any not-yet-acked client
+ * queue entries — so a still-retrying photo's seq is never reused by a
+ * fresh one taken right after reload. `pendingMeta` is the `meta` object
+ * (`{seq, arm, client}`) of each `capture_store.js` queue entry. */
+export function nextCaptureSeq(manifestPhotos, pendingMeta) {
+  const seqs = [-1, ...manifestPhotos.map((p) => p.seq), ...pendingMeta.map((m) => m.seq)];
+  return Math.max(...seqs) + 1;
+}
+
+/** §10 resume: the arm of whichever photo (kept or still-queued) has the
+ * highest seq, so a reload lands back on the arm the user was shooting.
+ * "A" for a session with nothing yet. */
+export function lastCaptureArm(manifestPhotos, pendingMeta) {
+  const all = [...manifestPhotos.map((p) => ({ seq: p.seq, arm: p.arm })),
+               ...pendingMeta.map((m) => ({ seq: m.seq, arm: m.arm }))];
+  if (!all.length) return "A";
+  return all.reduce((best, p) => (p.seq > best.seq ? p : best)).arm;
+}
+
+/** §10 "retries with exponential backoff (2s -> 60s cap)": the next delay
+ * given the current one and whether the last drain of the queue fully
+ * succeeded (empties it) or stopped partway (still offline/server down). */
+export function nextBackoffMs(currentMs, ok) {
+  return ok ? 2000 : Math.min(60000, currentMs * 2);
+}
+
+/** §10 "re-queue any IndexedDB entries whose uuid is missing from the
+ * manifest": uuids the client still has queued that the server has NOT
+ * acked. The rest were accepted before the crash/refresh and only need a
+ * local ack, never a re-send — this is what keeps a retried queue from
+ * ever duplicating a photo the server already has. */
+export function pendingNotYetOnServer(manifestPhotos, pendingUuids) {
+  const known = new Set(manifestPhotos.map((p) => p.uuid));
+  return pendingUuids.filter((u) => !known.has(u));
+}
+
 /** §3 step 4 / §4.1 "arm_bridge" — guidance for the walk between arms.
  * `bridgeOk` is `null` when no bridge check has run yet, `false` when the
  * most recent bridge-eligible photo's T1 check flagged a weak link. */

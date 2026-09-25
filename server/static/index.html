@@ -57,6 +57,7 @@
   </div>
 
   <div id="capture-session" class="hidden">
+    <div id="capture-finalize-retry" class="capture-checks"></div>
     <div class="row" id="capture-arm-select">
       <span class="note">shooting:</span>
       <button data-arm="A" class="primary">arm A</button>
@@ -64,6 +65,7 @@
       <button data-arm="B">arm B</button>
     </div>
     <div id="capture-arm-counts" class="note">A: 0   transition: 0   B: 0   total: 0</div>
+    <div id="capture-pending" class="note"></div>
     <div class="row">
       <label>Take photo <input type="file" id="capture-take" accept="image/jpeg" capture="environment"></label>
       <button id="capture-retake">Exclude last photo</button>
@@ -71,6 +73,7 @@
     </div>
     <div id="capture-last-photo" class="capture-checks"></div>
     <div id="capture-sequence" class="capture-checks"></div>
+    <div id="capture-preview" class="capture-checks"></div>
   </div>
 </section>
 

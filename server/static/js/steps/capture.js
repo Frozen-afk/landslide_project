@@ -1,24 +1,34 @@
-/* Step: guided capture (GUIDED_CAPTURE_PLAN.md S3, approved slice — "sequence
- * and viewpoint guidance"). Wires the S2 backend (`POST /api/jobs/capture`,
- * `PUT/DELETE .../capture/photos/{uuid}`, `GET .../capture`,
- * `POST .../capture/finalize`) to a minimal take-a-photo UI, and turns the
- * server's per-photo (T1) and per-sequence (T2) results plus optional
- * client-side sensor readings into the actionable guidance in
- * capture_guidance.js: photo count, overlap gaps, marker views, arm
- * transition, camera height and viewpoint diversity.
+/* Step: guided capture. S3 (GUIDED_CAPTURE_PLAN.md, approved slice) wired
+ * the S2 backend to a take-a-photo UI with sequence/viewpoint guidance. This
+ * pass (S5, approved slice — "capture persistence and recovery") closes the
+ * gap S3 explicitly left open: a killed tab or dropped connection mid-upload
+ * used to lose that one photo ("the user sees the gap in the count and
+ * retakes"). Now every photo is written to IndexedDB (`capture_store.js`)
+ * before the upload is attempted, per §10's own stated principle:
  *
- * Out of this slice (see GUIDED_CAPTURE_PROGRESS.md "S3" for why): the
- * marker-placement checklist (§6), the rim-clearing step (§3 step 2), the
- * top-down sketch (§5.4, needs S4's preview SfM), and an IndexedDB
- * offline-blob queue (§10) — the server manifest (`GET .../capture`) is
- * used directly as the resume source of truth instead, per §9.1/§10's own
- * "the server manifest is the truth for accepted photos" principle.
+ *   "the server manifest is the truth for accepted photos. The client
+ *   IndexedDB holds only what the server has not acked. Photo identity is a
+ *   client-generated UUID plus sha256, so every retry is idempotent."
+ *
+ * This pass also restores preview status (§9.1 `capture.preview`,
+ * running/stale/done/error) and finalize-crash recovery (§10 "finalize
+ * interrupted") across a reload, and hands a session off to the normal
+ * job view once it has moved past `capturing` — so reopening the page mid-
+ * reconstruction doesn't strand the user on a capture screen that can only
+ * 409 on every photo action from here on.
+ *
+ * Still out of this slice (S4/S5/S6b territory, unchanged): the marker
+ * checklist (§6), the rim-clearing step (§3 step 2), the top-down sketch,
+ * coverage/recapture instructions (§5) and a "capture report" result row —
+ * the preview UI added here is only enough to trigger/observe/recover a
+ * preview run, not the coverage map it will eventually show.
  */
 import { state, $, LS_CAPTURE_KEY, LS_KEY } from "../state.js";
 import { api } from "../api.js";
 import { resumeJob } from "./upload.js";
 import * as cm from "../capture_metrics.js";
 import * as cg from "../capture_guidance.js";
+import * as store from "../capture_store.js";
 
 function uuidv4() {
   if (window.crypto && crypto.randomUUID) {
@@ -155,6 +165,145 @@ function renderLastPhoto(entry, t0) {
   $("capture-last-photo").innerHTML = row;
 }
 
+// --- retry-safe client persistence (§10) ---------------------------------
+// Every photo is written to IndexedDB before its upload is attempted. A
+// failed attempt leaves it queued; `scheduleRetry` drains the queue with
+// exponential backoff (2s -> 60s cap, §10) until it empties. A reload calls
+// `reconcilePending` once instead of waiting for the timer, so a session
+// resumed after a crash starts retrying immediately, not after a full
+// backoff delay.
+let backoffMs = 2000;
+let retryTimer = null;
+
+function renderPending(n) {
+  $("capture-pending").textContent = n
+    ? `${n} photo${n === 1 ? "" : "s"} waiting for server checks`
+    : "";
+}
+
+async function uploadEntry(uuid, blob, meta) {
+  const fd = new FormData();
+  fd.append("file", blob, `${uuid}.jpg`);
+  fd.append("meta", JSON.stringify(meta));
+  return api(`/api/jobs/${state.capture.jobId}/capture/photos/${uuid}`, { method: "PUT", body: fd });
+}
+
+function mergeManifestEntry(uuid, meta, resp) {
+  if (state.capture.photos.some((p) => p.uuid === uuid)) return;
+  state.capture.photos.push({ uuid, seq: meta.seq, arm: meta.arm, client: meta.client,
+                              server: resp.server, verdict: resp.verdict,
+                              reasons: resp.reasons, excluded: false });
+  state.capture.photos.sort((a, b) => a.seq - b.seq);
+}
+
+/** Try every queued entry once, in order. Stops at the first failure (the
+ * network or server is presumably still down) rather than racing the rest
+ * — returns true only if the whole queue drained. */
+async function drainQueue() {
+  const items = await store.listPending(state.capture.jobId);
+  if (!items.length) return true;
+  let freshSequence = null;
+  for (const item of items) {
+    let resp;
+    try { resp = await uploadEntry(item.uuid, item.blob, item.meta); }
+    catch (e) { renderPending((await store.listPending(state.capture.jobId)).length); return false; }
+    await store.ack(item.uuid);
+    mergeManifestEntry(item.uuid, item.meta, resp);
+    freshSequence = resp.sequence || freshSequence;
+  }
+  renderArms();
+  renderSequencePanel(freshSequence || lastSequence);
+  renderPending(0);
+  return true;
+}
+
+function scheduleRetry() {
+  clearTimeout(retryTimer);
+  retryTimer = setTimeout(async () => {
+    const ok = await drainQueue();
+    backoffMs = cg.nextBackoffMs(backoffMs, ok);
+    const remaining = await store.listPending(state.capture.jobId);
+    if (remaining.length) scheduleRetry();
+  }, backoffMs);
+}
+
+/** On resume: ack whatever the server already has (avoids re-sending a
+ * photo that made it through before the crash/refresh — "avoid duplicate
+ * photos"), then retry only what's genuinely still missing, immediately
+ * rather than waiting for the first backoff tick. */
+async function reconcilePending(jobId, manifestPhotos, pending) {
+  if (!pending.length) { renderPending(0); return; }
+  const missing = new Set(cg.pendingNotYetOnServer(manifestPhotos, pending.map((p) => p.uuid)));
+  for (const item of pending) {
+    if (!missing.has(item.uuid)) await store.ack(item.uuid);
+  }
+  const remaining = await store.listPending(jobId);
+  renderPending(remaining.length);
+  if (!remaining.length) return;
+  backoffMs = 2000;
+  const ok = await drainQueue();
+  if (!ok) scheduleRetry();
+}
+
+// --- preview-state restoration (§9.1 `capture.preview`, §10 "server
+// restart during preview") ---------------------------------------------
+let previewPollTimer = null;
+
+function renderPreview(preview) {
+  clearTimeout(previewPollTimer);
+  const el = $("capture-preview");
+  const runBtn = '<button id="capture-preview-run">Run preview</button>';
+  if (!preview) {
+    el.innerHTML = runBtn;
+  } else if (preview.status === "running") {
+    el.innerHTML = '<span class="note">preview reconstruction running…</span>';
+    previewPollTimer = setTimeout(pollPreview, 1200);
+  } else if (preview.status === "stale") {
+    el.innerHTML = '<span class="warn">preview was interrupted by a server restart.</span> ' +
+      '<button id="capture-preview-run">Re-run preview</button>';
+  } else if (preview.status === "error") {
+    el.innerHTML = `<span class="err">preview failed: ${esc(preview.error || "")}</span> ` +
+      '<button id="capture-preview-run">Re-run preview</button>';
+  } else {
+    const blocking = (preview.report && preview.report.blocking) || [];
+    el.innerHTML = (blocking.length
+        ? `<span class="warn">preview: ${blocking.length} item(s) predicted to block finalize</span>`
+        : '<span class="ok">preview: no blocking items predicted</span>') +
+      ' <button id="capture-preview-run">Re-run preview</button>';
+  }
+  const btn = $("capture-preview-run");
+  if (btn) btn.addEventListener("click", () => runPreview().catch((e) => alert(e.message)));
+}
+
+async function runPreview() {
+  $("capture-preview").innerHTML = '<span class="note">starting preview…</span>';
+  try {
+    await api(`/api/jobs/${state.capture.jobId}/capture/preview`, { method: "POST" });
+  } catch (e) {
+    $("capture-preview").innerHTML = `<span class="err">${esc(e.message)}</span> ` +
+      '<button id="capture-preview-run">Run preview</button>';
+    $("capture-preview-run").addEventListener("click", () => runPreview().catch((err) => alert(err.message)));
+    return;
+  }
+  pollPreview();
+}
+
+async function pollPreview() {
+  let snap;
+  try { snap = await api(`/api/jobs/${state.capture.jobId}/capture`); }
+  catch (e) { previewPollTimer = setTimeout(pollPreview, 1200); return; }
+  renderPreview(snap.preview);
+}
+
+// --- finalize recovery (§10 "finalize interrupted") -----------------------
+function renderFinalizeRetry(errorMsg) {
+  const el = $("capture-finalize-retry");
+  if (!errorMsg) { el.innerHTML = ""; return; }
+  el.innerHTML = `<span class="err">Finalize was interrupted: ${esc(errorMsg)}</span> ` +
+    '<button id="capture-finalize-retry-btn">Retry finalize</button>';
+  $("capture-finalize-retry-btn").addEventListener("click", () => finish());
+}
+
 // --- session lifecycle ----------------------------------------------------
 async function startSession() {
   const marker_side_m = parseFloat($("capture-marker-side").value) || 0.5;
@@ -170,17 +319,44 @@ async function startSession() {
   $("capture-session").classList.remove("hidden");
   renderArms();
   renderSequencePanel({});
+  renderPreview(null);
+  renderFinalizeRetry(null);
+  renderPending(0);
 }
 
 async function loadSession(id) {
   let snap;
-  try { snap = await api(`/api/jobs/${id}/capture`); }
+  try { snap = await api(`/api/jobs/${id}`); }
   catch (e) { localStorage.removeItem(LS_CAPTURE_KEY); return; }
-  state.capture = { jobId: id, arm: "A", seq: snap.photos.length, photos: snap.photos };
+  if (!snap.capture) { localStorage.removeItem(LS_CAPTURE_KEY); return; }
+
+  if (snap.status !== "capturing" && snap.status !== "error") {
+    // Finalize already went through (this session moved on to reconstructing
+    // / ready / etc. before the reload) — the capture screen would now 409
+    // on every photo action, so hand off straight to the normal job view.
+    localStorage.removeItem(LS_CAPTURE_KEY);
+    localStorage.setItem(LS_KEY, id);
+    resumeJob(id);
+    return;
+  }
+
+  const manifestPhotos = snap.capture.photos || [];
+  const pending = await store.listPending(id);
+
+  state.capture = {
+    jobId: id,
+    arm: cg.lastCaptureArm(manifestPhotos, pending.map((p) => p.meta)),
+    seq: cg.nextCaptureSeq(manifestPhotos, pending.map((p) => p.meta)),
+    photos: manifestPhotos,
+  };
   $("capture-setup").classList.add("hidden");
   $("capture-session").classList.remove("hidden");
   renderArms();
-  renderSequencePanel(snap.sequence || {});
+  renderSequencePanel(snap.capture.sequence || {});
+  renderPreview(snap.capture.preview);
+  renderFinalizeRetry(snap.status === "error" && !snap.capture.finalized ? snap.error : null);
+
+  await reconcilePending(id, manifestPhotos, pending);
 }
 
 async function takePhoto(file) {
@@ -190,6 +366,7 @@ async function takePhoto(file) {
   const client = { t: Date.now() };
   if (latestHeading != null) client.heading = latestHeading;
   if (latestPitch != null) client.pitch = latestPitch;
+  const meta = { seq, arm: state.capture.arm, client };
 
   let t0 = null;
   try {
@@ -205,25 +382,33 @@ async function takePhoto(file) {
     t0 = { blurV: cm.classifyBlur(cm.laplacianVariance(gray, w, h), null) };
   } catch (e) { /* T0 preview is best-effort; the server check is authoritative */ }
 
-  const fd = new FormData();
-  fd.append("file", file, `${uuid}.jpg`);
-  fd.append("meta", JSON.stringify({ seq, arm: state.capture.arm, client }));
+  // §10: write the blob plus metadata to IndexedDB *before* the upload
+  // attempt, so a tab killed mid-request still has it to retry on reload.
+  const persisted = await store.put(state.capture.jobId, uuid, file, meta);
 
   $("capture-last-photo").innerHTML = '<span class="note">checking photo…</span>';
   let resp;
   try {
-    resp = await api(`/api/jobs/${state.capture.jobId}/capture/photos/${uuid}`, { method: "PUT", body: fd });
+    resp = await uploadEntry(uuid, file, meta);
   } catch (e) {
-    $("capture-last-photo").innerHTML = `<span class="err">upload failed: ${esc(e.message)} — retake</span>`;
-    state.capture.seq--;
+    if (persisted) {
+      $("capture-last-photo").innerHTML =
+        `<span class="warn">upload queued — will retry automatically (${esc(e.message)})</span>`;
+      renderPending((await store.listPending(state.capture.jobId)).length);
+      scheduleRetry();
+    } else {
+      // No IndexedDB to fall back on: same behavior as before this pass.
+      $("capture-last-photo").innerHTML = `<span class="err">upload failed: ${esc(e.message)} — retake</span>`;
+      state.capture.seq--;
+    }
     return;
   }
-  const entry = { uuid, seq, arm: state.capture.arm, client, server: resp.server,
-                  verdict: resp.verdict, reasons: resp.reasons, excluded: false };
-  state.capture.photos.push(entry);
-  renderLastPhoto(entry, t0);
+  if (persisted) await store.ack(uuid);
+  mergeManifestEntry(uuid, meta, resp);
+  renderLastPhoto(state.capture.photos.find((p) => p.uuid === uuid), t0);
   renderArms();
   renderSequencePanel(resp.sequence || {});
+  renderPending((await store.listPending(state.capture.jobId)).length);
 }
 
 async function refreshFromServer() {
@@ -241,11 +426,16 @@ async function retakeLast() {
 }
 
 async function finish() {
+  const pending = await store.listPending(state.capture.jobId);
+  if (pending.length && !confirm(
+    `${pending.length} photo(s) are still uploading and would not be included. Finish anyway?`)) {
+    return;
+  }
   $("capture-finish").disabled = true;
   try {
-    // No preview report exists yet (S4), so finalize never actually blocks
-    // on gate grounds today (server/routes.py::finalize_capture) — `override`
-    // is accepted by the endpoint but has nothing to override in this slice.
+    // Preview blocking is enforced server-side (S4, server/routes.py::
+    // finalize_capture); `override` stays false here — an "expert" override
+    // control is S5/S6b's preview-panel scope, not this pass's.
     await api(`/api/jobs/${state.capture.jobId}/capture/finalize`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -256,6 +446,9 @@ async function finish() {
     alert("could not finalize: " + e.message);
     return;
   }
+  clearTimeout(retryTimer);
+  clearTimeout(previewPollTimer);
+  await store.clear(state.capture.jobId);
   localStorage.removeItem(LS_CAPTURE_KEY);
   localStorage.setItem(LS_KEY, state.capture.jobId);
   $("step-capture").classList.add("hidden");

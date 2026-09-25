@@ -1549,3 +1549,232 @@ profiling or ladder-tuning was done).
   `checks`, not re-tuned) — documented above, with a regression test pinning
   it.
 - **S5–S7 remain not started**, per the instruction for this pass.
+
+## S5 — Capture persistence and recovery (approved slice, §10)
+
+**Base:** `main` @ `be8642f`. This pass added `server/static/js/capture_store.js`
+and changed `server/static/js/steps/capture.js`, `server/static/js/capture_guidance.js`,
+`server/static/index.html`, `tests/test_capture_guidance.mjs`. No `landslide/`,
+`server/*.py`, gate, or threshold file was touched — every piece of server-side
+support this pass needed (idempotent uuid+sha256 PUT, `GET /api/jobs/{id}`
+carrying `status` and `capture` together, the finalize `status in ("capturing",
+"error")` retry guard, `preview.status -> "stale"` on restart) already shipped
+in S2/S4. This pass implements the client-side half of §10 that S3 explicitly
+deferred ("Not built: IndexedDB offline-blob queue / retry backoff (§10,
+`capture_store.js`)"), plus restoring preview status and finalize-crash
+recovery across a reload — **not** the plan's own numbered "S5" row (§12
+stage table: "Coverage and recapture," ROI tap, cell map, `c_rej`/`c_ok`
+calibration). That row is untouched by this pass; this is a separately
+approved slice reusing the "S5" label for what the task instruction named
+"capture persistence and recovery." **S6b, S7, and the plan's own S5
+(coverage/recapture) are not started.**
+
+### Change made
+
+- **`server/static/js/capture_store.js`** (new, no DOM, not `node --test`-able
+  in this repo — same "no fake-indexeddb dependency installed" gap S1/S2/S3
+  documented for headless-browser testing): an IndexedDB wrapper with exactly
+  the four functions §9.4 names — `put(jobId, uuid, blob, meta)`,
+  `listPending(jobId)`, `ack(uuid)`, `clear(jobId)` — one object store keyed
+  by `uuid`, indexed by `jobId`. Every function degrades to a safe no-op
+  (`put` returns `false`, reads return `[]`) if `indexedDB` throws or is
+  absent, so a photo still uploads directly; it just has no retry buffer if
+  that direct attempt fails, the same as S3's pre-existing behavior.
+- **`server/static/js/capture_guidance.js`**: four new pure functions, kept in
+  this module (not a new file) because they are exactly what its own header
+  already claims to be — sequence/manifest-derived guidance for the capture
+  UI, unit-testable with `node --test` — and `capture.js` already imports it
+  as `cg`:
+  - `nextCaptureSeq(manifestPhotos, pendingMeta)` / `lastCaptureArm(...)` —
+    §10 "return to the same arm and seq": the next seq and the arm to resume
+    on, computed over the server manifest **and** any still-queued (not yet
+    acked) client entries, so a photo stuck retrying after a crash can never
+    have its seq reused by a fresh one taken right after reload.
+  - `nextBackoffMs(currentMs, ok)` — §10 "retries with exponential backoff
+    (2s → 60s cap)", as a pure doubling/reset function.
+  - `pendingNotYetOnServer(manifestPhotos, pendingUuids)` — §10 "re-queue any
+    IndexedDB entries whose uuid is missing from the manifest": the set-
+    difference that decides which queued photos actually need a re-send
+    (the rest are acked locally without another PUT — the "avoid duplicate
+    photos" half of the instruction, on top of the server's own uuid+sha256
+    idempotency, which makes even a redundant re-send harmless but wasteful).
+- **`server/static/js/steps/capture.js`**: three additions, each mapped to one
+  named part of the task instruction:
+  - **Retry-safe client persistence + interrupted-upload recovery.**
+    `takePhoto` now calls `store.put(...)` (writing the blob and its
+    `{seq, arm, client}` meta to IndexedDB) *before* attempting the PUT, per
+    §10's own ordering ("the change handler writes the blob plus metadata to
+    IndexedDB **first**"). A failed PUT no longer tells the user to retake
+    (S3's behavior) when the write persisted — it shows "upload queued — will
+    retry automatically" and starts `scheduleRetry()`, which drains the
+    IndexedDB queue with `nextBackoffMs`'s 2s→60s backoff until it empties.
+    The old "ask the user to retake" path is kept as the fallback only when
+    `store.put` itself failed (no IndexedDB available) — `seq` is rolled back
+    in that case exactly as before, since nothing is queued to fill it.
+    `loadSession` now fetches `store.listPending(id)` on every reload and
+    calls `reconcilePending`, which acks (never re-sends) any uuid the
+    manifest already has, then immediately drains whatever's left — not
+    waiting for the first backoff tick, so a session resumed right after a
+    crash starts recovering at once.
+  - **Preview-state restoration.** `renderPreview(preview)` renders
+    `capture.preview`'s four states (`null`/`running`/`stale`/`done`/`error`)
+    into a new `#capture-preview` panel: running polls `GET .../capture` at
+    the same 1.2s cadence `upload.js`'s own poll uses; stale (§9.1: "a
+    preview interrupted by a restart is marked `stale`") and error both offer
+    a "Re-run preview" button that calls the existing S4
+    `POST .../capture/preview` endpoint; done shows whether its report
+    predicts a blocking item. This is deliberately not the plan's own S5/S6b
+    preview panel (§9.4: status, **top-down sketch**, **recapture list**,
+    predicted G-class per gate) — those need §5's coverage map and ROI tap,
+    neither of which exists. Without *some* trigger there is nothing to
+    restore state for (S4 shipped no frontend at all), so a minimal
+    "run/re-run" control was added to make the restoration observable and
+    usable — this is the one piece of this pass that is an addition rather
+    than a gap-closing, and is called out as such rather than silently
+    smuggled in under "recovery."
+  - **Finalize recovery.** `loadSession` now reads `status` (`GET
+    /api/jobs/{id}`, not just `GET .../capture`, precisely so `status` and
+    `capture` arrive together) instead of assuming the job is still
+    `capturing`. Three branches: (a) `status` is `capturing` or `error` →
+    show the capture screen (b) `status == "error"` and
+    `capture.finalized` is still `null` → §10 "finalize interrupted": render
+    `#capture-finalize-retry` with the server's error and a button that calls
+    the existing `finish()` (which POSTs finalize again; the server's own
+    `status in ("capturing", "error")` guard, S2, accepts the retry and
+    re-copies from `capture/originals`) (c) any other status (finalize
+    already succeeded and the job moved on to reconstructing/ready/etc.) →
+    hand off straight to `upload.js`'s `resumeJob` instead of showing a
+    capture screen that would now 409 on every photo action. Branch (c) is a
+    gap S3 had: reloading mid- or post-finalize showed a stale, broken
+    capture UI. `finish()` itself also now warns (`confirm()`) if photos are
+    still queued when "Finish and reconstruct" is pressed, since finalize
+    only ever copies from server-confirmed `capture/originals` — a queued
+    photo would silently not be included otherwise — and clears the
+    IndexedDB queue for the job on a successful finalize (nothing queued for
+    it can ever be uploaded again).
+- **`server/static/index.html`**: three new elements inside `#capture-session`
+  — `#capture-finalize-retry`, `#capture-pending`, `#capture-preview` — all
+  reusing the existing `.capture-checks`/`.note`/`.warn`/`.err`/`.ok` classes
+  from S1's panel (no `style.css` change, no cache-bust bump needed).
+- **`tests/test_capture_guidance.mjs`**: four new tests, one per pure
+  function above, covering the seq/arm resume logic (including the
+  crash-mid-upload case where a queued photo holds the highest seq), the
+  backoff doubling/cap/reset, and the manifest/queue set-difference.
+
+### Focused validation
+
+```
+node --test tests/test_capture_guidance.mjs tests/test_capture_metrics.mjs tests/test_coords.mjs
+node --check server/static/js/steps/capture.js server/static/js/capture_store.js \
+             server/static/js/capture_guidance.js
+.venv/bin/python -m pytest -q -k "not e2e"
+```
+
+Results: **26 passed** (4 new in `test_capture_guidance.mjs`), 0 failed.
+`node --check` clean on all three changed/new JS files. `pytest -q -k "not
+e2e"`: **235 passed, 3 skipped, 23 deselected** — identical to S4's own
+baseline (no `landslide/`/`server/*.py` file was touched, so this is the
+expected outcome, not a re-run of unrelated work).
+
+**Server-contract check (real server, not just the unit tests):** started
+`uvicorn server.main:app`, then drove the exact sequence `loadSession`/
+`reconcilePending`/`finish` depend on with a small script (not committed) —
+`POST /api/jobs/capture` → three `PUT .../capture/photos/{uuid}` calls (real
+fixture JPEGs from `tests/fixtures/capture_t1/`) → `GET /api/jobs/{id}`
+confirmed to carry `status == "capturing"` **and** the full `capture` manifest
+together (what `loadSession` reads in one call) → a same-uuid re-PUT confirmed
+still idempotent (3 manifest entries, not 4 — S2's own guarantee, re-checked
+here because this pass's recovery path leans on it not regressing) →
+`POST .../capture/finalize` → `GET /api/jobs/{id}` confirmed `status` moved to
+`reconstructing` (the exact signal branch (c) above hands off on). The test
+job was deleted afterward.
+
+### Failure-recovery evidence (§10 table, each row this pass covers)
+
+| §10 row | Mechanism exercised | Where |
+| --- | --- | --- |
+| Tab killed mid-upload | `store.put` before the PUT; on reload, `store.listPending` finds the uuid, `pendingNotYetOnServer` says it's missing from the manifest, `reconcilePending` re-sends it via the same uuid (idempotent) | `capture.js::reconcilePending`/`drainQueue`, pinned by the `pendingNotYetOnServer` unit test |
+| Page refresh / reopen | `loadSession` restores `arm`/`seq` from `nextCaptureSeq`/`lastCaptureArm` over manifest + pending, not just manifest length | `capture.js::loadSession`, pinned by the `nextCaptureSeq`/`lastCaptureArm` unit tests (crash-mid-upload case included) |
+| Upload fails / network drops | `scheduleRetry`/`drainQueue` with `nextBackoffMs`'s 2s→60s exponential backoff; UI shows the pending count via `#capture-pending` | `capture.js::scheduleRetry`, pinned by the `nextBackoffMs` unit test |
+| Duplicate send (retry after a lost response) | Unchanged server guarantee (S2's uuid+sha256 check); this pass's own contract check re-confirmed it (3 entries, not 4) rather than assuming it still holds | server-contract check above |
+| Server restart during capture | Unchanged server guarantee (S2's `load_persisted_jobs`); this pass adds no client dependency on the job staying in memory across a restart beyond what `GET /api/jobs/{id}` already reports | — |
+| Server restart during preview | `preview.status` flips to `"stale"` server-side (S4, unchanged); this pass's `renderPreview` is the first place that *shows* `"stale"` and offers "Re-run preview" — S4 shipped no frontend for it at all | `capture.js::renderPreview` |
+| Finalize interrupted | Server-side recovery unchanged (S2); this pass's `renderFinalizeRetry` is the first client-side surface for it — S2/S3 covered the server guard and a `TestClient` retry, never a browser-facing "retry finalize" action | `capture.js::renderFinalizeRetry` |
+| Two devices/tabs on one session | Not touched — §10 itself names this "not a supported workflow"; no change attempted | — |
+
+**6(e), the manual device test** ("kill the tab after 3 shots, reopen, see
+all 3 plus the correct arm and seq") — still not run on a real device (no
+headless browser in this environment, same limitation S1–S4 recorded), but
+the mechanism it exercises is now implemented and unit-tested piece by piece
+(above), and the reconcile/resume logic was exercised end-to-end against the
+real server in the contract check (upload → reload-equivalent `GET` →
+idempotent re-send check). This closes the *design* gap S3 left open
+("A full offline queue is a larger, separable addition and was not part of
+the approved slice"); a literal kill-the-tab-and-reopen run on a phone
+remains S7's own field-validation item.
+
+### Deviations from the instruction
+
+- **A minimal "Run preview" trigger was added.** The instruction says
+  "preview-state restoration," and S4 shipped the preview endpoint with *no*
+  client trigger at all (its own progress notes: "wiring a 'Run preview'
+  button into `capture.js` is left for whoever starts S5/S6b"). Restoring
+  state for a preview that can never be started from the UI would be
+  untestable and largely theoretical, so this pass added the smallest
+  possible trigger/status control — not the plan's own S5/S6b preview panel
+  (top-down sketch, recapture list, predicted G-class), which needs §5's
+  coverage map and stays unbuilt.
+- **No coverage/recapture calibration, ROI tap, or ROI-aware preview
+  changes.** The plan's own numbered "S5" (§12 stage table row 5) is a
+  different, larger piece of work with its own exit criteria (criteria 3
+  full, criterion 4, `c_rej`/`c_ok` calibration). This pass does not touch
+  any of it, per the instruction's explicit "do not begin S6b, S7" and its
+  own narrower description of what "S5" means here.
+- **`finish()`'s pre-existing finalize-blocking error display is unchanged.**
+  A 409 from `POST .../finalize` with a `{"blocking": [...]}` body renders as
+  `[object Object]` in the `alert()` (`api.js`'s `msg = detail || msg` when
+  `detail` is a dict, not a string) — a real S4-introduced display bug, but
+  it is about *showing blocking reasons*, not persistence/recovery, and
+  fixing it well belongs with S6b's "capture report" / blocking-display work
+  named in the stage table. Left as found, not silently patched.
+- **No IndexedDB unit tests.** Same gap S1/S2/S3 already recorded for every
+  DOM/IndexedDB-touching module in this repo: no `fake-indexeddb` or headless
+  browser dependency is installed, so `capture_store.js` itself is verified
+  only by `node --check` (syntax) and indirectly by the real-server contract
+  check (which exercises the manifest shapes it stores, not the IndexedDB
+  calls themselves, since the check script is plain Python). Every piece of
+  logic that *can* be tested without a DOM (seq/arm resume, backoff, the
+  missing-from-manifest set difference) was pulled out into
+  `capture_guidance.js` and is unit-tested — see the table above.
+
+### Preserved
+
+- No `landslide/`, `server/*.py`, gate, or threshold file touched. The
+  existing `POST /api/jobs` multi-file path and every S2/S4 endpoint are
+  byte-for-byte unchanged. Legacy saved jobs and non-capture jobs are
+  unaffected (this pass's `loadSession` change only runs when
+  `localStorage[LS_CAPTURE_KEY]` is set, i.e. a guided-capture session was in
+  progress).
+- S3's existing behavior (arm/photo-count/marker/overlap/transition/height
+  guidance) is unchanged; this pass only replaces the failure branch of
+  `takePhoto` and the body of `loadSession`/`finish`.
+
+### Acceptance status
+
+- **Retry-safe client persistence, interrupted-upload recovery.** Met — see
+  the failure-recovery table. Device-level confirmation (6(e)) remains S7.
+- **Preview-state restoration.** Met, with the scope note above (a minimal
+  trigger was added; the full preview panel is still S5/S6b).
+- **Finalize recovery behavior.** Met — `renderFinalizeRetry` plus the
+  status-based hand-off in `loadSession` cover both halves of §10's
+  "finalize interrupted" row (retry after a crash; don't strand the user
+  after a finalize that already succeeded).
+- **Server manifest preserved as authoritative; duplicate photos avoided.**
+  Met — no server file changed; the client only acks/re-sends against what
+  `GET .../capture` reports, never invents or reorders manifest state, and
+  `pendingNotYetOnServer` is exactly the "don't re-send what the manifest
+  already has" rule, unit-tested.
+- **Regression.** `pytest -q -k "not e2e"`: 235 passed, identical to S4's
+  baseline. `node --test`: 26/26. `node --check`: clean.
+- **The plan's own S5 (coverage/recapture), S6b, and S7 are not started**,
+  per the instruction for this pass.

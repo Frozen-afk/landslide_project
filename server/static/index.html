@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Landslide Volume from Phone Photos</title>
-<link rel="stylesheet" href="/static/style.css?v=3">
+<link rel="stylesheet" href="/static/style.css?v=4">
 </head>
 <body>
 <header>
@@ -22,6 +22,7 @@
   <input type="file" id="file-input" accept="image/*" multiple>
   <button id="upload-btn" class="primary" disabled>Upload &amp; reconstruct</button>
   <span id="upload-note" class="note">select photos in capture order (left → right)</span>
+  <div id="capture-checks" class="capture-checks"></div>
   <div id="progress" class="hidden">
     <div class="spinner"></div>
     <span id="progress-text">uploading…</span>

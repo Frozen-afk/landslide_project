@@ -73,7 +73,11 @@ figure { margin: 0; flex: 1 1 380px; }
 figure img { width: 100%; border-radius: 8px; border: 1px solid #34435a; }
 figcaption { color: #9fb0c3; font-size: 0.82rem; margin-top: 4px; }
 #job-list { margin-top: 8px; }
-.ok { color: #7fe08f; } .err { color: #ff8f8f; }
+.ok { color: #7fe08f; } .err { color: #ff8f8f; } .warn { color: #f0c05a; }
+
+.capture-checks { margin-top: 10px; font-size: 0.82rem; color: #9fb0c3; }
+.capture-checks div { margin: 2px 0; }
+.capture-checks span[class] { margin-right: 4px; cursor: help; }
 
 .warnbox {
   background: #33270e; border: 1px solid #8a6d1f; border-radius: 8px;

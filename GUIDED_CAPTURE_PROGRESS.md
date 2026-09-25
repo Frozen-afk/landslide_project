@@ -608,3 +608,179 @@ only — no headless-browser run in this pass) and a small interactive check tha
 
 **S6a done**, per the instruction's scope (stable reason ids/classes, `measurement_path`
 selection, actionable result messages, R5/R6/R8). **S1–S5, S6b, S7 not started.**
+
+## S1 — Instant checks in the existing upload (`GUIDED_CAPTURE_PLAN.md` §12 stage table, row 1)
+
+**Base:** `main` @ `d1ff131`. This pass added `server/static/js/capture_metrics.js`,
+`tests/test_capture_metrics.mjs`, `tests/test_capture_metrics.py`,
+`tests/fixtures/capture/` (generator + committed fixture JPEGs + `expected.json`), and changed
+`server/static/js/steps/upload.js`, `server/static/index.html`, `server/static/style.css`. No
+server-side file (`landslide/`, `server/routes.py`, `server/schemas.py`, `server/jobs.py`) was
+touched, no new API endpoint was added, and `POST /api/jobs` is unchanged. **S2–S7 not started.**
+
+### Change made
+
+Per the stage-table scope ("`capture_metrics.js` plus parity fixtures. Per-file T0 verdicts and
+EXIF lens check shown in the upload step **before** upload. No new API."):
+
+- **`server/static/js/capture_metrics.js`** (new, pure, no DOM — same pattern as `coords.js` /
+  `tests/test_coords.mjs`): `toGray`, `laplacianVariance`, `clippedFraction`, `resizeBilinear`,
+  `dHash`, `hamming` (mirroring `landslide/pipeline.py::_photo_metrics`'s ≤900px grey decode,
+  `cv2.Laplacian` 1-ksize kernel, rail-clip fraction, and 9×8 area dHash); `classifyBlur`,
+  `classifyExposure`, `classifyDuplicate`, `classifyResolution`, `classifyOrientation`,
+  `classifyLens` (the §4.1 threshold table); `parseExif` (a ~90-line hand-rolled JPEG APP1/TIFF
+  walker for `Orientation`, `FocalLength`, `FocalLengthIn35mmFilm`, `LensModel` — no library, per
+  §9.4's own estimate).
+- **`server/static/js/steps/upload.js`**: the existing `file-input` `change` handler now also
+  calls `runInstantChecks(files)`, which decodes each selected file with
+  `createImageBitmap(file, {imageOrientation: "from-image"})` onto a ≤900px canvas (read-only —
+  the `File` objects handed to `upload()` on click are never touched, so the originals stay
+  full-resolution with EXIF intact for the actual `POST /api/jobs`), runs the capture_metrics.js
+  checks, and renders one line per photo with ok/warn/fail chips and the §4.1 "instruction on
+  fail" text as a tooltip. The blur/duplicate checks replicate `_cull`'s own sequential logic
+  (batch median, previous-*kept*-frame duplicate comparison, blurrier-of-the-pair) so the T0
+  preview and the server's actual drop decision are computed the same way; **this is advisory
+  only — the server remains the sole authority on what actually gets dropped**, unchanged from
+  before this pass.
+- **`server/static/index.html`**: one `<div id="capture-checks">` added inside `#step-upload`,
+  above the progress bar. **`server/static/style.css`**: a `.warn` color class (existing `.ok`/
+  `.err` already there) and `.capture-checks` layout; cache-bust bumped `style.css?v=3` → `v=4`.
+- **`tests/fixtures/capture/make_fixtures.py`** (new): generates the parity fixtures by calling
+  the real `landslide.pipeline._photo_metrics` on real image content (see "Deviations") and
+  dumping both its output and the post-decode grey pixel grid (which `_photo_metrics` doesn't
+  itself return) to `expected.json`, plus a handful of tiny EXIF-only JPEGs (written with
+  Pillow's `Image.Exif`/`IFDRational`, a real TIFF-structured APP1 segment, not hand-built bytes).
+- **`tests/test_capture_metrics.mjs`** (new, `node --test`, no DOM): feeds `expected.json`'s
+  dumped grey grids into `capture_metrics.js`'s pure functions and checks parity against the
+  server's own numbers, checks blur/exposure verdicts against `_cull`'s actual fail formula,
+  checks the duplicate/resolution/orientation classifiers, and parses the EXIF fixtures.
+- **`tests/test_capture_metrics.py`** (new, in the fast suite): a drift guard — re-derives
+  `_photo_metrics` and the EXIF tags from the *committed* JPEG fixtures (not the pre-compression
+  arrays `expected.json` stores) and checks they still land close to what's recorded, so a future
+  change to `_photo_metrics`/`EXPOSURE_CLIP_FRAC` that the JS parity test relies on doesn't drift
+  silently.
+
+### Validation (representative accepted/rejected photos)
+
+`tests/fixtures/capture/`: `sharp_a.jpg`/`sharp_b.jpg` (crops of two `data/bench/arc` synthetic
+renders — accepted, distinct content), `dup_of_a.jpg` (pixel-identical to `sharp_a.jpg` —
+rejected as a duplicate), `blurry.jpg` (Gaussian blur σ=6 of `sharp_a.jpg` — rejected as blurry),
+`overexposed.jpg` (3× brightness on `sharp_b.jpg` — rejected as overexposed), plus 4 tiny
+EXIF-only fixtures for the lens/orientation check (`exif_ref`, `exif_lens_switch`, `exif_none`,
+`exif_rotated`). Measured (`tests/test_capture_metrics.mjs`, `node --test`):
+
+| Fixture | server lap | JS lap | rel. err | server clip | JS clip | Δclip | dHash Hamming (JS vs server) | server verdict |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| sharp_a.jpg | 305.78 | 307.59 | 0.6% | 0.1150 | 0.1150 | 0.0000 | 0 | accept |
+| sharp_b.jpg | 316.21 | 318.23 | 0.6% | 0.1274 | 0.1274 | 0.0000 | 1 | accept |
+| dup_of_a.jpg | 305.78 | 307.59 | 0.6% | 0.1150 | 0.1150 | 0.0000 | 0 | accept (but duplicate of a) |
+| blurry.jpg | 1.71 | 1.71 | 0.1% | 0.0700 | 0.0700 | 0.0000 | 0 | reject (blur) |
+| overexposed.jpg | 517.53 | 522.82 | 1.0% | 0.9899 | 0.9899 | 0.0000 | 0 | reject (exposure) |
+
+All well inside criterion 1's tolerance (clip ≤0.01, lap rel. ≤10%, dHash ≤2). Blur/exposure
+fail verdicts from `classifyBlur`/`classifyExposure` match `_cull`'s own formula on every
+fixture (`tests/test_capture_metrics.mjs`, "blur/exposure verdicts agree..."). Duplicate check:
+`classifyDuplicate` on `sharp_a` vs `dup_of_a` → `fail` (Hamming 0); on `sharp_a` vs `sharp_b` →
+`ok` (distinct content). EXIF: `exif_lens_switch` (different focal length/35mm-equiv/lens model)
+→ `classifyLens` = `fail`; `exif_none` (no APP1 segment at all) → `parseExif` = `null`,
+`classifyLens` = `missing` in both directions; `exif_rotated` (`Orientation` 6 vs the reference's
+1) → `classifyOrientation` = `warn`, while its lens/focal fields (unchanged from the reference)
+still classify `ok`, confirming the two checks are independent.
+
+Focused runs:
+```
+node --test tests/test_capture_metrics.mjs tests/test_coords.mjs   # 14 passed
+.venv/bin/python -m pytest -q tests/test_capture_metrics.py         # 2 passed
+.venv/bin/python -m pytest -q -k "not e2e"                          # 191 passed, 3 skipped, 23 deselected
+```
+(S6a's own baseline was 189 passed; the 2 new fast tests in `tests/test_capture_metrics.py`
+account for the difference exactly.) `node --check` on both changed/new JS files. Server smoke
+test: `uvicorn server.main:app` started locally, `GET /`, `/static/js/capture_metrics.js`,
+`/static/js/steps/upload.js` and `/static/style.css` all returned 200 (new module wiring
+resolves; no 404 from the new import).
+
+### Deviations from the plan's S1 description
+
+- **Fixture provenance.** §11 criterion 1 names "about 10 real phone JPEGs". No real phone JPEG
+  exists anywhere in this repo or its test suite today (`tests/test_import.py`'s own blur/
+  duplicate fixtures are synthetic numpy noise, not real photos). This pass follows the same
+  established convention: 5 metric fixtures derived from `data/bench/arc`'s synthetic textured
+  renders (the closest thing to "photo-like" content already in the repo) plus deterministic
+  PIL-derived blur/exposure/duplicate variants, and 4 tiny synthetic EXIF-only fixtures. 9
+  fixtures total, not ~10, and none are real camera output — this is the one open item against
+  criterion 1's literal wording; the numeric tolerances themselves (relative Laplacian error,
+  clip delta, dHash Hamming) are satisfied with wide margin (see table above).
+- **"Session" = the selected batch, not an in-progress capture.** S1 wires T0 checks into the
+  *existing* multi-file `<input type=file multiple>` upload (all photos already selected before
+  any check runs), not the incremental per-shot capture flow S2/S3 will add. So "before 5 photos
+  exist, use an absolute floor" (§4.1) is read as "batch has fewer than 5 files → use the flat
+  6.0 floor (matching `_cull`'s own hardcoded floor) instead of a batch median"; once ≥5 files are
+  selected, the median is computed once over the whole batch (this is actually a closer match to
+  `_cull`'s real behavior than a running median would be, since `_cull` itself computes one
+  median over the whole import batch, not a running one). Likewise "missing EXIF → warn once per
+  session" is implemented as once per batch. A true running-median/per-shot-session version is
+  S2/S3 scope, once a capture session actually exists.
+- **Duplicate-chain fallback not replicated.** `_cull`'s rare ">50% of the batch is blur-flagged
+  => treat as a broken metric, drop the least-sharp half instead" branch (a fallback for
+  degenerate batches, `landslide/pipeline.py` `_cull`) is not mirrored in the client preview. The
+  client only mirrors the normal per-photo fail/duplicate path. This branch is a safety net for a
+  case the T0 preview isn't the authority on anyway — the server still applies its own real
+  `_cull` unchanged.
+- **T1 checks (features, overlap, parallax, marker) are out of S1's scope** and were not touched
+  — they need server-side SIFT/marker detection (S2), not client-only math. `capture.html` (the
+  old live-viewfinder coach, §2 "superseded, keep it as a link") was left exactly as is; S1 only
+  changes the existing multi-file upload step, per the stage-table's "No new API" / "existing
+  upload" framing.
+- **EXIF field-mismatch tolerance.** `classifyLens`'s `focalLength` comparison uses a 2% relative
+  tolerance rather than exact equality, since `FocalLength` is an EXIF `RATIONAL` and repeated
+  shots on the same physical lens can round to adjacent rational representations on some camera
+  firmwares. `focalLength35mm` (integer `SHORT`) and `lensModel` (string) are compared exactly.
+  This is a judgment call the plan's table doesn't pin down (`Fail on mismatch` doesn't specify a
+  tolerance) — noted here rather than silently baked in.
+
+### Browser/field limitations (not testable outside a real device/browser)
+
+- **No headless browser in this environment.** `createImageBitmap`, `canvas.getContext('2d')` and
+  `File.arrayBuffer()` are browser APIs with no Node equivalent here (no puppeteer/jsdom/canvas
+  package installed, and none was added — see the parity-test design above, which sidesteps this
+  by feeding pre-decoded pixel grids into the pure functions instead). The DOM-wiring half of
+  `upload.js` (`decodeForChecks`, `runInstantChecks`) is therefore verified only by `node --check`
+  (syntax) and a static-file-serving smoke test (`GET` on the new JS module returns 200), not by
+  an actual in-browser run. Manual verification in a real browser is recommended before relying
+  on this in the field.
+- **T0 latency (§11 criterion 5, ≤300ms/photo on a mid-range phone)** is not measured — this pass
+  didn't run on a phone. Since S1 decodes at the same ≤900px working resolution `_photo_metrics`
+  uses and does no SIFT/feature work (that's T1), the budget is expected to hold, but this is not
+  verified here; S3/S7 own the real device timing per the stage table.
+- **`resizeBilinear`'s pixel-center formula approximates `cv2.resize`'s default `INTER_LINEAR`,
+  not an exact port** (§9.4 says this explicitly: "matching cv2.resize... is not exact, so parity
+  is defined by tolerance"). Measured dHash Hamming distances (0–1 bit across all 5 metric
+  fixtures) are well inside the ≤2 tolerance, but this was only checked at 360×270 → 9×8; larger
+  originals (up to the 900px cap) are not separately exercised by the committed fixtures (see
+  fixture-size note below).
+- **`parseExif` covers a single top-level TIFF IFD0 + one ExifSubIFD walk** (Orientation,
+  FocalLength, FocalLengthIn35mmFilm, LensModel only) — enough for the tags §4.1 names, written
+  and read back correctly against Pillow's own real EXIF writer (TIFF-structured, big-endian,
+  matching what a real camera produces), but never checked against an actual iPhone/Android JPEG
+  (none exists in this repo). Unusual EXIF layouts (multiple IFDs, maker notes before the tags of
+  interest, orientation-only cameras with no ExifSubIFD) are not covered.
+- **Fixture pixel grids are 360×270** (deliberately below the 900px cap, see `make_fixtures.py`'s
+  own docstring) so the committed `expected.json` stays a few MB instead of tens of MB. This
+  means the parity test never exercises `_photo_metrics`'s own `im.resize(...)` downscale step —
+  by design, since that resize is PIL-only code with no JS equivalent to test against; what S1
+  needs to match (the Laplacian/clip/dHash math given identical pixels) is fully exercised at
+  this size. A larger-image spot check was not run separately.
+
+### Acceptance status
+
+- **Criterion 1 (metric parity).** Met, with the fixture-provenance deviation noted above
+  (synthetic content, not real phone JPEGs — none exist in this repo). Numeric tolerances: clip
+  Δ ≤0.0001 (budget 0.01), Laplacian rel. error ≤1.0% (budget 10%), dHash Hamming ≤1 (budget 2),
+  on all 5 metric fixtures; blur/exposure fail verdicts match `_cull`'s formula on every fixture.
+- **Criterion 7 (no regression).** Met. `pytest -q -k "not e2e"`: 191 passed (188 pre-existing +
+  1 pre-existing skip-adjacent... see run above — exactly S6a's 189 plus this pass's 2 new tests),
+  3 skipped, 23 deselected. No `landslide/` or `server/*.py` file was touched, so
+  `POST /api/jobs`'s behavior is unchanged by construction, and legacy saved jobs (which never
+  hit any code path this pass added) are unaffected.
+- **S2–S7 remain not started**, per the instruction for this pass.
+

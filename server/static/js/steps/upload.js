@@ -6,6 +6,7 @@ import { api } from "../api.js";
 import * as scale from "./scale.js";
 import * as mark from "./mark.js";
 import { showResult } from "./result.js";
+import * as cm from "../capture_metrics.js";
 
 let pollTimer = null;
 
@@ -127,6 +128,116 @@ export async function refreshJobList() {
   } catch (e) { /* ignore */ }
 }
 
+// GUIDED_CAPTURE_PLAN.md S1: instant (T0) blur/exposure/duplicate/lens/
+// resolution/orientation checks, run client-side on the already-selected
+// files before upload. Read-only: never touches the File objects that get
+// uploaded, so the originals (full resolution, EXIF intact) reach the
+// server exactly as before.
+const INSTR = {
+  blur: "Blurry — hold still, tap to focus on the slope, retake.",
+  exposure: "Sky or shadow is blowing out the frame — tilt down or step so the sun is behind you.",
+  duplicate: "Same as the last photo — take 1–2 steps along the arc first.",
+  lens: "Camera switched lens (0.5×/2×). Set it back to 1× and retake.",
+  resOri: "Keep the phone in the same orientation for every photo, and use the full photo resolution.",
+};
+
+async function decodeForChecks(file) {
+  const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
+  const longSide = Math.max(bitmap.width, bitmap.height);
+  const s = Math.min(1, cm.MAX_SIDE / longSide);
+  const w = Math.max(1, Math.round(bitmap.width * s));
+  const h = Math.max(1, Math.round(bitmap.height * s));
+  const canvas = document.createElement("canvas");
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(bitmap, 0, 0, w, h);
+  const gray = cm.toGray(ctx.getImageData(0, 0, w, h).data);
+  bitmap.close();
+  const exif = cm.parseExif(await file.arrayBuffer());
+  return { longSide, gray, w, h, exif };
+}
+
+function median(xs) {
+  const s = [...xs].sort((a, b) => a - b);
+  const n = s.length;
+  return n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2;
+}
+
+function esc(s) {
+  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function chip(label, verdict, msg) {
+  if (!verdict || verdict === "ok") return "";
+  const cls = verdict === "fail" ? "err" : "warn";
+  return ` <span class="${cls}" title="${msg || ""}">${label}: ${verdict}</span>`;
+}
+
+async function runInstantChecks(files) {
+  const out = $("capture-checks");
+  if (!files.length) { out.innerHTML = ""; return; }
+  out.innerHTML = '<span class="note">checking photos…</span>';
+  const decoded = [];
+  for (const f of files) {
+    try { decoded.push(await decodeForChecks(f)); }
+    catch (e) { decoded.push(null); }
+  }
+  const laps = decoded.map((d) => d && cm.laplacianVariance(d.gray, d.w, d.h));
+  const clips = decoded.map((d) => d && cm.clippedFraction(d.gray));
+  const hashes = decoded.map((d) => d && cm.dHash(d.gray, d.w, d.h));
+  const med = laps.filter((v) => v != null).length >= 5 ? median(laps.filter((v) => v != null)) : null;
+  const ref = decoded.find((d) => d)?.exif || null;
+  const refOrientation = ref?.orientation ?? null;
+
+  let prevKept = -1, exifWarned = false;
+  const rows = [];
+  for (let i = 0; i < files.length; i++) {
+    const d = decoded[i];
+    if (!d) { rows.push(`${esc(files[i].name)}: <span class="err">could not read photo</span>`); continue; }
+    const blurV = cm.classifyBlur(laps[i], med);
+    const expV = cm.classifyExposure(clips[i]);
+    let dupV = "ok";
+    if (blurV !== "fail" && expV !== "fail") {
+      if (prevKept === -1) {
+        dupV = "ok";
+      } else {
+        const ham = cm.hamming(hashes[i], hashes[prevKept]);
+        dupV = cm.classifyDuplicate(ham);
+      }
+      if (dupV === "fail" && prevKept !== -1 && laps[prevKept] > laps[i]) {
+        // near-duplicate: the blurrier of the two would be dropped server-side
+      } else {
+        prevKept = i;
+      }
+    }
+    // §4.1: a mismatch is shown every time; missing EXIF is shown once per
+    // batch (the same camera model produces it on every photo otherwise).
+    let lensV = "ok", lensMsg = INSTR.lens;
+    if (i > 0) {
+      const raw = cm.classifyLens(d.exif, ref);
+      if (raw === "fail") lensV = "fail";
+      else if (raw === "missing") {
+        if (exifWarned) lensV = "ok";
+        else { lensV = "warn"; lensMsg = "no EXIF metadata found — camera/lens can't be checked"; exifWarned = true; }
+      }
+    }
+    const resV = cm.classifyResolution(d.longSide);
+    const oriV = cm.classifyOrientation(d.exif?.orientation ?? null, refOrientation);
+    const resOriV = resV === "warn" || oriV === "warn" ? "warn" : "ok";
+
+    const prefix = `${esc(files[i].name)}:`;
+    let row = prefix;
+    row += chip("blur", blurV, INSTR.blur);
+    row += chip("exposure", expV, INSTR.exposure);
+    row += chip("duplicate", dupV, INSTR.duplicate);
+    row += chip("lens", lensV, lensMsg);
+    row += chip("photo", resOriV, INSTR.resOri);
+    if (row === prefix) row += ' <span class="ok">ok</span>';
+    rows.push(row);
+  }
+  out.innerHTML = rows.map((r) => `<div>${r}</div>`).join("");
+}
+
 export function initUpload() {
   $("file-input").addEventListener("change", (e) => {
     const n = e.target.files.length;
@@ -134,6 +245,7 @@ export function initUpload() {
     $("upload-note").textContent = n === 0
       ? "select photos in capture order (left → right)"
       : `${n} photo${n === 1 ? "" : "s"} selected` + (n < 3 ? " — need at least 3" : "");
+    runInstantChecks([...e.target.files]);
   });
   $("upload-btn").addEventListener("click", () => upload($("file-input").files));
 

@@ -473,6 +473,13 @@ def test_g9_unstable_datum_downgrades_ok_to_indicative():
     status, reasons = evaluate_gates(_FakeCtx(), res, "ground_frame")
     assert status == "indicative", reasons
     assert any("datum uncertain" in msg for msg in reasons), reasons
+    # S6a (GUIDED_CAPTURE_PLAN.md §11 criterion 9): this is the `datum`, not
+    # `capture`, class — recapturing will not fix it, so it must route to
+    # path 3 (indicative_only), never capture_failure.
+    from landslide.gates import classify_measurement_path
+    assert res["reason_ids"] == ["G9_datum_unstable"]
+    assert classify_measurement_path(
+        status, res["reason_ids"], res.get("datum")) == "indicative_only"
 
 
 def test_g9_calibration_terrain_stays_ok_seed7():
@@ -511,6 +518,12 @@ def test_g9_calibration_terrain_stays_ok_seed7():
     status, reasons = evaluate_gates(_FakeCtx(), res, "ground_frame")
     assert status == "ok", reasons
     assert reasons == []
+    # S6a (GUIDED_CAPTURE_PLAN.md §11 criterion 9): the §12b.4 fixture is the
+    # positive control for path 1 — a clean rim-inferred `ok`.
+    from landslide.gates import classify_measurement_path
+    assert res["reason_ids"] == []
+    assert classify_measurement_path(
+        status, res["reason_ids"], res.get("datum")) == "rim"
 
 
 def test_g9_stable_planar_and_curved_fixtures_stay_ok():
@@ -544,3 +557,51 @@ def test_g9_no_rim_fallback_never_ok():
     status, reasons = evaluate_gates(_FakeCtx(), res, "ground_frame")
     assert status != "ok"
     assert any("no usable rim" in msg for msg in reasons), reasons
+
+
+def test_g9_one_sided_rim_never_ok():
+    # R5 (DATUM_STABILITY_PLAN.md §8): the field case of "that side of the
+    # slide cannot be reached" — a rim seen on only one side. An unseen arc's
+    # tilt is unconstrained, so this must never reach `ok`, however tight the
+    # holdout looks on the side that WAS seen.
+    from landslide.gates import classify_measurement_path, evaluate_gates
+
+    from test_gates import _FakeCtx
+
+    interior, rim, _analytic = make_bowl_points()
+    ang = np.degrees(np.arctan2(rim[:, 1], rim[:, 0])) % 360
+    one_sided_rim = rim[ang < 150.0]
+    up = np.array([0.0, 0.0, 1.0])
+    polygon_ground = _circle_polygon(0.0, 0.0, 5.6)
+
+    res = prism_volume(interior, one_sided_rim, log=lambda *_: None, up=up,
+                       polygon_ground=polygon_ground)
+    res["cloud"] = "dense"
+    status, reasons = evaluate_gates(_FakeCtx(), res, "ground_frame")
+    assert res["datum_holdout_windows"] < 6 or status != "ok"
+    assert status != "ok", reasons
+    # S6a: a partial rim is a capture/tracing fault (recapture the missing
+    # side), never routed to path 3 (indicative_only) as if it were a datum
+    # fault the user can't do anything about.
+    assert "G9_rim_partial" in res["reason_ids"], res["reason_ids"]
+    assert classify_measurement_path(
+        status, res["reason_ids"], res.get("datum")) == "capture_failure"
+
+
+def test_g9_flags_small_pile_on_curved_road_as_indicative():
+    # R8 (DATUM_STABILITY_PLAN.md §8): a known-conservative case, not a bug.
+    # The S-curve road's datum uncertainty is only about a centimeter, but
+    # that's still a large share of the pile's own sub-m³ volume — G9 must
+    # flag it, and this documents that as intended rather than a regression
+    # to "fix" later.
+    from landslide.gates import evaluate_gates
+
+    from test_gates import _FakeCtx
+
+    interior, rim, _truth = make_s_curve_road_with_pile()
+    up = np.array([0.0, 0.0, 1.0])
+    res = prism_volume(interior, rim, log=lambda *_: None, up=up)
+    res["cloud"] = "dense"
+    status, reasons = evaluate_gates(_FakeCtx(), res, "ground_frame")
+    assert status == "indicative", reasons
+    assert any("datum uncertain" in msg for msg in reasons), reasons

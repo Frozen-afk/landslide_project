@@ -307,10 +307,15 @@ def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
     # confident single number with no coverage/calibration context is what
     # let every preset's ~1-2% "photo error" hide a 40-60% unobserved void
     # (see REMAINING_ACCURACY_PLAN.md). G8 (the UI) is result.js.
-    from .gates import evaluate_gates
+    from .gates import classify_measurement_path, evaluate_gates
     status, gate_reasons = evaluate_gates(ctx, res, region_method)
     res["status"] = status
     res["reasons"] = gate_reasons
+    # S6a (GUIDED_CAPTURE_PLAN.md §7a.1): which of the three measurement
+    # paths (or a capture failure) this result is on. Additive, detection
+    # only — never changes status or any volume number.
+    res["measurement_path"] = classify_measurement_path(
+        status, res.get("reason_ids", []), res.get("datum"))
 
     if artifacts_dir is not None:
         artifacts_dir = Path(artifacts_dir)

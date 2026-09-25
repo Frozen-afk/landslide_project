@@ -18,6 +18,77 @@ const statusLabels = {
   rejected: "rejected — see reasons below",
 };
 
+// S6a (GUIDED_CAPTURE_PLAN.md §7, §7a, §9.3): mirrors landslide/gates.py's
+// RULES — the "what to do next time" text per reason id, and whether the
+// reason is a capture fault (recapture can fix it), a datum fault (it
+// can't), or informational. gates.py stays the source of truth for the
+// classification (`measurement_path`); this copy only supplies the display
+// text, since no endpoint serves RULES to the browser yet.
+const REASON_RULES = {
+  G1_thin_dense: { cls: "capture", action:
+    "Not enough overlapping texture for 3-D. Shoot from an angle (not " +
+    "straight down), keep 70%+ overlap between photos, and include " +
+    "textured ground, not just sky or water." },
+  G2_scale_warn: { cls: "capture", action:
+    "Marker scale is uncertain. Move closer, turn the board to face the " +
+    "camera, flatten it if bent, and include it in more photos." },
+  G3_focal: { cls: "capture", action:
+    "Camera zoom or lens changed mid-capture. Stay on the 1x camera for " +
+    "every photo." },
+  G4_collinear: { cls: "capture", action:
+    "You walked a straight line. Walk a curve around the slide, and add " +
+    "a second vantage point well away from the first." },
+  G5_fallback: { cls: "capture", action:
+    "Get higher (at least 20° above the debris). Keep the whole rim plus " +
+    "a margin in every photo. Never shoot from below the crown." },
+  G5_partial: { cls: "capture", action:
+    "Get higher (at least 20° above the debris). Keep the whole rim plus " +
+    "a margin in every photo. Never shoot from below the crown." },
+  G5_rejected: { cls: "capture", action:
+    "Get higher (at least 20° above the debris). Keep the whole rim plus " +
+    "a margin in every photo. Never shoot from below the crown." },
+  UP_disagree: { cls: "capture", action:
+    "Include more flat, stable ground around the slide in frame." },
+  G6_indicative: { cls: "capture", action:
+    "Walk to a second vantage point at least 60° around the slide from " +
+    "the first, keeping 60-80% overlap, so more of the interior is seen " +
+    "from at least two angles." },
+  G6_rejected: { cls: "capture", action:
+    "Walk to a second vantage point at least 60° around the slide from " +
+    "the first, keeping 60-80% overlap, so more of the interior is seen " +
+    "from at least two angles." },
+  G9_no_rim: { cls: "capture", action:
+    "No undisturbed ground was measured around the outline. First check " +
+    "the outline traces the slide edge, not the photo edge. If it's " +
+    "right, recapture with 2-3 m of undisturbed ground around the slide " +
+    "in every photo." },
+  G9_rim_partial: { cls: "capture", action:
+    "Recapture so the missing side of the slide is in frame. If that " +
+    "side cannot be seen (cliff, river, no access), this result can be " +
+    "kept as indicative." },
+  G9_datum_unstable: { cls: "datum", action:
+    "Not a photo problem — more photos will not help. The ground around " +
+    "the slide varies, so its edge does not predict the surface the " +
+    "slide removed. For a measured result, upload a pre-event elevation " +
+    "model (survey, LiDAR, earlier scan) and re-measure." },
+  DEM_no_coverage_gate: { cls: "info", action:
+    "Measured against your pre-event model. Indicative until SlopeLens " +
+    "can check how much of the slide the model covers." },
+};
+
+const pathLabels = {
+  rim: "Measured — the rim datum passed every check.",
+  dem: "Measured against your pre-event model.",
+  indicative_only: "Not a photo problem — more photos will not help.",
+  capture_failure: "Capture problem — fixable.",
+};
+
+function scrollToDemUpload() {
+  const input = document.getElementById("dem-input");
+  if (input) input.closest("section")?.scrollIntoView({ behavior: "smooth" });
+  input?.focus();
+}
+
 export function showResult(r) {
   $("step-result").classList.remove("hidden");
   state.lastResult = r;
@@ -38,6 +109,13 @@ export function showResult(r) {
   // unobserved void behind a "1.7% error" (see REMAINING_ACCURACY_PLAN.md).
   if (r.status) {
     rows.push(["status", statusLabels[r.status] || r.status]);
+    if (r.measurement_path && pathLabels[r.measurement_path]) {
+      rows.push(["path", pathLabels[r.measurement_path]]);
+    }
+  } else {
+    // S6a (§9.3): a result saved before the gates existed has no status —
+    // label it rather than silently rendering as if it had been checked.
+    rows.push(["status", "pre-gate result — not checked"]);
   }
   rows.push(
     ["net volume (fill − cut)", `${r.net_volume_m3.toFixed(1)} m³`],
@@ -90,12 +168,29 @@ export function showResult(r) {
     "<table>" + rows.map((x) => `<tr><td>${x[0]}</td><td><b>${x[1]}</b></td></tr>`).join("") + "</table>";
 
   const reasons = r.reasons || [];
-  const warns = (r.status && r.status !== "ok" ? reasons : []).concat(r.warnings || []);
+  const reasonIds = r.reason_ids || [];
+  const gated = r.status && r.status !== "ok";
+  const reasonItems = gated
+    ? reasons.map((w, i) => {
+        const rule = REASON_RULES[reasonIds[i]];
+        return rule ? `<li>${w}<br><i>${rule.action}</i></li>` : `<li>${w}</li>`;
+      })
+    : [];
+  const warnItems = (r.warnings || []).map((w) => `<li>${w}</li>`);
   const wb = $("result-warnings");
-  if (warns.length) {
+  if (reasonItems.length || warnItems.length) {
     wb.classList.remove("hidden");
-    wb.innerHTML = "<b>⚠ check before trusting the numbers:</b><ul>" +
-      warns.map((w) => `<li>${w}</li>`).join("") + "</ul>";
+    let html = "<b>⚠ check before trusting the numbers:</b><ul>" +
+      reasonItems.join("") + warnItems.join("") + "</ul>";
+    if (r.measurement_path === "indicative_only") {
+      // §7a.2 / §9.4: the existing DEM upload control (step 3) already
+      // does the re-measure — point at it instead of duplicating it here.
+      html += '<p><button type="button" id="result-upload-dem-btn">' +
+        "Upload pre-event DEM</button></p>";
+    }
+    wb.innerHTML = html;
+    document.getElementById("result-upload-dem-btn")
+      ?.addEventListener("click", scrollToDemUpload);
   } else {
     wb.classList.add("hidden");
   }

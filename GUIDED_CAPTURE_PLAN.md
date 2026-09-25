@@ -42,7 +42,7 @@ The capture is the dominant error term in SlopeLens, not the software.
 | Ground basis | `ortho.ground_basis(up)`, `geometry.points_in_polygon`, `volume._coverage_gate` (0.25 m grid) | Preview coverage map (coarser grid, sparse cloud) |
 | Process isolation | `executor.submit_job(job, fn, *extra, on_done)`; worker functions in `server/worker.py` | Preview runs as a new worker function |
 | Job persistence | `Job.save_state` (atomic temp + `os.replace`), `load_persisted_jobs`, `localStorage["lsv-last-job"]` | Capture manifest uses the same atomic pattern. Adds status `capturing`. |
-| Two-azimuth presets | `tools/synth.py` `twosided` (S0, `arc_offset` fixed to 90°), `twosided_b` (S0b geometry) | `twosided_b` holds the protocol geometry (§3). Its seed-7 terrain fails G9, so it is the **negative datum control**, not the calibration target. The calibration target is `twosided_cal` (§12b, not built yet). |
+| Two-azimuth presets | `tools/synth.py` `twosided` (S0, `arc_offset` fixed to 90°), `twosided_b` (S0b geometry), `twosided_cal` (S0c geometry, GO) | `twosided_b` holds the protocol geometry (§3) but its seed-7 terrain fails G9, so it is the **negative datum control**, not the calibration target. `twosided_cal` (§12b) is the S4/S5 path-1 reference, replacing `twosided_b` in that role. |
 | Datum holdout | `volume._datum_holdout` (8 × 90° windows), result fields `datum_holdout_m`, `datum_holdout_windows` | T3 datum estimate on the preview rim (§3a.4). Result-side datum/capture split (§7a). |
 | G9 gate | `gates.py` G9 block, `DATUM_HOLDOUT_REL = 0.05`, `DATUM_MIN_WINDOWS = 6` | Unchanged. Its three branches map to three reason ids (§7a). |
 | Pre-event DEM path | `dem.load_dem`, `dem.align_to_dem`, `POST/DELETE /api/jobs/{id}/dem`, `volume.dem_volume`, `measure(dem=…)` | Path 2 (§3a.2). No new code for the measurement itself. |
@@ -51,7 +51,7 @@ The capture is the dominant error term in SlopeLens, not the software.
 
 This protocol comes from `REMAINING_ACCURACY_PLAN.md` §77/§122 and README "Capturing good photos", corrected by S0b (§12a.4). It is the only protocol with a path to G6 `ok`. **One protocol serves all three measurement paths (§3a).** The path is decided after the measurement, not before the capture, so the user never has to choose a protocol.
 
-**Validation status.** The S0b geometry (`twosided_b`) passed every capture criterion of §12a.5: registration, G6 coverage and both voids, G1–G5, up-vector, marker views and elevation (items 1–4, 6, 7). It failed only accuracy (item 5), and G9 later traced that failure to the seed-7 terrain, not to the capture (`DATUM_STABILITY_PLAN.md` §1). The protocol below is therefore **provisional until S0c (§12b) passes** on a scene whose datum the rim can predict.
+**Validation status.** The S0b geometry (`twosided_b`) passed every capture criterion of §12a.5: registration, G6 coverage and both voids, G1–G5, up-vector, marker views and elevation (items 1–4, 6, 7). It failed only accuracy (item 5), and G9 later traced that failure to the seed-7 terrain, not to the capture (`DATUM_STABILITY_PLAN.md` §1). **S0c (§12b) passed with a GO decision** (`GUIDED_CAPTURE_PROGRESS.md`): on `twosided_cal`, a scene whose datum the rim can predict, this same capture geometry reaches `status == "ok"` with margin on every item. The protocol below is confirmed, no longer provisional.
 
 1. **Marker:** ArUco board, side ≥ 0.50 m, flat and rigid. Place it on stable ground just outside the landslide rim. Tilt it toward the capture positions (§6).
 2. **Rim band:** before arm A, clear the undisturbed ground 0.5–2.5 m outside the slide edge of everything that is not ground: bags, tripods, vehicles, spoil heaps. That band is the datum for path 1 (§3a.1). The one marker board is allowed there; the robust fit removes it (`DATUM_STABILITY_PLAN.md` §2.2).
@@ -473,26 +473,25 @@ Each stage can ship and be tested on its own. Stop after any stage and the produ
 | **S0 Calibration data** | `twosided` (90°): `indicative`, G6 void 9.1–10.1 m². NO-GO recorded (`GUIDED_CAPTURE_PROGRESS.md`). |
 | **S0b Protocol correction** | `twosided_b`: every capture criterion passes, accuracy +15–17 %. NO-GO. The cause was re-attributed to the seed-7 datum (§12a, `DATUM_STABILITY_PLAN.md`). |
 | **G9 Datum stability** | `9bb999d`. `twosided_b` → `indicative` (G9). Detection only, no volume change. |
+| **S0c Calibration scene** | §12b: `twosided_cal` (long-wavelength terrain octaves zeroed). **GO** — every §12b.5 item passes with margin on `twosided_cal`, both modes; `twosided_b` confirmed as the negative datum control (`GUIDED_CAPTURE_PROGRESS.md`). §3's protocol is no longer provisional. |
+| **S6a Result-side paths and ids** | `reason_ids`, `RULES`, `classify_measurement_path` in `gates.py`; `res["measurement_path"]` set in `pipeline.measure`; `datum_holdout_missing_deg` in `volume.py`; §7a messages, path label, legacy label, and an "Upload pre-event DEM" action (pointing at the existing step-3 control) in `result.js`. R5/R6/R8 from `DATUM_STABILITY_PLAN.md` §8 added to `tests/test_volume.py` / `tests/test_gates.py`. |
 
-**Revised order (post-G9).** The old rule "S1–S6 blocked until S0b passes" is replaced. S0b cannot pass on seed-7 terrain with any capture (`DATUM_STABILITY_PLAN.md` §7.2). Only the stages whose exit checks need a path-1 reference scene now wait for S0c.
+**Revised order (post-G9).** The old rule "S1–S6 blocked until S0b passes" is replaced. S0b cannot pass on seed-7 terrain with any capture (`DATUM_STABILITY_PLAN.md` §7.2). Only the stages whose exit checks need a path-1 reference scene waited for S0c; that scene now exists (GO) and S4/S5 are unblocked.
 
 | # | Stage | Scope | Depends on | Exit check |
 | --- | --- | --- | --- | --- |
-| 1 | **S0c Calibration scene** | §12b: opt-in terrain octaves in `tools/synth.py`, `twosided_cal` preset, benchmark terrain fix, perfect-point pre-check, one SfM run, DEM-path run on `twosided_b` | G9 | §12b.5, under the §12b.7 decision rule |
-| 2 | **S6a Result-side paths and ids** | `reason_ids`, `RULES` in `gates.py`, `measurement_path`, `datum_holdout_missing_deg`, §7a messages in `result.js`, "Upload pre-event DEM" action on path 3 (existing endpoint), legacy label. Missing G9 tests from `DATUM_STABILITY_PLAN.md` §8: R5 (one-sided rim), R6 (pure `evaluate_gates` mapping), R8 (small pile on a curved road). | G9 only | Criterion 9 (fast part), criterion 7. No status or volume changes on any fixture. |
-| 3 | **S1 Instant checks in the existing upload** | `capture_metrics.js` plus parity fixtures. Per-file T0 verdicts and EXIF lens check shown in the upload step **before** upload. No new API. | — | Criteria 1 and 7 |
-| 4 | **S2 Capture session backend** | `capturing` status, `session.json`, `PUT/DELETE photos`, `GET capture`, `finalize` (no preview gating yet), `landslide/capture.py::image_checks` / `sequence_checks`, semaphore. Setup stores the DEM answer (§3b step 1) in `session.json`. | S1 | Criteria 2, 6(a–d), 7 |
-| 5 | **S3 Guided UI and persistence** | `step-capture` section, `capture_store.js` IndexedDB queue, arms and counters (including the 2 outer-end photos), rim-check step, marker checklist and chips, optional sensors on a secure context | S2 | Criteria 5 (T0/T1), 6(e) |
-| 6 | **S4 Preview SfM** | `reconstruct(max_attempts=…)`, `worker.run_preview`, `preview_report` (registration, collinearity, focal, elevation, azimuth, stereo pairs, marker scale, datum estimate §3a.4), finalize blocking plus override | S2, **S0c** | Criteria 3 (except the G6 prediction), 5 (T3). Datum estimate calibrated per §12b.6. |
-| 7 | **S5 Coverage and recapture** | ROI tap, §5 cell map, calibrated `c_rej`/`c_ok` (now including `twosided_b` and `twosided_cal`), directional instructions including the outer-end rule (§5.4), top-down sketch, marker px thresholds calibrated on real prints | S4, **S0c** | Criteria 3 (full), 4 |
-| 8 | **S6b Capture report on the result** | `capture_report` row, "finalized with override" label | S4 | UI smoke: each replayed preset shows its path and matching instruction |
-| 9 | **S7 Device and field validation** | Android Chrome and iOS Safari over HTTP (no sensors) and HTTPS (sensors). ≥ 3 real sites, one with a pre-event DEM. | S5, S6b | Criterion 8 |
+| 1 | **S1 Instant checks in the existing upload** | `capture_metrics.js` plus parity fixtures. Per-file T0 verdicts and EXIF lens check shown in the upload step **before** upload. No new API. | — | Criteria 1 and 7 |
+| 2 | **S2 Capture session backend** | `capturing` status, `session.json`, `PUT/DELETE photos`, `GET capture`, `finalize` (no preview gating yet), `landslide/capture.py::image_checks` / `sequence_checks`, semaphore. Setup stores the DEM answer (§3b step 1) in `session.json`. | S1 | Criteria 2, 6(a–d), 7 |
+| 3 | **S3 Guided UI and persistence** | `step-capture` section, `capture_store.js` IndexedDB queue, arms and counters (including the 2 outer-end photos), rim-check step, marker checklist and chips, optional sensors on a secure context | S2 | Criteria 5 (T0/T1), 6(e) |
+| 4 | **S4 Preview SfM** | `reconstruct(max_attempts=…)`, `worker.run_preview`, `preview_report` (registration, collinearity, focal, elevation, azimuth, stereo pairs, marker scale, datum estimate §3a.4), finalize blocking plus override | S2 | Criteria 3 (except the G6 prediction), 5 (T3). Datum estimate calibrated per §12b.6. |
+| 5 | **S5 Coverage and recapture** | ROI tap, §5 cell map, calibrated `c_rej`/`c_ok` (now including `twosided_b` and `twosided_cal`), directional instructions including the outer-end rule (§5.4), top-down sketch, marker px thresholds calibrated on real prints | S4 | Criteria 3 (full), 4 |
+| 6 | **S6b Capture report on the result** | `capture_report` row, "finalized with override" label | S4 | UI smoke: each replayed preset shows its path and matching instruction |
+| 7 | **S7 Device and field validation** | Android Chrome and iOS Safari over HTTP (no sensors) and HTTPS (sensors). ≥ 3 real sites, one with a pre-event DEM. | S5, S6b | Criterion 8 |
 
 Why this order:
-- **S0c first.** It is cheap (one ~13 min SfM run plus about 5 min of cached re-measures) and is the only stage whose result can change the design. If it fails, S4 and S5 have no path-1 reference and stay blocked. Every other stage still ships.
-- **S6a second.** It needs only the gates that exist. It fixes the largest user-facing gap today: a G9 result looks the same as a capture failure, and nothing offers the DEM path. It also defines the ids and `RULES` that S2–S5 reuse.
+- **S0c and S6a are done** (see the Done table above) — S0c gave S4/S5 their path-1 reference (`twosided_cal`); S6a defined the ids and `RULES` that S2–S5 reuse and fixed the largest user-facing gap (a G9 result looked the same as a capture failure, and nothing offered the DEM path).
 - **S1 → S2 → S3** do not depend on any scene. They follow the original order.
-- **S4 → S5** need S0c: criterion 3 needs a preset whose final status is `ok` to prove false-block = 0, and §5.3 needs it to fit `c_ok`.
+- **S4 → S5** relied on S0c for a preset whose final status is `ok`, to prove false-block = 0 (criterion 3) and to fit `c_ok` (§5.3). That reference (`twosided_cal`) now exists.
 - **S6b** needs the preview report from S4.
 
 S4 is still the largest single cost and risk.
@@ -623,7 +622,7 @@ On `data/bench/twosided_b`, clean cache, default settings. Every item must hold 
 
 ### 12a.7 Consequences for the rest of the plan (apply after §12a.6 passes)
 
-**Post-G9 status:** §12a.6 did not pass, but the only failed item (accuracy) was re-attributed to the terrain datum (`DATUM_STABILITY_PLAN.md` §1). The capture items passed. The items below are therefore applied now, **provisionally**, through §3, §4.3, §5.4 and §11. S0c (§12b) confirms or reverts them.
+**Post-G9 status:** §12a.6 did not pass, but the only failed item (accuracy) was re-attributed to the terrain datum (`DATUM_STABILITY_PLAN.md` §1). The capture items passed. The items below were applied provisionally, through §3, §4.3, §5.4 and §11. **S0c (§12b) has since confirmed them with a GO decision** (`GUIDED_CAPTURE_PROGRESS.md`): the same geometry reaches `status == "ok"` on `twosided_cal`, a scene whose datum the rim can predict. They are no longer provisional.
 
 
 - §3 step 2: "elevation ≥ 20°" is measured above the ROI centroid, not the lowest debris point. Add: "walk each arm about 2 photos further away from the other arm than feels necessary."

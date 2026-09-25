@@ -479,3 +479,132 @@ Consequences, per §12b.7's GO branch:
 Per the instruction for this pass, **S1–S7 remain not started.** This pass touched only
 `tools/synth.py`, `tools/benchmark.py`, and `tests/test_volume.py`, and changed no existing
 preset's output, no gate, no threshold, and no application behavior.
+
+`GUIDED_CAPTURE_PLAN.md` has since been updated (by the S6a pass below) to record S0c's GO and
+drop "provisional" from §3/§12a.7, per the authorization this section's GO decision gives.
+
+## S6a — Result-side paths and ids (`GUIDED_CAPTURE_PLAN.md` §9.3, §12 stage table)
+
+**Base:** `main` @ `2941089`, plus S0c's own uncommitted `GUIDED_CAPTURE_PLAN.md` wording gap
+(§3/§12a.7 still said "provisional" although S0c's GO already authorized dropping it — closed by
+this pass, see below). This pass changed `landslide/gates.py`, `landslide/pipeline.py`,
+`landslide/volume.py`, `server/static/js/steps/result.js`, `tests/test_gates.py`,
+`tests/test_volume.py`, and `GUIDED_CAPTURE_PLAN.md`. No gate threshold changed. No `tools/` file
+touched. S1–S5, S6b, S7 not started, per instruction.
+
+### Change made
+
+Per the stage-table scope (`GUIDED_CAPTURE_PLAN.md` §12, S6a row):
+
+- **`landslide/gates.py`:** `evaluate_gates`'s `flag()` now takes a third argument, a stable
+  reason id (e.g. `"G9_datum_unstable"`), and sets `res["reason_ids"]` (parallel to the existing
+  `reasons` list) before returning — the return signature (`(status, reasons)`) is unchanged, so
+  every existing caller and test keeps working unmodified. A new module-level `RULES` dict maps
+  each id to its `class` (`capture` / `datum` / `info`, §7a) and its "what to do next time"
+  `action` text (§7, §7a.2) — one source, reused by the (not-yet-built) capture UI and by
+  `result.js` below. A new `classify_measurement_path(status, reason_ids, datum)` implements
+  §7a.1's five-rule, first-match-wins path classification (`rim` / `dem` / `indicative_only` /
+  `capture_failure`).
+- **`landslide/pipeline.py`:** right after `evaluate_gates`, `measure()` now sets
+  `res["measurement_path"] = classify_measurement_path(status, res["reason_ids"], res["datum"])`
+  — additive, computed from fields `evaluate_gates` already produces, so it changes no status and
+  no volume number.
+- **`landslide/volume.py`:** `_datum_holdout` now also returns the centre azimuths (degrees, in
+  the datum's own (u, v) frame) of the holdout windows it had to skip for lack of rim points, and
+  `prism_volume` stores them as the new additive field `res["datum_holdout_missing_deg"]`. This is
+  the field `G9_rim_partial`'s result-panel message needs to name which side of the slide is
+  missing (§9.3); it is `[]` whenever the rim datum wasn't fitted at all (surface-plane fallback)
+  or every window had enough points.
+- **`server/static/js/steps/result.js`:** a `REASON_RULES` object mirrors `gates.py`'s `RULES`
+  text (no endpoint serves `RULES` to the browser yet, so this is a copy, not a fetch — `gates.py`
+  stays the single source for the *classification*, `classify_measurement_path`, which the fast
+  tests below pin). Each reason now shows its "what to do next time" line under it. A `path` row
+  shows the §7a.1 label (e.g. "Not a photo problem — more photos will not help.") next to
+  `status`. A result with `measurement_path == "indicative_only"` gets an "Upload pre-event DEM"
+  button; per §9.4 ("existing endpoint"), it does not duplicate the upload widget — it scrolls to
+  and focuses the DEM `<input>` that already exists in step 3 (`mark.js`'s `uploadDem`, wired to
+  `POST/DELETE /api/jobs/{id}/dem`), which already re-measures on success. A result with no
+  `status` (a legacy saved job, pre-gates) now shows "pre-gate result — not checked" instead of
+  silently omitting the row (closes `FINAL_RELEASE_AUDIT.md` §3.10's note, named in §9.3).
+- **`GUIDED_CAPTURE_PLAN.md`:** §3's validation-status paragraph, the reuse-inventory row for
+  `twosided_cal`, §12a.7's "provisionally" note, and the §12 Done/pending stage tables now record
+  S0c's GO and S6a's completion; §3 no longer says "provisional" (S0c's own GO record, above,
+  authorized this edit but did not make it).
+- **Tests, the missing R5/R6/R8 from `DATUM_STABILITY_PLAN.md` §8:**
+  - `tests/test_volume.py::test_g9_one_sided_rim_never_ok` (R5): `make_bowl_points()`'s rim kept
+    only for polar angle < 150°. Asserts `status != "ok"`, `"G9_rim_partial"` in `reason_ids`, and
+    `classify_measurement_path(...) == "capture_failure"` — a partial rim is fixable by recapture,
+    so it must never be routed to path 3 as if it were an unfixable datum fault.
+  - `tests/test_gates.py::test_g9_holdout_threshold_mapping` (R6): four hand-built `res` dicts
+    against bare `evaluate_gates`, pinning the exact thresholds — (a) holdout 0.001 m/8 windows/
+    area 100/net 60 → `ok`/`rim`; (b) holdout 0.07 m → `indicative`/`G9_datum_unstable`/
+    `indicative_only`; (c) 5 windows → `indicative`/`G9_rim_partial`/`capture_failure`; (d) `dem`
+    datum unaffected, classifies as `dem`. (a)/(d) already had coverage in the pre-existing
+    `test_non_dem_mode_unaffected_by_dem_guard` / `test_dem_mode_status_never_ok`; this test adds
+    the missing (b)/(c) thresholds plus the id/path assertions for all four.
+  - `tests/test_volume.py::test_g9_flags_small_pile_on_curved_road_as_indicative` (R8): the
+    existing `make_s_curve_road_with_pile()` fixture (already used by
+    `test_s_curve_road_gets_membrane_datum`, which never calls `evaluate_gates`) run through the
+    gate. Asserts `indicative` with a `"datum uncertain"` reason and documents it as intended —
+    the road's roughly 1 cm datum uncertainty is a large share of the pile's own sub-m³ volume, so
+    G9 correctly refuses to call this `ok`, per `DATUM_STABILITY_PLAN.md` §2's own recorded 216%
+    figure for this fixture.
+  - Extended the two existing `twosided`/`twosided_cal` G9 fixtures
+    (`test_g9_unstable_datum_downgrades_ok_to_indicative`,
+    `test_g9_calibration_terrain_stays_ok_seed7`) with `reason_ids`/`classify_measurement_path`
+    assertions, covering §11 criterion 9's two named fast-test fixtures (R1 → `G9_datum_unstable`/
+    `indicative_only`; the §12b.4 fixture → `rim`) without weakening either test's existing
+    assertions.
+
+### Focused validation (one run)
+
+```
+.venv/bin/python -m pytest -q -k "not e2e"
+```
+
+Result: **189 passed, 3 skipped, 23 deselected** — S0c's own baseline was 186 passed; the 3 new
+tests (R5, R6, R8) account for the difference exactly, and every pre-existing assertion still
+passes unmodified. Also spot-checked `node --check server/static/js/steps/result.js` (syntax
+only — no headless-browser run in this pass) and a small interactive check that `evaluate_gates` /
+`classify_measurement_path` / `RULES` import cleanly and produce the expected ids for a
+`G9_datum_unstable` fixture.
+
+### Deviations from the plan's S6a description
+
+- `result.js`'s `REASON_RULES` duplicates `gates.py`'s `RULES` text rather than fetching it from
+  an endpoint. §9.2's new endpoints (session/photo/preview/finalize) are S2/S4 scope, not S6a's,
+  and no endpoint today serves `RULES` on its own — inventing one would be scope creep for this
+  pass. `gates.py` stays the source of truth for the *classification* (`classify_measurement_path`,
+  covered by fast tests); the JS copy is display text only, and the two are structurally identical
+  (same ids, same class) so they can't silently diverge in meaning, only in wording if `gates.py`'s
+  `action` text is edited without a matching `result.js` edit later.
+- "Upload pre-event DEM" (§9.4) reuses the existing step-3 DEM control instead of building a new
+  upload affordance inside the result panel, per §9.3's own "existing endpoint" framing. Building a
+  second upload widget on the result screen would duplicate `mark.js`'s `uploadDem`/`removeDem` for
+  no behavioral gain and was treated as out of S6a's scope.
+- Did not add a `capture_report` row or a "finalized with override" label to `result.js` — both are
+  explicitly S6b scope (§12 stage table), and no capture session exists yet to populate either.
+- Did not touch `architecture.md`. `DATUM_STABILITY_PROGRESS.md`'s own diff-scope note (§9 item 7)
+  already covers G9's documentation there; S6a adds no new gate or volume field that changes the
+  pipeline's architecture, only ids/classification/display for fields G9 already produced.
+- `RULES`' `action` text was written fresh for this pass (not copied verbatim from a single plan
+  table cell) because §7's table is itself is split across a "final-pipeline failure" column, a
+  "capture-time predictor (tier)" column (T0/T1/T3 — capture-module scope, not built), and a "user
+  instruction" column that sometimes just points at §6 rather than giving a sentence (e.g. G2). The
+  wording keeps §7/§7a.2's substance (what to do, phrased as a recapture instruction) without
+  inventing capture-tier detail (T0/T1/T3 checks) this pass doesn't implement.
+
+### Preserved
+
+- Every existing `res` field is unchanged; only additive fields were added (`reason_ids`,
+  `measurement_path`, `datum_holdout_missing_deg`). `evaluate_gates`'s return signature is
+  unchanged. Saved-job JSON compatibility holds: the new fields are plain strings/floats/lists,
+  serialize the same way as every existing field, and `result.js` already treats every field it
+  reads as optional (`typeof r.x === "number"` / truthiness checks), so an old saved job with none
+  of these fields still renders (with the new "pre-gate result" label only if it also has no
+  `status`, which is the pre-existing legacy case, not something this pass introduces).
+
+### Status
+
+**S6a done**, per the instruction's scope (stable reason ids/classes, `measurement_path`
+selection, actionable result messages, R5/R6/R8). **S1–S5, S6b, S7 not started.**

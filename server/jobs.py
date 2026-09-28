@@ -209,8 +209,53 @@ class Job:
                 out["images"] = []
                 out["scale"] = self.scale_info or None
             if self.result is not None:
-                out["result"] = self.result
+                out["result"] = dict(self.result)
+                if self.capture is not None:
+                    out["result"]["capture_report"] = _capture_report(self.capture)
             return out
+
+
+def _capture_report(capture: dict) -> dict:
+    """S6b (GUIDED_CAPTURE_PLAN.md §9.3, §12 stage table row 6): a display-only
+    summary of the guided-capture session for the result panel — capture
+    counts, the latest preview's own predicted findings, the early (§3a.4)
+    datum estimate, and whether finalize was overridden. Computed fresh from
+    `job.capture` at snapshot time (never written into `job.result` /
+    `state.json`), so it always reflects the session manifest as-is and adds
+    no new persisted field. No gate, threshold, or `landslide/` file is
+    touched — this is job-manifest -> display composition, same layer as
+    `snapshot()`'s existing `images`/`geo`/`scale` fields."""
+    seq = capture.get("sequence") or {}
+    preview = capture.get("preview") or {}
+    report = preview.get("report") or {}
+    finalized = capture.get("finalized") or {}
+    all_checks = report.get("checks") or []
+    datum = report.get("datum_estimate") or {}
+    override = bool(finalized.get("override"))
+    by_id = {c["id"]: c.get("text", c["id"]) for c in all_checks}
+    return {
+        "arms": seq.get("counts", {}),
+        "total_photos": seq.get("total", 0),
+        "marker_views": seq.get("marker_views", {}),
+        "marker_views_total": seq.get("marker_views_total", 0),
+        "preview_status": preview.get("status"),
+        "elevation_deg": (report.get("elevation_deg") or {}).get("median"),
+        "arm_separation_deg": report.get("arm_separation_deg"),
+        # §7a.2 "the same ids are used with 'predicted' in front of the first
+        # line": preview_report() already prefixes each check's text with
+        # "Predicted: ", so this is shown as-is, not reclassified — every T3
+        # check is a capture-fixable or informational finding (§12b.6: the
+        # datum estimate never becomes a `checks` entry), so nothing here can
+        # be mistaken for the datum-fault class the final `reason_ids` use.
+        "preview_checks": [{"id": c["id"], "level": c["level"], "text": c["text"]}
+                           for c in all_checks if c.get("level") in ("warn", "block")],
+        # informational only (§3a.4, §12b.6) — never a predicted status.
+        "datum_estimate_ratio": datum.get("ratio"),
+        "finalized_override": override,
+        "overridden_checks": [{"id": rid, "text": by_id.get(rid, rid)}
+                              for rid in finalized.get("blocking_at_finalize", [])]
+                              if override else [],
+    }
 
 
 JOBS: OrderedDict[str, Job] = OrderedDict()

@@ -16,7 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from server import jobs
-from server.jobs import JOBS, JOBS_LOCK, Job
+from server.jobs import JOBS, JOBS_LOCK, Job, _capture_report
 
 
 # ---------- P3b: save_state must not publish torn JSON under concurrency ----------
@@ -233,3 +233,72 @@ def test_complete_model_resumes_as_ready(tmp_path, monkeypatch):
     job = _reload(jid, tmp_path, monkeypatch)
     assert job.status == "ready"
     assert job.error is None
+
+
+# ---------- S6b: result.capture_report (GUIDED_CAPTURE_PLAN.md §9.3) ----------
+
+def _fake_preview_report(**overrides) -> dict:
+    report = {
+        "elevation_deg": {"median": 22.9}, "arm_separation_deg": 90.0,
+        "checks": [
+            {"id": "G3_focal", "level": "warn", "text": "Predicted: stay on the 1x camera."},
+            {"id": "T3_azimuth", "level": "block", "text": "Predicted: walk further around."},
+        ],
+        "blocking": ["T3_azimuth"],
+        "datum_estimate": {"ratio": 0.55},
+    }
+    report.update(overrides)
+    return report
+
+
+def test_capture_report_absent_for_a_normal_upload_job():
+    job = Job("test-" + uuid.uuid4().hex[:8], result={"status": "ok"})
+    assert "capture_report" not in job.snapshot()["result"]
+
+
+def test_capture_report_summarizes_arms_marker_views_and_preview():
+    capture = {
+        "sequence": {"counts": {"A": 19, "B": 10}, "total": 29,
+                     "marker_views": {"A": 12, "B": 5}, "marker_views_total": 17},
+        "preview": {"status": "done", "report": _fake_preview_report()},
+        "finalized": {"override": False, "blocking_at_finalize": []},
+    }
+    job = Job("test-" + uuid.uuid4().hex[:8], result={"status": "ok"}, capture=capture)
+    cr = job.snapshot()["result"]["capture_report"]
+
+    assert cr["arms"] == {"A": 19, "B": 10}
+    assert cr["total_photos"] == 29
+    assert cr["marker_views"] == {"A": 12, "B": 5}
+    assert cr["marker_views_total"] == 17
+    assert cr["elevation_deg"] == 22.9
+    assert cr["arm_separation_deg"] == 90.0
+    assert {c["id"] for c in cr["preview_checks"]} == {"G3_focal", "T3_azimuth"}
+    # §12b.6: reported for future use, never a predicted verdict
+    assert cr["datum_estimate_ratio"] == 0.55
+    assert cr["finalized_override"] is False
+    assert cr["overridden_checks"] == []
+
+
+def test_capture_report_flags_finalized_with_override():
+    capture = {
+        "sequence": {"counts": {"A": 12}, "total": 12, "marker_views": {}, "marker_views_total": 0},
+        "preview": {"status": "done", "report": _fake_preview_report()},
+        "finalized": {"override": True, "blocking_at_finalize": ["T3_azimuth"]},
+    }
+    job = Job("test-" + uuid.uuid4().hex[:8], result={"status": "indicative"}, capture=capture)
+    cr = job.snapshot()["result"]["capture_report"]
+
+    assert cr["finalized_override"] is True
+    assert cr["overridden_checks"] == [
+        {"id": "T3_azimuth", "text": "Predicted: walk further around."}]
+
+
+def test_capture_report_handles_no_preview_yet():
+    capture = {"sequence": {"counts": {"A": 3}, "total": 3, "marker_views": {},
+                            "marker_views_total": 0},
+               "preview": None, "finalized": {"override": False, "blocking_at_finalize": []}}
+    cr = _capture_report(capture)
+    assert cr["preview_status"] is None
+    assert cr["elevation_deg"] is None
+    assert cr["preview_checks"] == []
+    assert cr["datum_estimate_ratio"] is None

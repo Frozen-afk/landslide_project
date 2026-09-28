@@ -1778,3 +1778,239 @@ remains S7's own field-validation item.
   baseline. `node --test`: 26/26. `node --check`: clean.
 - **The plan's own S5 (coverage/recapture), S6b, and S7 are not started**,
   per the instruction for this pass.
+
+## S6b — Capture report on the result (`GUIDED_CAPTURE_PLAN.md` §9.3, §12 stage
+table row 6)
+
+**Base:** `main` @ `644029a`. This pass added `server/jobs.py::_capture_report`
+(called from `Job.snapshot()`), a `renderCaptureReport` function in
+`server/static/js/steps/result.js`, a `#result-capture-report` container in
+`server/static/index.html`, and four tests in `tests/test_jobs.py`. No
+`landslide/`, gate, or threshold file was touched — every input this stage
+needs (`reason_ids`/`measurement_path`/`RULES`, S6a; `sequence_checks`/
+`preview_report`, S2/S4; `capture.finalized`, S2) already exists. **S7 not
+started**, per the instruction for this pass.
+
+### Change made
+
+Per the stage-table scope ("`capture_report` row, 'finalized with override'
+label"), and the pass instruction's fuller framing (capture-quality findings,
+preview results, measurement path, gate reasons, clear next actions; datum
+problems distinguished from capture problems; early datum estimates kept
+informational):
+
+- **`server/jobs.py::_capture_report(capture)`** (new): a pure, display-only
+  function that turns a job's `capture` manifest (§9.1: `sequence`, `preview`,
+  `finalized`) into a summary dict — `arms` (per-arm kept-photo counts),
+  `total_photos`, `marker_views` (per-arm and total), `preview_status`,
+  `elevation_deg` (the latest finished preview's median camera elevation),
+  `arm_separation_deg`, `preview_checks` (the preview's own warn/block
+  findings, each already carrying "Predicted: " + the same `RULES`/
+  `T3_MESSAGES` action text §7a.2 specifies — no new vocabulary, no copy of
+  that text into this function), `datum_estimate_ratio` (§3a.4/§12b.6's
+  number, reported as raw context only — see "informational" below),
+  `finalized_override` (bool), and `overridden_checks` (the blocking preview
+  items that `override=true` bypassed at finalize, §9.1's
+  `finalized.blocking_at_finalize`, resolved back to their own text).
+  **`Job.snapshot()`** calls it and merges the result into a *copy* of
+  `self.result` as `result["capture_report"]`, only when `self.capture is not
+  None` — never into `self.result` itself, so `state.json` gains no new
+  persisted field and the report is always computed fresh from the manifest's
+  current state. A job with no capture session (every pre-existing upload)
+  gets no `capture_report` key at all, not an empty one.
+- **`server/static/js/steps/result.js::renderCaptureReport(r)`** (new),
+  called at the end of `showResult(r)`: renders a `#result-capture-report`
+  block — reusing the existing `.capture-checks`/`.ok`/`.warn`/`.err`/`.note`
+  CSS classes from S1's panel, no `style.css` change — only when
+  `r.capture_report` is present. Shows arm/marker-view counts, the preview's
+  median elevation and arm separation (or its status, if it never finished),
+  the preview's own predicted findings as a list (block items in `.err`, warn
+  items in `.warn` — the same visual language `result.js` already uses for
+  the *final* reasons list), the datum-estimate ratio labelled explicitly
+  "informational only, not a prediction — see the result's own 'path' and
+  reasons above for the actual measurement" (never as a path guess — §12b.6's
+  own finding that this ratio doesn't discriminate reliably), and — only when
+  `finalized_override` is true — a `.err`-styled "⚠ finalized with override"
+  line naming exactly which preview warnings were bypassed.
+- **`server/static/index.html`**: one `<div id="result-capture-report"
+  class="capture-checks hidden"></div>` inside `#step-result`, between the
+  existing `#result-warnings` box and the material-factor row. No
+  `style.css` change (cache-bust stays at `v=5`, set by S3): every class this
+  block uses already existed before this pass.
+- **`tests/test_jobs.py`**: four new tests, directly on `Job`/`_capture_report`
+  (same pattern this file already uses for `Job`-level behavior, no HTTP
+  layer needed) — a normal (non-capture) job gets no `capture_report` key; a
+  full capture manifest (arms, marker views, a finished preview with a warn
+  and a block check, `datum_estimate.ratio`, no override) produces the
+  expected summary; `finalized.override=true` with
+  `blocking_at_finalize=["T3_azimuth"]` produces `finalized_override: True`
+  and `overridden_checks` resolved to that check's own text; and a session
+  with `preview: None` (never previewed) returns `preview_status`,
+  `elevation_deg`, `preview_checks`, and `datum_estimate_ratio` all empty/None
+  rather than raising.
+
+### Distinguishing capture problems from datum problems (the pass instruction's
+own framing)
+
+This block does not re-derive or duplicate that distinction — S6a already
+built it (`gates.classify_measurement_path`, the "path" row, and
+`REASON_RULES`' `cls` field in `result.js`, shown above this block on the same
+page) and this pass's job is only to add the *capture-session* report next to
+it, not to re-classify anything. The two blocks read together: the "path" row
+and reason list (S6a) say what the *final* gates found and whether recapture
+can fix it or only a pre-event DEM can; this block (S6b) says what the
+*on-site preview* already predicted before reconstruction ever ran. Nothing in
+`preview_checks` can be mistaken for the datum-fault class: every T3 check
+reuses a `capture`/`info`-class id from `gates.RULES`, or one of the two
+preview-only ids (`T3_registration`, `T3_azimuth`) that have no gate
+counterpart at all — §12b.6 already established that the one datum-flavoured
+number T3 computes (the early ratio) never becomes a `checks` entry, so it
+cannot appear in `preview_checks`; it is surfaced separately, labelled
+informational, exactly per this pass's instruction to "keep early datum
+estimates informational."
+
+### Focused validation
+
+**Now run** (the tool-execution outage recorded below has since cleared).
+Commands and results, this pass:
+
+```
+.venv/bin/python -m pytest -q tests/test_jobs.py     # 10 passed
+node --check server/static/js/steps/result.js         # syntax OK
+node --test tests/*.mjs                                # 26 passed
+.venv/bin/python -m pytest -q -k "not e2e"             # 239 passed, 3 skipped, 23 deselected
+```
+
+239 passed matches this section's own prior prediction exactly (235 baseline
++ 4 new `test_jobs.py` cases, no other count changed). The
+`worker process crashed (native crash)` line in the fast-suite output is
+`test_worker_crash_is_isolated_and_pool_recovers` deliberately killing a
+worker (same known/documented behavior S0 already noted), not a new failure.
+`git diff --stat` against `main` shows only the five files this pass's own
+"Change made" section names (`GUIDED_CAPTURE_PROGRESS.md`, `server/jobs.py`,
+`server/static/index.html`, `server/static/js/steps/result.js`,
+`tests/test_jobs.py`) — no unrelated file touched. No code defect found: the
+manual trace recorded below (from when the outage blocked execution) is
+confirmed correct by this run, not superseded by it.
+
+Still not exercised (unchanged from this section's original notes, and out of
+this validation pass's scope): no real capture-session walk, no browser
+render of `renderCaptureReport` (no headless browser in this environment, per
+every prior stage's own notes), no UI smoke test against the replayed
+presets.
+
+<details>
+<summary>Original note, while the tool-execution outage was active (superseded above)</summary>
+
+**Not run this pass.** Every execution path (`Bash`, and `Agent` as a
+fallback) returned a persistent tool-level failure for the whole session —
+"the server-side auto mode classifier gave no verdict" — on every attempt
+(read-only tools were unaffected and are what this section's own research and
+all of this pass's file edits relied on). This is a session-infrastructure
+outage, not a decision to skip validation, and it is recorded here rather than
+fabricating a pytest/node run. In its place:
+
+- **Manual trace of `_capture_report`** against each of the four new test
+  cases by hand (reading the function alongside each test's input dict,
+  confirmed field-by-field: counts pass through `seq.get(...)` unchanged;
+  `elevation_deg`/`arm_separation_deg` read the preview report's own keys;
+  `preview_checks` filters `checks` to `level in ("warn","block")` and keeps
+  `id`/`level`/`text` verbatim; `datum_estimate_ratio` reads
+  `datum_estimate.get("ratio")`; `overridden_checks` is `[]` whenever
+  `override` is falsy and otherwise resolves each `blocking_at_finalize` id
+  through a `by_id` map built from the *same* `checks` list) — no discrepancy
+  found between the code and the expected values asserted in each test.
+  `Job(...)` with `capture=None` is `snapshot()`-safe by inspection: the
+  `if self.capture is not None` guard is the same shape S2's own `capture`
+  key already uses two lines above it.
+- **`node --check` was not run.** The file was read in full after editing
+  (reproduced above in-conversation) and every added brace/paren/template
+  literal is balanced by inspection; this is a weaker check than an actual
+  parse and is recorded as such.
+- **No server smoke test, no real capture-session walk, no browser render.**
+  S1–S5's own progress notes already establish there is no headless browser
+  in this environment; this pass adds no new gap on that front, but unlike
+  every prior stage it could not even reach the `TestClient`/`uvicorn`-level
+  checks those stages used, because the outage blocked all process execution,
+  not just browser automation.
+
+This is a materially weaker validation than every prior stage recorded and is
+flagged here, not smoothed over.
+
+</details>
+
+### Deviations from the plan's S6b description and this pass's instruction
+
+- **"Preview coverage estimate"** (§9.3's own capture-report field list) is
+  not included. §5's coverage/void cell map and its `c_rej`/`c_ok` calibration
+  are the plan's own numbered S5 (not built — see that row's own progress
+  section above, which is a different, unbuilt slice from the "S5" label
+  reused earlier in this file for capture persistence/recovery). There is no
+  coverage number anywhere in `capture.preview.report` for this function to
+  read; inventing one here would mean computing it, which is S5's scope, not
+  S6b's. Every other named field (arms, separation, median elevation, marker
+  views) is present.
+- **No new capture-time vocabulary.** `preview_checks` and `overridden_checks`
+  both reuse the `text` strings `preview_report()` already produced and stored
+  in `capture.preview.report.checks` — this pass does not add a JS-side copy
+  of `T3_MESSAGES` (unlike S6a's `REASON_RULES`, which had to copy
+  `gates.RULES`' text because no endpoint serves it to the browser). The
+  preview's own text is already sitting in the manifest the browser already
+  fetches, so copying it a second time would be pure duplication with no
+  endpoint gap to work around.
+- **`capture_report` is computed at `snapshot()` time, not stored in
+  `job.result`/`state.json`.** This keeps `landslide/pipeline.py::measure()`
+  (which has no knowledge of `job.capture`, by design — no web dependency)
+  untouched, and means the report always reflects whatever `job.capture`
+  currently holds rather than a value frozen at measure time. Since nothing
+  can mutate `job.capture` once a session leaves `"capturing"` status (every
+  capture-session route checks `status == "capturing"` first), this is
+  observably identical to computing it once at finalize time, but without
+  adding a field to persist.
+- **No UI smoke test against the replayed presets** (the plan's own S6b exit
+  check: "each replayed preset shows its path and matching instruction").
+  That check needs `tests/test_e2e_capture.py` (S5's own exit criterion 3,
+  still not written) plus a way to drive `result.js` outside a browser
+  (no headless browser in this repo, per every prior stage's own notes) — out
+  of reach for this pass even before the tool outage. The manual trace above
+  is the substitute for the *data-shape* half of that check (does
+  `capture_report` contain what `result.js` expects); the *rendering* half
+  (does it actually show right on each preset) is unverified.
+
+### Preserved
+
+- No `landslide/` file, gate, or threshold touched. `evaluate_gates`,
+  `classify_measurement_path`, `RULES`, `preview_report`, `sequence_checks`
+  are all read-only inputs to `_capture_report`, never modified.
+  `pipeline.measure()`'s return shape is unchanged (S6a's own fields are
+  untouched, and this pass adds nothing to it — `capture_report` lives only
+  in the `Job.snapshot()` view, never in `res`/`job.result`).
+- Every existing `result.js` row (status, path, reasons, DEM-upload button,
+  legacy label — all S6a) renders exactly as before; `renderCaptureReport`
+  only adds a block after them and returns immediately if its container
+  element is missing (a defensive no-op, not a hard dependency on the new
+  `index.html` markup existing).
+- A job with no capture session — every job created through the existing
+  `POST /api/jobs` multi-file upload, i.e. every job created before this
+  plan's guided-capture stages existed — gets no `capture_report` key and no
+  visible change to its result panel.
+
+### Acceptance status
+
+- **`capture_report` row (arms, marker views, preview elevation/separation,
+  preview's own predicted findings, early datum estimate kept informational)
+  and the "finalized with override" label** — both built, per the stage
+  table's own scope, with the one named field gap above (preview coverage
+  estimate — not yet computable, S5 scope).
+- **Capture-vs-datum distinction, clear next actions** — met by construction:
+  this block adds no new classification and cannot contradict S6a's; its own
+  "what the preview flagged" list carries the same action text as the final
+  reasons list, and its datum-estimate line is explicitly labelled
+  informational rather than a verdict.
+- **Focused validation** — run (this pass's own validation pass, above):
+  `tests/test_jobs.py` 10 passed, `node --check` on `result.js` clean,
+  `node --test tests/*.mjs` 26 passed, fast suite 239 passed / 3 skipped / 23
+  deselected (matches the predicted count exactly), `git diff --stat` limited
+  to the five files this stage names. No S6b defect found.
+- **S7 is not started**, per the instruction for this pass. Per the same
+  instruction, this pass stops here.

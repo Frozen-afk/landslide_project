@@ -83,6 +83,57 @@ const pathLabels = {
   capture_failure: "Capture problem — fixable.",
 };
 
+// S6b (GUIDED_CAPTURE_PLAN.md §9.3, §12 stage table row 6): `result.capture_report`
+// (server/jobs.py::_capture_report) is only present on a job that went through
+// guided capture — a normal multi-file upload has no `job.capture`, so this
+// block stays hidden for every pre-existing job.
+function renderCaptureReport(r) {
+  const box = document.getElementById("result-capture-report");
+  if (!box) return;
+  const cr = r.capture_report;
+  if (!cr) { box.classList.add("hidden"); box.innerHTML = ""; return; }
+
+  const fmtCounts = (obj) => Object.entries(obj || {}).map(([k, n]) => `${k}: ${n}`).join("  ") || "—";
+  const lines = [`<b>Guided capture report</b>`];
+  lines.push(`<div>photos — ${fmtCounts(cr.arms)} (total ${cr.total_photos})</div>`);
+  lines.push(`<div>marker views — total ${cr.marker_views_total}` +
+    (Object.keys(cr.marker_views || {}).length ? ` (${fmtCounts(cr.marker_views)})` : "") + `</div>`);
+  if (typeof cr.elevation_deg === "number") {
+    lines.push(`<div>on-site preview: median camera elevation ${cr.elevation_deg.toFixed(1)}°` +
+      (typeof cr.arm_separation_deg === "number" ? `, arm separation ${cr.arm_separation_deg.toFixed(0)}°` : "") +
+      `</div>`);
+  } else if (cr.preview_status && cr.preview_status !== "done") {
+    lines.push(`<div class="note">on-site preview: ${cr.preview_status}` +
+      (cr.preview_status === "stale" ? " (interrupted by a restart, never re-run)" : "") + `</div>`);
+  } else if (!cr.preview_status) {
+    lines.push(`<div class="note">no on-site preview was run for this session</div>`);
+  }
+  if (cr.preview_checks.length) {
+    // §7a.2 "predicted" findings: what the cheap on-site preview flagged
+    // before the real reconstruction ran, each already carrying its own
+    // "what to do next time" action text (landslide/capture.py T3_MESSAGES
+    // / gates.py RULES, prefixed "Predicted: " by preview_report()).
+    lines.push(`<div>what the on-site preview flagged:</div><ul>` +
+      cr.preview_checks.map((c) => `<li class="${c.level === "block" ? "err" : "warn"}">${c.text}</li>`).join("") +
+      `</ul>`);
+  }
+  if (typeof cr.datum_estimate_ratio === "number") {
+    // §3a.4 / §12b.6: this ratio never discriminates reliably (calibration
+    // failed on every scene tested) and is shown as raw context only — never
+    // as a predicted path or a verdict on the result above.
+    lines.push(`<div class="note">early on-site datum estimate (informational ` +
+      `only, not a prediction — see the result's own "path" and reasons ` +
+      `above for the actual measurement): ratio ${cr.datum_estimate_ratio.toFixed(2)}</div>`);
+  }
+  if (cr.finalized_override) {
+    lines.push(`<div class="err">⚠ finalized with override — ` +
+      `${cr.overridden_checks.length} on-site preview warning(s) were bypassed:</div><ul>` +
+      cr.overridden_checks.map((c) => `<li>${c.text}</li>`).join("") + `</ul>`);
+  }
+  box.innerHTML = lines.join("");
+  box.classList.remove("hidden");
+}
+
 function scrollToDemUpload() {
   const input = document.getElementById("dem-input");
   if (input) input.closest("section")?.scrollIntoView({ behavior: "smooth" });
@@ -194,6 +245,7 @@ export function showResult(r) {
   } else {
     wb.classList.add("hidden");
   }
+  renderCaptureReport(r);
   $("img-overlay").src = artifactURL("overlay.jpg", true);
   $("img-height").src = artifactURL("heightmap.png", true);
   $("img-slope").src = artifactURL("slopemap.png", true);

@@ -2014,3 +2014,272 @@ flagged here, not smoothed over.
   to the five files this stage names. No S6b defect found.
 - **S7 is not started**, per the instruction for this pass. Per the same
   instruction, this pass stops here.
+
+## S7 — Device and field validation (`GUIDED_CAPTURE_PLAN.md` §12 stage table, row 7)
+
+**Base:** `main` @ `95ee5c1` (S6b). This pass changed no application code —
+`landslide/`, `server/*.py`, and every `server/static/*` file are byte-for-byte
+unchanged from `95ee5c1`. Only this file was edited. **This is a validation-only
+pass**: the instruction was to complete S7's final validation, run the planned
+final tests, fix only clear integration defects actually found, and record
+results/limitations/a deployment recommendation. No integration defect was
+found in the product during this pass (see below), so nothing else changed.
+
+### What S7 asks for, and what this environment can and cannot do
+
+The stage table's S7 row is explicit: "Android Chrome and iOS Safari over
+HTTP (no sensors) and HTTPS (sensors). ≥ 3 real sites, one with a pre-event
+DEM," gated on criterion 8. None of that is reachable here — this is a
+sandboxed dev container with no phone, no browser, and no landslide to visit.
+Every prior stage (S1–S6b) already recorded this same gap for its own piece
+of the work; S7 is where the plan expected it to finally get closed, and it
+cannot be, in this environment. That is stated plainly in the deployment
+recommendation below rather than worked around.
+
+What *is* reachable, and is new for this pass: every stage from S1 through
+S6b shipped its own route-level tests with the heavy step
+(`executor.submit_job` / `worker.run_preview` / `worker.run_reconstruction`)
+**monkeypatched out**, by their own explicit design (S4's own docstring:
+"same pattern as `tests/test_server.py`"). That is the right call for a fast
+unit-test suite, but it means no test in this repository, before this pass,
+had ever driven the guided-capture HTTP API end to end through a real,
+unmocked preview → finalize → reconstruction → scale → measure run. This
+pass adds exactly that one run, as the closest thing to "final validation"
+this environment can produce, and treats it as informative, not as a
+substitute for criterion 8's real sites.
+
+### Focused validation (regression, no code changed)
+
+```
+.venv/bin/python -m pytest -q -k "not e2e"                                        # 239 passed, 3 skipped, 23 deselected
+.venv/bin/python -m pytest -q tests/test_capture.py tests/test_capture_session.py \
+  tests/test_capture_preview.py tests/test_capture_preview_routes.py \
+  tests/test_capture_metrics.py                                                    # 45 passed
+node --test tests/*.mjs                                                            # 26 passed
+node --check <every file under server/static/js/**/*.js>                          # all clean
+```
+
+239/3/23 matches S6b's own baseline exactly — no regression from anything on
+`main` since `95ee5c1`. (The "worker process crashed (native crash)" fast-suite
+line is, as every prior stage has noted, `test_worker_crash_is_isolated_and_pool_recovers`
+deliberately killing a worker — not a new failure.)
+
+### A real, fully unmocked end-to-end run (new for this pass)
+
+Drove the actual, running server (`server.main.app`, via `TestClient`, no
+endpoint or worker function monkeypatched) through the complete guided-capture
+lifecycle using `data/bench/arc`'s 21 already-rendered synthetic photos
+(re-encoded PNG→JPEG, quality 92 — the capture endpoint requires `.jpg`):
+
+1. `POST /api/jobs/capture` → `capturing` job.
+2. 21× `PUT .../capture/photos/{uuid}` (arm `A`, real `image_checks`: real
+   Laplacian/clip/dHash, real SIFT, real marker detection — nothing mocked).
+3. `POST .../capture/preview` → **real** `worker.run_preview` in a real
+   process-pool worker: real SIFT extraction, real exhaustive matching, real
+   incremental SfM. Result: **21/21 registered**, preview `done`.
+4. `POST .../capture/finalize` → **real** `worker.run_reconstruction`: SIFT →
+   matching → incremental mapping again (finalize re-imports and
+   re-reconstructs from the originals, same as any non-guided job). Result:
+   **21/21 registered**, job reaches `ready`.
+5. `POST .../scale/aruco` (`side_m=2.0`, matching the scene's actual printed
+   marker) → real marker detection: `DICT_6X6_250` id 0 seen in all 21 views,
+   side spread 0.5%, scale ±1.3%, PnP cross-check spread 0.8%.
+6. `POST .../measure` (real dense multi-view stereo fusion, 21/21 views
+   contributing, 257 329 fused points; real ground/rim-band extraction, real
+   robust datum fit, real bridging/coverage gates).
+
+**Final result** (`res["status"]` etc., read via `Job.snapshot()`):
+
+| Field | Value |
+| --- | --- |
+| `status` | `rejected` |
+| `reason_ids` | `["G6_rejected", "G9_datum_unstable"]` |
+| `measurement_path` | `capture_failure` |
+| `coverage_frac` | 0.586 |
+| `largest_void_m2` | 42.25 |
+| `datum` | `rim_quad` |
+| `net_volume_m3` / `cut_volume_m3` | −49.30 / 49.30 |
+
+`result["capture_report"]` (S6b, read the same way): `arms: {"A": 21}`,
+`marker_views: {"A": 21}`, `preview_status: "done"`, `elevation_deg: 20.2`,
+`preview_checks: []`, `datum_estimate_ratio: 0.606` (carried as informational
+context only, exactly as §12b.6/S6b specify — never shown as a predicted
+path), `finalized_override: false`.
+
+**Assessment.** This is exactly the outcome the plan's own evidence base
+predicts for a single-azimuth capture: `arc`'s documented coverage band is
+0.48–0.62 (`GUIDED_CAPTURE_PLAN.md` §1), and 0.586 sits inside it, on the
+`rejected` side of the 0.6 floor this time rather than the `indicative` side
+S0's own bench run landed on — both are known, gated outcomes for a single
+arc, not a surprise. `classify_measurement_path` correctly returned
+`capture_failure` (a `capture`-class reason, `G6_rejected`, fired alongside
+the `datum`-class `G9_datum_unstable`, and §7a.1 rule 1 — capture wins —
+applied exactly as S6a's own fixture tests already pin). The capture-session
+manifest, the real preview report, the real finalize/reconstruction, the real
+scale, and the real gate/classification/report chain all agree with each
+other and with the plan's own predictions. **No defect was found in
+`server/` or `landslide/` code anywhere in this run.**
+
+One pre-existing, already-documented gap showed up again exactly as
+predicted: 19 of the 21 photos' T1 `image_checks` returned `verdict=fail` on
+the `features` reason — the client-preview-resolution (≤900 px) SIFT count on
+this repo's only synthetic scene falls under the 300-keypoint floor, the same
+"honest numeric-ceiling gap" S1/S2's own progress notes already recorded
+(`tests/test_capture.py`'s own 229-keypoint ceiling). Confirmed here from a
+different angle: full-resolution SfM on the *same* JPEGs (step 3 above) got
+2 800–3 000 SIFT features per image and registered 21/21 without issue — the
+scene has plenty of real texture; only the client-preview downscale, on this
+specific synthetic renderer, does not clear the fail threshold. This is not a
+new finding and nothing was changed because of it (per the plan's own
+standing rule: thresholds are calibrated against real prints/photos in S5/S7,
+never loosened to fit synthetic content) — it is recorded here because this
+is the first time it was observed via the *real* HTTP endpoint end to end
+rather than via a hand-built fixture.
+
+### Bugs found this pass — all three in the throwaway validation script, none in the product
+
+Building the run above took three fix cycles, each a bug in my own scratch
+script, not in `server/`/`landslide/`:
+
+1. **Missing `if __name__ == "__main__":` guard.** The first attempt's script
+   body ran at top level; `multiprocessing`'s forkserver bootstrap re-imported
+   the script as `__mp_main__` inside the worker process it was trying to
+   start, which re-ran the *entire* script (including the upload loop) a
+   second time before crashing with `RuntimeError: An attempt has been made
+   to start a new process before the current process has finished its
+   bootstrapping phase`. Fixed by wrapping the script in `main()` behind the
+   standard guard. No `server/executor.py` code was touched — that module
+   already assumes a real program entry point, which every real invocation
+   (`uvicorn server.main:app`) provides.
+2. **Wrong JSON field name.** `POST .../measure` was called with `{"photo":
+   ...}`; the real field is `image` (`server/schemas.py::MeasureRequest`).
+   Pydantic silently dropped the unknown key and defaulted `image` to `None`,
+   and `landslide/pipeline.py::measure` correctly raised `ValueError("image
+   'None' is not part of the reconstruction")` — a clear, specific error, not
+   a crash or a silent wrong answer. The server behaved correctly; the script
+   was fixed to send `image`.
+3. **Polling for a status that doesn't exist.** The script waited for
+   `status in ("completed", "error")`; this app's actual status set is
+   `capturing|reconstructing|ready|measuring|orthorectifying|error`
+   (`server/jobs.py:40`) — a finished job returns to `ready` with `result`
+   populated, there is no `completed` state. Fixed to check `status ==
+   "ready" and result is not None`.
+
+A fourth thing, not a bug but worth recording: a bare `TestClient(app)` (no
+`with` block) does not run FastAPI's `lifespan` context, so
+`load_persisted_jobs()` never fires and a fresh script process cannot see
+jobs an earlier process created on disk. Calling `load_persisted_jobs()`
+directly before constructing the client reattached the job correctly
+(confirmed: manifest, `scale_info`, and status all came back intact). This
+only affects a bare `TestClient` in a throwaway script — every real
+deployment runs under `uvicorn`, which always executes `lifespan` on boot,
+and this is exactly the path S2's own `test_load_persisted_jobs_reattaches_capturing_session`
+already exercises (by calling `load_persisted_jobs()` directly, same as
+here). Recorded for completeness, not as a gap.
+
+One of the mid-flight script attempts also left four empty/erroring
+`data/jobs/2026092*` directories on disk (a duplicate-session artifact of bug
+1, before it was fixed) and one long-running orphaned dense-stereo
+subprocess that had already finished naturally by the time it was checked.
+`data/jobs/` is untracked (`git status --porcelain data/jobs` is empty), so
+this touched no repository file; the four junk directories were removed, and
+the one real validation job (`20260928-192219-11218a`) was left on disk as
+evidence, safe to delete at any time.
+
+### Remaining real-device / field-test requirements (still open, cannot be closed here)
+
+- **Criterion 5, real-hardware latency.** T0 ≤ 300 ms/photo and T1 ≤ 2 s
+  p95 have never been measured on real phone/field-laptop hardware in any
+  stage (S1–S3 each recorded this gap for their own piece). T3 ≤ 60 s for 30
+  photos **was** measured for real, on this dev box, back in S4: 111 s for 38
+  photos (≈88 s scaled to 30) — a real, already-recorded miss against the
+  budget, unresolved here and unchanged by this pass (no code was touched).
+- **Android Chrome / iOS Safari, HTTP and HTTPS.** No browser exists in this
+  environment, per every prior stage's own notes. `capture.js`'s DOM wiring
+  (`createImageBitmap`, `FormData`/`fetch`, `deviceorientation`,
+  `IndexedDB`) has been syntax-checked and driven indirectly through its own
+  HTTP contract (S2/S3's own scripts, and this pass's), never through an
+  actual browser tab.
+- **Criterion 8 — ≥ 3 real sites, ≥ 1 with a pre-event DEM.** Not attempted;
+  requires real terrain and a real device. This is the criterion the plan
+  itself names as the only check of the radially-symmetric datum blind spot
+  (§3a.1) and the only evidence that guided capture "prevents weak captures"
+  outside synthetic data. It remains entirely open.
+- **Criterion 6(e)**, kill-the-tab-and-reopen on a real device: same gap,
+  unchanged from S3/S5's own notes.
+
+### A structural blocker independent of hardware: the plan's own S5 was never built
+
+The stage table lists S7's dependencies as **S5 and S6b**. S6b is done. S5
+is not — and this needs to be said plainly, because the "S5" heading earlier
+in *this same file* ("Capture persistence and recovery") is a different,
+separately-approved slice that reused the label; its own opening paragraph
+already flags this ("not the plan's own numbered 'S5' row... coverage and
+recapture... That row is untouched by this pass"), and S6b's "Deviations"
+section flags it again. The plan's actual S5 — the ROI tap, the §5 per-cell
+coverage/void map, calibrated `c_rej`/`c_ok` thresholds, the top-down sketch,
+and directional recapture instructions — has no code anywhere in this
+repository.
+
+This pass's own real run makes the gap concrete rather than theoretical: step
+3 above (the real preview) produced `preview_checks: []` — no predicted
+finding at all — while the *final* measurement (step 6) rejected on
+`G6_rejected`, a 58.6%-coverage / 42.25 m² void outcome the preview never
+saw coming, because the coverage/void proxy that would have predicted it
+(§5.2/§5.3) does not exist. Criterion 4 ("predicted vs actual G6 class
+matches on ≥ 8/9 presets") and criterion 3's "full" checkbox (a slow
+preset-replay test, `tests/test_e2e_capture.py`, which S4's own notes already
+flagged as never written) are both still unmet — not because of anything
+this pass found wrong, but because the capability they depend on was never
+built. **S7 cannot be considered fully satisfied against the plan's own
+dependency graph, independent of the real-device/field gap above.**
+
+### Deployment recommendation
+
+**Ship guided capture as an opt-in/beta capture path alongside the existing
+expert multi-file upload — leave the expert upload exactly as it is, as the
+safe, unconditional fallback.** Grounds: the full fast/node suite shows zero
+regression from anything already on `main`, and this pass's one genuine,
+fully-unmocked end-to-end run exercised every layer of the new code
+(session, per-photo checks, preview SfM, finalize, real reconstruction, real
+scale, real dense stereo, real gates, the S6a path classification, and the
+S6b capture report) without finding a single defect in `server/` or
+`landslide/` — every result it produced was internally consistent and
+matched the plan's own predictions.
+
+**Do not yet:** market it as replacing on-site judgment, promise `ok`
+outcomes, or reduce visibility of the expert-upload fallback. Before a wider
+rollout:
+
+1. **Build the plan's own S5.** Without the coverage/void map and calibrated
+   `c_rej`/`c_ok`, the guided UI cannot tell a user in the field that their
+   capture is heading for `rejected` — which is the single most valuable
+   thing this whole plan set out to do (§1: "catch these faults while the
+   user is still on site"). This pass's own real run is a direct
+   demonstration: the preview said nothing, and the final gate rejected.
+2. **Measure T0/T1/T3 on real target hardware** and revisit the T3 60 s
+   budget if the already-recorded 111 s dev-box number (S4) holds up on a
+   real field laptop — the budget may need revisiting rather than the code.
+3. **Run criterion 8** — at least 3 real sites, at least 1 with an
+   independent pre-event DEM — before any claim that guided capture
+   "prevents weak captures" outside synthetic data.
+
+### Acceptance status
+
+- **Regression (criterion 7).** Met — fast suite, capture-specific suite,
+  and node suite all pass at their established baselines; no code changed.
+- **A real, unmocked end-to-end run of the full guided-capture pipeline** —
+  new for this pass, not named as a numbered criterion but the closest
+  in-environment substitute for criterion 3's "full" preset-replay checkbox.
+  Passed: no defect found, output matches the plan's own predictions exactly.
+- **Criteria 5 (real-hardware latency), 6(e), 8 (real field sites)** — not
+  met, not attempted, require hardware/terrain this environment does not
+  have. Recorded as open, not worked around.
+- **Criteria 3 ("full") and 4 (predicted-vs-actual G6)** — not met, because
+  they depend on the plan's own S5, which remains unbuilt (see above) —
+  independent of this pass's own findings.
+- **No integration defect was found in the product during this pass.** The
+  three bugs found and fixed were in this pass's own throwaway validation
+  script only (listed above); no `landslide/`, `server/`, or
+  `server/static/*` file was changed.
+- Per the task instruction, this pass stops here.

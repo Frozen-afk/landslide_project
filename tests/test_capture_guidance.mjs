@@ -7,6 +7,7 @@ import {
   photoCountGuidance, markerViewGuidance, overlapGapGuidance,
   viewpointDiversityGuidance, cameraHeightGuidance, armTransitionGuidance,
   nextCaptureSeq, lastCaptureArm, nextBackoffMs, pendingNotYetOnServer,
+  coverageSummaryText, instructionProgress, sketchLayout,
 } from "../server/static/js/capture_guidance.js";
 
 test("circular stats: mean, diff and spread handle the 0/360 wraparound", () => {
@@ -102,4 +103,62 @@ test("pendingNotYetOnServer: only uuids missing from the manifest need a re-send
   assert.deepEqual(pendingNotYetOnServer(manifest, ["a", "c"]), ["c"]);
   assert.deepEqual(pendingNotYetOnServer(manifest, ["a", "b"]), []);
   assert.deepEqual(pendingNotYetOnServer([], ["a"]), ["a"]);
+});
+
+// S5C (§12c.9, §11 criterion 9): coverage/ROI display helpers.
+
+test("coverageSummaryText: predicted class wins, else a flagged percentage", () => {
+  assert.equal(coverageSummaryText(null), "Coverage estimate unavailable");
+  assert.equal(coverageSummaryText({ unavailable: "marker scale failed" }),
+    "Coverage estimate unavailable (marker scale failed)");
+  assert.equal(coverageSummaryText({ preview_coverage: 0.71, roi_source: "default" }),
+    "Coverage estimate 71% (lower-confidence: no outline drawn)");
+  assert.equal(coverageSummaryText({ preview_coverage: 0.71, roi_source: "tap" }),
+    "Coverage estimate 71%");
+  assert.equal(coverageSummaryText({ preview_coverage: 0.9, roi_source: "tap", predicted_g6: "indicative" }),
+    "Predicted: indicative");
+});
+
+test("instructionProgress: counts only photos after max_seq on the instruction's arm", () => {
+  const manifest = [
+    { uuid: "1", arm: "A", seq: 0, excluded: false },
+    { uuid: "2", arm: "A", seq: 5, excluded: false },
+    { uuid: "3", arm: "A", seq: 6, excluded: false },
+    { uuid: "4", arm: "B", seq: 7, excluded: false },
+    { uuid: "5", arm: "A", seq: 8, excluded: true },
+  ];
+  const instructions = [
+    { kind: "extend_arm", arm: "A", n_photos: 2 },
+    { kind: "new_arm", arm: "B", n_photos: 12 },
+    { kind: "higher", arm: "A", n_photos: 0 },
+  ];
+  const out = instructionProgress(instructions, manifest, 4);
+  assert.deepEqual(out[0], { k: 2, n: 2, done: true });    // seq 5, 6 on arm A
+  assert.deepEqual(out[1], { k: 1, n: 12, done: false });  // seq 7 on arm B
+  assert.deepEqual(out[2], { k: 0, n: 0, done: true });    // "higher" has no photo-count progress
+});
+
+test("sketchLayout: fits the ROI/cameras with margin, north arrow only with an offset", () => {
+  const coverage = {
+    grid: { u0: 0, v0: 0, cell: 1, nx: 4, ny: 4, classes: "gggg\nwwvv\nGGVV\n...." },
+    roi_ground: [[0, 0], [3, 0], [3, 3], [0, 3]],
+    roi_centroid_uv: [1.5, 1.5],
+    cameras: [{ name: "A0", arm: "A", u: -2, v: -2 }, { name: "A1", arm: "A", u: 6, v: 6 }],
+    instructions: [{ kind: "extend_arm", arm: "A", target_az: 90, stand_m: 5 }],
+    compass_offset_deg: null,
+  };
+  const layout = sketchLayout(coverage, 200, 200, 8);
+  assert.ok(layout);
+  for (const p of [...layout.roiPath, ...layout.camDots]) {
+    assert.ok(p.x >= 8 - 1e-6 && p.x <= 200 - 8 + 1e-6);
+    assert.ok(p.y >= 8 - 1e-6 && p.y <= 200 - 8 + 1e-6);
+  }
+  assert.equal(layout.targets.length, 1);
+  assert.equal(layout.north, null);
+
+  const withNorth = sketchLayout({ ...coverage, compass_offset_deg: 12 }, 200, 200);
+  assert.ok(withNorth.north);
+  assert.equal(withNorth.north.angleDeg, -12);
+
+  assert.equal(sketchLayout({ unavailable: "x" }, 200, 200), null);
 });

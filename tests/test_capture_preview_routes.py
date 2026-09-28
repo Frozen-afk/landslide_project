@@ -158,6 +158,160 @@ def test_delete_job_refuses_while_a_preview_is_running(capture_job, monkeypatch)
     assert r.status_code == 409
 
 
+# ---------------------------------------------------------------------------
+# S5C (GUIDED_CAPTURE_PLAN.md §12c.8, §11 criterion 8): ROI endpoint, roi_only
+# reuse, and finalize's stale_preview flag.
+# ---------------------------------------------------------------------------
+
+SQUARE = [[0, 0], [10, 0], [10, 10], [0, 10]]
+
+
+def test_roi_put_rejects_too_few_vertices(capture_job):
+    _put(capture_job, "u0", "overlap_a.jpg", 0)
+    r = client.put(f"/api/jobs/{capture_job}/capture/roi",
+                   json={"photo_uuid": "u0", "polygon": [[0, 0], [1, 1]]})
+    assert r.status_code == 422
+
+
+def test_roi_put_rejects_too_many_vertices(capture_job):
+    _put(capture_job, "u0", "overlap_a.jpg", 0)
+    poly = [[i % 5, i] for i in range(201)]
+    r = client.put(f"/api/jobs/{capture_job}/capture/roi",
+                   json={"photo_uuid": "u0", "polygon": poly})
+    assert r.status_code == 422
+
+
+def test_roi_put_rejects_self_intersecting_polygon(capture_job):
+    _put(capture_job, "u0", "overlap_a.jpg", 0)
+    bowtie = [[0, 0], [10, 10], [10, 0], [0, 10]]   # crosses itself
+    r = client.put(f"/api/jobs/{capture_job}/capture/roi",
+                   json={"photo_uuid": "u0", "polygon": bowtie})
+    assert r.status_code == 422
+
+
+def test_roi_put_rejects_unknown_photo(capture_job):
+    _put(capture_job, "u0", "overlap_a.jpg", 0)
+    r = client.put(f"/api/jobs/{capture_job}/capture/roi",
+                   json={"photo_uuid": "does-not-exist", "polygon": SQUARE})
+    assert r.status_code == 404
+
+
+def test_roi_put_rejects_excluded_photo(capture_job):
+    _put(capture_job, "u0", "overlap_a.jpg", 0)
+    client.delete(f"/api/jobs/{capture_job}/capture/photos/u0")
+    r = client.put(f"/api/jobs/{capture_job}/capture/roi",
+                   json={"photo_uuid": "u0", "polygon": SQUARE})
+    assert r.status_code == 409
+
+
+def test_roi_put_ok_and_persists_in_the_manifest(capture_job):
+    _put(capture_job, "u0", "overlap_a.jpg", 0)
+    r = client.put(f"/api/jobs/{capture_job}/capture/roi",
+                   json={"photo_uuid": "u0", "polygon": SQUARE})
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+    snap = client.get(f"/api/jobs/{capture_job}/capture").json()
+    assert snap["roi"]["photo_uuid"] == "u0"
+    assert snap["roi"]["polygon_px"] == [[float(x), float(y)] for x, y in SQUARE]
+
+
+def test_roi_put_during_running_preview_sets_rerun_after(capture_job, monkeypatch):
+    _put_three(capture_job)
+
+    def _submit(job, fn, *extra_args, on_done):
+        pass   # never resolves — preview stays "running"
+
+    monkeypatch.setattr("server.routes.executor.submit_job", _submit)
+    r = client.post(f"/api/jobs/{capture_job}/capture/preview")
+    assert r.status_code == 200
+
+    r = client.put(f"/api/jobs/{capture_job}/capture/roi",
+                   json={"photo_uuid": "u0", "polygon": SQUARE})
+    assert r.status_code == 200
+    assert r.json()["preview_stale"] is True
+    snap = client.get(f"/api/jobs/{capture_job}/capture").json()
+    assert snap["preview"]["rerun_after"] is True
+
+
+def test_roi_persists_across_load_persisted_jobs(capture_job):
+    r = client.put(f"/api/jobs/{capture_job}/capture/roi",
+                   json={"photo_uuid": "u0", "polygon": SQUARE})
+    # roi PUT needs a known photo uuid; without one it 404s, which is fine —
+    # this test only checks the manifest round-trips through the loader once
+    # the field is set directly.
+    with JOBS_LOCK:
+        job = JOBS[capture_job]
+    with job.lock:
+        job.capture["roi"] = {"photo_uuid": "zzz", "polygon_px": SQUARE, "set_at": 1.0}
+    job.save_capture()
+
+    jobs_mod.load_persisted_jobs()
+    with JOBS_LOCK:
+        reloaded = JOBS[capture_job]
+    assert reloaded.capture["roi"]["photo_uuid"] == "zzz"
+
+
+def test_roi_only_falls_back_to_full_run_when_photo_set_changed(capture_job, monkeypatch):
+    _put_three(capture_job)
+    calls = []
+
+    def _submit(job, fn, capture_dir, originals_order, marker_side_m, marker_dict,
+               roi, reuse, on_done):
+        calls.append(reuse)
+        on_done(job, {"checks": [], "blocking": [], "n_registered": 3,
+                      "photo_set": None}, None)
+
+    monkeypatch.setattr("server.routes.executor.submit_job", _submit)
+    r = client.post(f"/api/jobs/{capture_job}/capture/preview")
+    assert r.status_code == 200
+    assert calls == [False]   # first run: nothing to reuse yet
+
+    _put(capture_job, "u3", "overlap_a.jpg", 3)   # photo set changes
+    r = client.post(f"/api/jobs/{capture_job}/capture/preview", json={"roi_only": True})
+    assert r.status_code == 200
+    assert calls == [False, False]   # roi_only requested, but photo set drifted
+
+
+def test_roi_only_reuses_when_photo_set_unchanged(capture_job, monkeypatch):
+    _put_three(capture_job)
+    calls = []
+
+    def _submit(job, fn, capture_dir, originals_order, marker_side_m, marker_dict,
+               roi, reuse, on_done):
+        calls.append(reuse)
+        on_done(job, {"checks": [], "blocking": [], "n_registered": 3}, None)
+
+    monkeypatch.setattr("server.routes.executor.submit_job", _submit)
+    client.post(f"/api/jobs/{capture_job}/capture/preview")
+    r = client.post(f"/api/jobs/{capture_job}/capture/preview", json={"roi_only": True})
+    assert r.status_code == 200
+    assert calls == [False, True]
+
+
+def test_finalize_409_carries_stale_preview(capture_job, monkeypatch):
+    _put_three(capture_job)
+    report = {"checks": [{"id": "G4_collinear", "level": "block", "text": "walk a curve"}],
+             "blocking": ["G4_collinear"]}
+    monkeypatch.setattr("server.routes.executor.submit_job", _fake_submit(report))
+    client.post(f"/api/jobs/{capture_job}/capture/preview")
+
+    _put(capture_job, "u3", "overlap_a.jpg", 3)   # photo set drifts after the preview
+    r = client.post(f"/api/jobs/{capture_job}/capture/finalize", json={})
+    assert r.status_code == 409
+    assert r.json()["detail"]["stale_preview"] is True
+
+
+def test_finalize_with_a_report_missing_coverage_still_finalizes(capture_job, monkeypatch):
+    _put_three(capture_job)
+    report = {"checks": [], "blocking": [], "n_registered": 3}   # no "coverage" key
+    monkeypatch.setattr("server.routes.executor.submit_job", _fake_submit(report))
+    client.post(f"/api/jobs/{capture_job}/capture/preview")
+
+    monkeypatch.setattr("server.routes.executor.submit_job", lambda *a, **kw: None)
+    r = client.post(f"/api/jobs/{capture_job}/capture/finalize", json={})
+    assert r.status_code == 200, r.text
+
+
 def test_load_persisted_jobs_marks_a_running_preview_stale(tmp_path, monkeypatch):
     jid = "20990101-000004-eeeeee"
     d = tmp_path / jid

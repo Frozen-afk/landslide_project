@@ -5,8 +5,18 @@ export async function api(path, opts) {
   const r = await fetch(path, opts);
   if (!r.ok) {
     let msg = r.statusText;
-    try { msg = (await r.json()).detail || msg; } catch (e) { /* not JSON */ }
-    throw new Error(msg);
+    let detail = null;
+    try {
+      detail = (await r.json()).detail;
+      // S5C (GUIDED_CAPTURE_PLAN.md §12c.9): a structured 409 detail (e.g.
+      // finalize's `{blocking, stale_preview}`) used to stringify to
+      // "[object Object]" here. Keep the object on the thrown error instead,
+      // and fall back to statusText for the plain string it used to be.
+      if (typeof detail === "string" && detail) msg = detail;
+    } catch (e) { /* not JSON */ }
+    const err = new Error(msg);
+    if (detail && typeof detail === "object") err.detail = detail;
+    throw err;
   }
   return r.json();
 }

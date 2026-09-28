@@ -125,6 +125,16 @@ function renderCaptureReport(r) {
       `only, not a prediction — see the result's own "path" and reasons ` +
       `above for the actual measurement): ratio ${cr.datum_estimate_ratio.toFixed(2)}</div>`);
   }
+  // S5C (§12c.8): the predicted-vs-actual pair criterion 8 needs to check
+  // the coverage proxy against real field sites. `predicted_g6` is null
+  // until the §12c.5 calibration freezes C_REJ/C_OK.
+  if (typeof cr.preview_coverage === "number") {
+    const pct = Math.round(cr.preview_coverage * 100);
+    const actual = typeof r.coverage_frac === "number"
+      ? `${Math.round(r.coverage_frac * 100)}% (${r.status || "?"})` : (r.status || "?");
+    lines.push(`<div>predicted G6 ${cr.predicted_g6 || `~${pct}%`} → actual ${actual}` +
+      (cr.roi_source ? ` (roi: ${cr.roi_source})` : "") + `</div>`);
+  }
   if (cr.finalized_override) {
     lines.push(`<div class="err">⚠ finalized with override — ` +
       `${cr.overridden_checks.length} on-site preview warning(s) were bypassed:</div><ul>` +

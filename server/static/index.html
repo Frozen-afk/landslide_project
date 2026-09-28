@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Landslide Volume from Phone Photos</title>
-<link rel="stylesheet" href="/static/style.css?v=5">
+<link rel="stylesheet" href="/static/style.css?v=6">
 </head>
 <body>
 <header>
@@ -72,8 +72,26 @@
       <button id="capture-finish" class="primary" disabled>Finish and reconstruct</button>
     </div>
     <div id="capture-last-photo" class="capture-checks"></div>
+    <div class="row">
+      <button id="capture-roi-open" disabled>Draw slide outline</button>
+    </div>
     <div id="capture-sequence" class="capture-checks"></div>
     <div id="capture-preview" class="capture-checks"></div>
+    <canvas id="capture-sketch" width="320" height="240" class="capture-sketch"></canvas>
+    <div id="capture-coverage" class="capture-checks"></div>
+  </div>
+
+  <!-- §12c.3 ROI editor: drawn on the last kept photo's own local blob -->
+  <div id="capture-roi" class="hidden">
+    <p class="note">Tap around the slide edge: the line between disturbed and undisturbed ground. Not the photo edge.</p>
+    <canvas id="capture-roi-canvas"></canvas>
+    <div class="row">
+      <button id="capture-roi-undo">Undo</button>
+      <button id="capture-roi-clear">Clear</button>
+      <button id="capture-roi-save" class="primary">Save</button>
+      <button id="capture-roi-skip">Skip</button>
+    </div>
+    <div id="capture-roi-status" class="note"></div>
   </div>
 </section>
 
@@ -190,6 +208,6 @@
 </section>
 </main>
 
-<script type="module" src="/static/js/main.js?v=1"></script>
+<script type="module" src="/static/js/main.js?v=2"></script>
 </body>
 </html>

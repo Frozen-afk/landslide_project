@@ -37,7 +37,8 @@ from landslide.sfm import IMAGE_EXTS, count_photos  # noqa: E402
 from server import executor, jobs, worker  # noqa: E402
 from server.jobs import JOBS, JOBS_LOCK, Job, _photo_cache  # noqa: E402
 from server.schemas import (ArucoScaleRequest, CaptureFinalizeRequest,  # noqa: E402
-                            CapturePhotoMeta, CaptureSessionRequest,
+                            CapturePhotoMeta, CapturePreviewRequest,
+                            CaptureRoiRequest, CaptureSessionRequest,
                             ManualScaleRequest, MeasureRequest)
 
 MAX_PHOTOS = 200          # per job
@@ -275,13 +276,76 @@ def delete_capture_photo(job_id: str, photo_uuid: str):
     return {"excluded": True}
 
 
+def _polygon_valid(polygon: list) -> str | None:
+    """§12c.8 ROI validation. Returns an error message, or None if ok."""
+    n = len(polygon)
+    if n < 3:
+        return "polygon needs at least 3 vertices"
+    if n > 200:
+        return "polygon has more than 200 vertices"
+    pts = [(float(x), float(y)) for x, y in polygon]
+
+    def _seg_intersect(a, b, c, d):
+        def ccw(p, q, r):
+            return (r[1] - p[1]) * (q[0] - p[0]) - (q[1] - p[1]) * (r[0] - p[0])
+        d1, d2 = ccw(a, b, c), ccw(a, b, d)
+        d3, d4 = ccw(c, d, a), ccw(c, d, b)
+        return (d1 > 0) != (d2 > 0) and (d3 > 0) != (d4 > 0)
+
+    edges = [(pts[i], pts[(i + 1) % n]) for i in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if j == i or (j + 1) % n == i or (i + 1) % n == j:
+                continue   # adjacent edges share an endpoint, not a crossing
+            if _seg_intersect(*edges[i], *edges[j]):
+                return "polygon edges self-intersect"
+    return None
+
+
+@router.put("/api/jobs/{job_id}/capture/roi")
+def put_capture_roi(job_id: str, spec: CaptureRoiRequest):
+    """S5C (§12c.3, §12c.8): store the tapped slide outline. Idempotent —
+    the last write wins. A preview in flight is marked to re-run once it
+    finishes, same mechanism as a mid-run second preview request."""
+    job = _get_capturing_job(job_id)
+    err = _polygon_valid(spec.polygon)
+    if err:
+        raise HTTPException(422, err)
+    with job.lock:
+        photo = next((p for p in job.capture["photos"] if p["uuid"] == spec.photo_uuid), None)
+        if photo is None:
+            raise HTTPException(404, "no such photo in this session")
+        if photo["excluded"]:
+            raise HTTPException(409, "that photo was excluded — draw the outline on a kept photo")
+        job.capture["roi"] = {"photo_uuid": spec.photo_uuid,
+                              "polygon_px": [list(p) for p in spec.polygon],
+                              "set_at": time.time()}
+        preview = job.capture.get("preview")
+        stale = False
+        if preview and preview.get("status") == "running":
+            preview["rerun_after"] = True
+            stale = True
+        elif preview and preview.get("status") == "done":
+            stale = True
+    job.save_capture()
+    return {"ok": True, "preview_stale": stale}
+
+
 @router.post("/api/jobs/{job_id}/capture/preview")
-def start_capture_preview(job_id: str):
-    """S4 (§9.2): one preview SfM attempt (cheap: 1000 px, single attempt)
-    on the kept photos so far, run in the same worker pool as reconstruction
-    (`executor.submit_job`) so a crash there can't take the server down. One
-    preview in flight per job; a request that arrives mid-run is queued to
-    re-run once the current one finishes, per §9.2's own spec."""
+def start_capture_preview(job_id: str, spec: CapturePreviewRequest = CapturePreviewRequest()):
+    """S4/S5C (§9.2, §12c.8): one preview SfM attempt (cheap: 1000 px, single
+    attempt) on the kept photos so far, run in the same worker pool as
+    reconstruction (`executor.submit_job`) so a crash there can't take the
+    server down. One preview in flight per job; a request that arrives
+    mid-run is queued to re-run once the current one finishes.
+
+    `spec.roi_only` (§12c.8): when true AND the kept-photo uuid set matches
+    the last *done* preview's own `photo_set`, the worker reuses the cached
+    preview SfM (`reconstruct(..., reuse=True)`) and only recomputes the
+    coverage/instruction report — seconds, not the full ~100s attempt.
+    Falls back to a full run when the photo set changed or no prior done
+    preview exists, since `reconstruct`'s own `reuse` does not itself check
+    the photo set (`sfm.py`)."""
     job = _get_capturing_job(job_id)
     with job.lock:
         photos = sorted((p for p in job.capture["photos"] if not p["excluded"]),
@@ -293,9 +357,14 @@ def start_capture_preview(job_id: str):
             preview["rerun_after"] = True
             job.save_capture()
             return {"running": True}
+        photo_set = sorted(p["uuid"] for p in photos)
+        max_seq = photos[-1]["seq"] if photos else -1
+        reuse = bool(spec.roi_only and preview and preview.get("status") == "done"
+                    and preview.get("photo_set") == photo_set)
         job.capture["preview"] = {"status": "running", "started": time.time(),
                                   "finished": None, "n_photos": len(photos),
-                                  "report": None, "error": None}
+                                  "report": None, "error": None,
+                                  "photo_set": photo_set, "max_seq": max_seq}
         originals_order = [{"uuid": p["uuid"], "seq": p["seq"], "arm": p["arm"]}
                            for p in photos]
         marker_side_m = job.capture["marker_side_m"]
@@ -303,7 +372,7 @@ def start_capture_preview(job_id: str):
         roi = job.capture.get("roi")
     job.save_capture()
     executor.submit_job(job, worker.run_preview, job.capture_dir, originals_order,
-                        marker_side_m, marker_dict, roi, on_done=_on_preview_done)
+                        marker_side_m, marker_dict, roi, reuse, on_done=_on_preview_done)
     return {"queued": True}
 
 
@@ -363,8 +432,13 @@ async def finalize_capture(job_id: str, spec: CaptureFinalizeRequest):
             blocking_ids = list(report.get("blocking", []))
             by_id = {c["id"]: c["text"] for c in report.get("checks", [])}
             blocking = [{"id": rid, "text": by_id.get(rid, rid)} for rid in blocking_ids]
+        # §12c.8: true when the kept-photo set has drifted since the last
+        # finished preview (new photos, a retake, an exclusion) — the UI
+        # offers "re-run preview" instead of "finish anyway" in that case.
+        current_set = sorted(p["uuid"] for p in photos)
+        stale_preview = bool(preview) and preview.get("photo_set") != current_set
         if blocking_ids and not spec.override:
-            raise HTTPException(409, {"blocking": blocking})
+            raise HTTPException(409, {"blocking": blocking, "stale_preview": stale_preview})
         job.status = "reconstructing"   # marks the session closed to further PUT/DELETE
     job.save_state()
 

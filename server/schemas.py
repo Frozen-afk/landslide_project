@@ -51,3 +51,17 @@ class CapturePhotoMeta(BaseModel):
 
 class CaptureFinalizeRequest(BaseModel):
     override: bool = False
+
+
+class CaptureRoiRequest(BaseModel):
+    """S5C (GUIDED_CAPTURE_PLAN.md §12c.8): the tapped slide outline, in the
+    ROI photo's own original-resolution pixel coordinates."""
+    photo_uuid: str
+    polygon: list[tuple[float, float]]
+
+
+class CapturePreviewRequest(BaseModel):
+    """S5C (§12c.8): optional body on `POST .../capture/preview`. Backward
+    compatible — an empty body (S4's original contract) defaults to a full
+    run."""
+    roi_only: bool = False

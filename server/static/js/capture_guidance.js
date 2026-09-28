@@ -210,3 +210,98 @@ export function armTransitionGuidance(currentArm, bridgeOk) {
   }
   return [];
 }
+
+// ---------------------------------------------------------------------------
+// S5C (GUIDED_CAPTURE_PLAN.md §12c.9): coverage/ROI display helpers. Pure —
+// the `coverage` object here is `preview_report(...)["coverage"]` (§12c.8)
+// as returned by `GET .../capture` / `POST .../capture/preview`.
+// ---------------------------------------------------------------------------
+
+/** §12c.9: one-line coverage summary — "Predicted: <class>" once
+ * calibration has fixed a class, otherwise a bare percentage, flagged
+ * lower-confidence when the ROI came from the §5.1 default (no outline
+ * drawn) rather than a tap. */
+export function coverageSummaryText(coverage) {
+  if (!coverage || coverage.unavailable) {
+    return `Coverage estimate unavailable${coverage && coverage.unavailable ? ` (${coverage.unavailable})` : ""}`;
+  }
+  if (coverage.predicted_g6) return `Predicted: ${coverage.predicted_g6}`;
+  const pct = Math.round((coverage.preview_coverage || 0) * 100);
+  const note = coverage.roi_source === "tap" ? "" : " (lower-confidence: no outline drawn)";
+  return `Coverage estimate ${pct}%${note}`;
+}
+
+/** §12c.9: `[{k, n, done}]` per instruction — the count of kept photos on
+ * the instruction's own arm taken after the report's `max_seq` (§12c.6:
+ * "derived, not stored"). `higher`/rim instructions have no photo-count
+ * progress of their own (they're a re-shoot-in-place, not a walk-and-count),
+ * so they report `done: true` immediately. */
+export function instructionProgress(instructions, manifestPhotos, maxSeq) {
+  return (instructions || []).map((ins) => {
+    if (ins.kind !== "extend_arm" && ins.kind !== "new_arm") {
+      return { k: 0, n: 0, done: true };
+    }
+    const n = ins.n_photos || 12;
+    const k = (manifestPhotos || [])
+      .filter((p) => !p.excluded && p.arm === ins.arm && p.seq > (maxSeq ?? -1)).length;
+    return { k, n, done: k >= n };
+  });
+}
+
+/** §12c.9 top-down sketch layout: fits the ROI polygon, the observation-map
+ * cell grid, and the camera dots into a `w`x`h` canvas with >= `margin` px
+ * of border, plus a target wedge per directional instruction (an arc from
+ * the ROI centroid out to `stand_m` at `target_az`) and a north arrow only
+ * when `compass_offset_deg` is known. Returns null when there's nothing to
+ * draw yet (`coverage` unavailable). All output is canvas px, y-down, with
+ * ground +v mapped to "up" on screen. */
+export function sketchLayout(coverage, w, h, margin = 8) {
+  if (!coverage || coverage.unavailable || !coverage.grid) return null;
+  const { u0, v0, cell, nx, ny, classes } = coverage.grid;
+  const cams = coverage.cameras || [];
+  const u1 = u0 + nx * cell, v1 = v0 + ny * cell;
+  const us = [u0, u1, ...cams.map((c) => c.u)];
+  const vs = [v0, v1, ...cams.map((c) => c.v)];
+  const minU = Math.min(...us), maxU = Math.max(...us);
+  const minV = Math.min(...vs), maxV = Math.max(...vs);
+  const spanU = Math.max(maxU - minU, 1e-6), spanV = Math.max(maxV - minV, 1e-6);
+  const availW = Math.max(w - 2 * margin, 1), availH = Math.max(h - 2 * margin, 1);
+  const scale = Math.min(availW / spanU, availH / spanV);
+  const toPx = (u, v) => ({
+    x: margin + (u - minU) * scale,
+    y: h - margin - (v - minV) * scale,
+  });
+
+  const roiPath = (coverage.roi_ground || []).map(([u, v]) => toPx(u, v));
+
+  const rows = classes.split("\n");
+  const cells = [];
+  for (let iy = 0; iy < ny; iy++) {
+    for (let ix = 0; ix < nx; ix++) {
+      const cls = rows[iy][ix];
+      if (cls === ".") continue;
+      const p0 = toPx(u0 + ix * cell, v0 + iy * cell);
+      const p1 = toPx(u0 + (ix + 1) * cell, v0 + (iy + 1) * cell);
+      cells.push({ cls, x: Math.min(p0.x, p1.x), y: Math.min(p0.y, p1.y),
+        w: Math.abs(p1.x - p0.x), h: Math.abs(p1.y - p0.y) });
+    }
+  }
+
+  const camDots = cams.map((c) => ({ ...toPx(c.u, c.v), arm: c.arm, name: c.name }));
+
+  const roiC = coverage.roi_centroid_uv || [0, 0];
+  const from = toPx(roiC[0], roiC[1]);
+  const targets = (coverage.instructions || [])
+    .filter((ins) => ins.target_az != null && ins.stand_m != null)
+    .map((ins) => {
+      const rad = (ins.target_az * Math.PI) / 180;
+      const to = toPx(roiC[0] + ins.stand_m * Math.cos(rad),
+                      roiC[1] + ins.stand_m * Math.sin(rad));
+      return { kind: ins.kind, arm: ins.arm, fromX: from.x, fromY: from.y, toX: to.x, toY: to.y };
+    });
+
+  const north = coverage.compass_offset_deg != null
+    ? { angleDeg: -coverage.compass_offset_deg } : null;
+
+  return { scale, marginPx: margin, roiPath, cells, camDots, targets, north };
+}

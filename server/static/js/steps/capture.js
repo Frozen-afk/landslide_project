@@ -26,6 +26,8 @@
 import { state, $, LS_CAPTURE_KEY, LS_KEY } from "../state.js";
 import { api } from "../api.js";
 import { resumeJob } from "./upload.js";
+import { setupCanvas } from "../canvas.js";
+import { storedToCanvas, dist } from "../coords.js";
 import * as cm from "../capture_metrics.js";
 import * as cg from "../capture_guidance.js";
 import * as store from "../capture_store.js";
@@ -165,6 +167,92 @@ function renderLastPhoto(entry, t0) {
   $("capture-last-photo").innerHTML = row;
 }
 
+// --- ROI outline (§12c.3): drawn on the most recently taken kept photo's
+// own local blob (never re-fetched from the server). `capture_store.js`
+// evicts a photo's blob from IndexedDB as soon as the server acks it (§10),
+// so a blob usable for tracing only exists for the photo just taken, held
+// here in memory until the next one replaces it — not for an arbitrary
+// earlier photo in the manifest, a narrower case than §12c.3's "any kept
+// photo" but the one the UI actually offers (the last-photo card).
+// ---------------------------------------------------------------------------
+let lastPhotoBlobURL = null;
+let lastPhotoUuid = null;
+let roiCanvas = null;
+let roiPolygon = [];   // [{x, y}] in original-photo px (stored coords)
+let roiDirty = false;  // set on save, cleared once a preview has run since
+
+function setLastPhotoBlob(uuid, file) {
+  if (lastPhotoBlobURL) URL.revokeObjectURL(lastPhotoBlobURL);
+  lastPhotoUuid = uuid;
+  lastPhotoBlobURL = URL.createObjectURL(file);
+  const btn = $("capture-roi-open");
+  if (btn) btn.disabled = false;
+}
+
+function roiDecorator(ctx, s) {
+  if (!roiPolygon.length) return;
+  ctx.strokeStyle = "#ffe14d"; ctx.lineWidth = 2.5; ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.moveTo(roiPolygon[0].x * s, roiPolygon[0].y * s);
+  for (const v of roiPolygon.slice(1)) ctx.lineTo(v.x * s, v.y * s);
+  if (roiPolygon.length >= 3) { ctx.closePath(); ctx.fillStyle = "rgba(255,225,77,0.18)"; ctx.fill(); }
+  ctx.stroke();
+  ctx.setLineDash([]);
+  roiPolygon.forEach((v) => ctx.fillRect(v.x * s - 3, v.y * s - 3, 6, 6));
+}
+
+function roiHitTest(cpx) {
+  const R = 10;
+  for (let i = 0; i < roiPolygon.length; i++) {
+    const c = storedToCanvas(roiPolygon[i], roiCanvas.view, roiCanvas.view.zoomPan);
+    if (dist(c, cpx) < R) return { kind: "vertex", index: i };
+  }
+  return null;
+}
+
+function openRoiEditor() {
+  if (!lastPhotoBlobURL) return;
+  roiPolygon = [];
+  $("capture-roi").classList.remove("hidden");
+  $("capture-roi-status").textContent = "";
+  if (!roiCanvas) {
+    roiCanvas = setupCanvas($("capture-roi-canvas"));
+    roiCanvas.decorator = roiDecorator;
+    roiCanvas.hitTest = roiHitTest;
+    roiCanvas.onDragMove = (hit, storedPx) => { roiPolygon[hit.index] = storedPx; };
+    roiCanvas.onDragEnd = () => roiCanvas.draw(roiDecorator);
+    roiCanvas.onTap = (p) => {
+      if (roiPolygon.length < 200) roiPolygon.push(p);
+      roiCanvas.draw(roiDecorator);
+    };
+  }
+  roiCanvas.loadURL(lastPhotoBlobURL, 900, 1);
+}
+
+function closeRoiEditor() {
+  $("capture-roi").classList.add("hidden");
+}
+
+async function saveRoi() {
+  if (roiPolygon.length < 3) {
+    $("capture-roi-status").innerHTML = '<span class="err">tap at least 3 points around the slide edge</span>';
+    return;
+  }
+  try {
+    const r = await api(`/api/jobs/${state.capture.jobId}/capture/roi`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ photo_uuid: lastPhotoUuid, polygon: roiPolygon.map((p) => [p.x, p.y]) }),
+    });
+    roiDirty = true;
+    $("capture-roi-status").innerHTML = '<span class="ok">outline saved</span>' +
+      (r.preview_stale ? " — re-run preview to update coverage" : "");
+    closeRoiEditor();
+  } catch (e) {
+    $("capture-roi-status").innerHTML = `<span class="err">${esc(e.message)}</span>`;
+  }
+}
+
 // --- retry-safe client persistence (§10) ---------------------------------
 // Every photo is written to IndexedDB before its upload is attempted. A
 // failed attempt leaves it queued; `scheduleRetry` drains the queue with
@@ -249,12 +337,76 @@ async function reconcilePending(jobId, manifestPhotos, pending) {
 // restart during preview") ---------------------------------------------
 let previewPollTimer = null;
 
+function drawSketch(coverage) {
+  const canvas = $("capture-sketch");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const layout = cg.sketchLayout(coverage, canvas.width, canvas.height);
+  if (!layout) return;
+  const colors = { g: "#3ecf5e", w: "#e0b34d", v: "#666", ".": "transparent",
+                   G: "#2a6b38", W: "#8a6a2a", V: "#333" };
+  for (const c of layout.cells) {
+    ctx.fillStyle = colors[c.cls] || "#444";
+    ctx.fillRect(c.x, c.y, Math.max(1, c.w), Math.max(1, c.h));
+  }
+  if (layout.roiPath.length >= 2) {
+    ctx.strokeStyle = "#ffe14d"; ctx.lineWidth = 2; ctx.beginPath();
+    ctx.moveTo(layout.roiPath[0].x, layout.roiPath[0].y);
+    for (const p of layout.roiPath.slice(1)) ctx.lineTo(p.x, p.y);
+    ctx.closePath(); ctx.stroke();
+  }
+  const armColor = { A: "#4da6ff", B: "#ff8c4d" };
+  for (const d of layout.camDots) {
+    ctx.fillStyle = armColor[d.arm] || "#ccc";
+    ctx.beginPath(); ctx.arc(d.x, d.y, 3, 0, 2 * Math.PI); ctx.fill();
+  }
+  ctx.strokeStyle = "#ff5d5d"; ctx.lineWidth = 1.5;
+  for (const t of layout.targets) {
+    ctx.beginPath(); ctx.moveTo(t.fromX, t.fromY); ctx.lineTo(t.toX, t.toY); ctx.stroke();
+  }
+  if (layout.north) {
+    const cx = canvas.width - 20, cy = 20, r = 12;
+    const a = (layout.north.angleDeg * Math.PI) / 180;
+    ctx.strokeStyle = "#fff"; ctx.beginPath();
+    ctx.moveTo(cx, cy); ctx.lineTo(cx + r * Math.sin(a), cy - r * Math.cos(a)); ctx.stroke();
+  }
+}
+
+function renderCoverage(report) {
+  const coverage = report && report.coverage;
+  const el = $("capture-coverage");
+  if (!el) return;
+  if (!coverage || coverage.unavailable) {
+    el.innerHTML = `<div class="note">${esc(cg.coverageSummaryText(coverage))}</div>`;
+    drawSketch(null);
+    return;
+  }
+  drawSketch(coverage);
+  const instructions = coverage.instructions || [];
+  const progress = cg.instructionProgress(instructions, state.capture.photos,
+    report.preview && report.preview.max_seq);
+  const cards = instructions.map((ins, i) => {
+    const p = progress[i];
+    return `<li class="note">${esc(ins.text)}` +
+      (p.n ? ` <span class="${p.done ? "ok" : "warn"}">(${p.k} of ${p.n})</span>` : "") +
+      "</li>";
+  }).join("");
+  el.innerHTML = `<div>${esc(cg.coverageSummaryText(coverage))}` +
+    (coverage.roi_source !== "tap" ? "" : "") + "</div>" +
+    (cards ? `<ul>${cards}</ul>` : "") +
+    (roiDirty ? ' <button id="capture-coverage-update">Update coverage for new outline</button>' : "");
+  const btn = $("capture-coverage-update");
+  if (btn) btn.addEventListener("click", () => runPreview(true).catch((e) => alert(e.message)));
+}
+
 function renderPreview(preview) {
   clearTimeout(previewPollTimer);
   const el = $("capture-preview");
   const runBtn = '<button id="capture-preview-run">Run preview</button>';
   if (!preview) {
     el.innerHTML = runBtn;
+    renderCoverage(null);
   } else if (preview.status === "running") {
     el.innerHTML = '<span class="note">preview reconstruction running…</span>';
     previewPollTimer = setTimeout(pollPreview, 1200);
@@ -270,15 +422,21 @@ function renderPreview(preview) {
         ? `<span class="warn">preview: ${blocking.length} item(s) predicted to block finalize</span>`
         : '<span class="ok">preview: no blocking items predicted</span>') +
       ' <button id="capture-preview-run">Re-run preview</button>';
+    roiDirty = false;
+    renderCoverage({ ...preview.report, preview });
   }
   const btn = $("capture-preview-run");
   if (btn) btn.addEventListener("click", () => runPreview().catch((e) => alert(e.message)));
 }
 
-async function runPreview() {
+async function runPreview(roiOnly = false) {
   $("capture-preview").innerHTML = '<span class="note">starting preview…</span>';
   try {
-    await api(`/api/jobs/${state.capture.jobId}/capture/preview`, { method: "POST" });
+    await api(`/api/jobs/${state.capture.jobId}/capture/preview`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ roi_only: roiOnly }),
+    });
   } catch (e) {
     $("capture-preview").innerHTML = `<span class="err">${esc(e.message)}</span> ` +
       '<button id="capture-preview-run">Run preview</button>';
@@ -315,6 +473,8 @@ async function startSession() {
   });
   state.capture = { jobId: id, arm: "A", seq: 0, photos: [] };
   localStorage.setItem(LS_CAPTURE_KEY, id);
+  lastPhotoBlobURL = null; lastPhotoUuid = null; roiDirty = false;
+  $("capture-roi-open").disabled = true;
   $("capture-setup").classList.add("hidden");
   $("capture-session").classList.remove("hidden");
   renderArms();
@@ -406,6 +566,7 @@ async function takePhoto(file) {
   if (persisted) await store.ack(uuid);
   mergeManifestEntry(uuid, meta, resp);
   renderLastPhoto(state.capture.photos.find((p) => p.uuid === uuid), t0);
+  if (resp.verdict !== "fail") setLastPhotoBlob(uuid, file);   // §12c.3
   renderArms();
   renderSequencePanel(resp.sequence || {});
   renderPending((await store.listPending(state.capture.jobId)).length);
@@ -443,7 +604,18 @@ async function finish() {
     });
   } catch (e) {
     $("capture-finish").disabled = false;
-    alert("could not finalize: " + e.message);
+    // §12c.9: a blocking 409's `detail` is `{blocking: [{id, text}], stale_preview}`
+    // (api.js keeps it on `e.detail` instead of stringifying it). Anything
+    // else (a plain string detail, a network error) falls back to e.message.
+    if (e.detail && e.detail.blocking) {
+      const lines = e.detail.blocking.map((b) => `- ${b.text}`).join("\n");
+      const extra = e.detail.stale_preview
+        ? "\n\nThe photo set has changed since that preview — re-run it first."
+        : "";
+      alert(`Finalize is blocked:\n${lines}${extra}`);
+    } else {
+      alert("could not finalize: " + e.message);
+    }
     return;
   }
   clearTimeout(retryTimer);
@@ -478,6 +650,19 @@ export function initCapture() {
   });
   $("capture-retake").addEventListener("click", () => retakeLast().catch((e) => alert(e.message)));
   $("capture-finish").addEventListener("click", () => finish());
+
+  // §12c.3 ROI editor
+  $("capture-roi-open").addEventListener("click", openRoiEditor);
+  $("capture-roi-undo").addEventListener("click", () => {
+    roiPolygon.pop();
+    roiCanvas.draw(roiDecorator);
+  });
+  $("capture-roi-clear").addEventListener("click", () => {
+    roiPolygon = [];
+    roiCanvas.draw(roiDecorator);
+  });
+  $("capture-roi-save").addEventListener("click", () => saveRoi());
+  $("capture-roi-skip").addEventListener("click", closeRoiEditor);
 
   const saved = localStorage.getItem(LS_CAPTURE_KEY);
   if (saved) loadSession(saved);

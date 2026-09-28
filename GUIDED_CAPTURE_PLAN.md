@@ -3,6 +3,7 @@
 **Status:** design only. No application code is changed by this document.
 **Base:** `main` @ `9bb999d` (G9 datum-stability gate merged). B1–B5 are fixed (`RELEASE_BLOCKER_PROGRESS.md`). F1–F3 are open (`FINAL_RELEASE_AUDIT.md` §5).
 **Revision (post-G9):** §1, §2, §3, §7 and §11 are updated. §3a (measurement paths), §3b (user workflow), §7a (capture failure vs datum failure messages) and §12b (calibration scene) are new. §12 has the revised stage order. §12a is kept as the S0b record; its §12a.7 consequences are now applied through §3 and §12b.
+**Revision (post-S7):** §12c (S5C, coverage and ROI guidance) is new. It specifies stage-table row 5, which S7 found was never built. §5 and the §12 stage table point to it.
 
 ## 1. Context and goal
 
@@ -179,6 +180,8 @@ Run one `_run_attempt` (exhaustive matcher, n ≤ 45, 1000 px, per-image cameras
 **Block** means finalize is refused unless the user sets `override=true` (expert pilot). **Warn** is shown with an instruction but allows finalize.
 
 ## 5. Coverage tracking and directional recapture
+
+**Superseded in part by §12c (S5C).** §12c replaces the §5.2 cell rule, the §5.3 calibration choice and the §5.4 count and direction rules. This section is kept as the original design.
 
 ### 5.1 Region of interest
 
@@ -475,6 +478,7 @@ Each stage can ship and be tested on its own. Stop after any stage and the produ
 | **G9 Datum stability** | `9bb999d`. `twosided_b` → `indicative` (G9). Detection only, no volume change. |
 | **S0c Calibration scene** | §12b: `twosided_cal` (long-wavelength terrain octaves zeroed). **GO** — every §12b.5 item passes with margin on `twosided_cal`, both modes; `twosided_b` confirmed as the negative datum control (`GUIDED_CAPTURE_PROGRESS.md`). §3's protocol is no longer provisional. |
 | **S6a Result-side paths and ids** | `reason_ids`, `RULES`, `classify_measurement_path` in `gates.py`; `res["measurement_path"]` set in `pipeline.measure`; `datum_holdout_missing_deg` in `volume.py`; §7a messages, path label, legacy label, and an "Upload pre-event DEM" action (pointing at the existing step-3 control) in `result.js`. R5/R6/R8 from `DATUM_STABILITY_PLAN.md` §8 added to `tests/test_volume.py` / `tests/test_gates.py`. |
+| **S5C Coverage and ROI guidance** (§12c) | **Done** (`GUIDED_CAPTURE_PROGRESS.md` "S5C" + "S5C continuation"): implemented, calibrated (9/9 predicted-vs-actual G6 matches, `C_REJ`/`C_OK`/`G6_REJECTED_BLOCKS` frozen, §12c.7.3 datum recalibration passed), and validated end-to-end. Criterion 11 (real HTTP replay, `tests/test_e2e_capture.py`) and the item-6 truncation control both run for real: 9/9 presets match the calibration table, and the truncation control passed (gap + `extend_arm`/arm B/n=14). The `twosided_b` false `extend_arm` is fixed (a minimum-size/implausibly-steep gap is withheld, and `higher`'s `need_elev` is clamped below 90°) and re-verified via real HTTP replay: zero instructions, zero blocking. A real e2e replay also found and fixed a `numpy` JSON-serialization bug in `band_windows_seen`. `G5_partial` stays informational (warn, never block), per design. **One recorded residual**: `twosided_cal` shows the same per-arm pose-noise class probabilistically (an occasional spurious `extend_arm`, never a block) — not tuned away, since slope/area alone can't reliably separate it from real small gaps elsewhere (`sparse8`'s own legitimate gap is steeper). Left for S7's real-hardware comparison. |
 
 **Revised order (post-G9).** The old rule "S1–S6 blocked until S0b passes" is replaced. S0b cannot pass on seed-7 terrain with any capture (`DATUM_STABILITY_PLAN.md` §7.2). Only the stages whose exit checks need a path-1 reference scene waited for S0c; that scene now exists (GO) and S4/S5 are unblocked.
 
@@ -484,9 +488,11 @@ Each stage can ship and be tested on its own. Stop after any stage and the produ
 | 2 | **S2 Capture session backend** | `capturing` status, `session.json`, `PUT/DELETE photos`, `GET capture`, `finalize` (no preview gating yet), `landslide/capture.py::image_checks` / `sequence_checks`, semaphore. Setup stores the DEM answer (§3b step 1) in `session.json`. | S1 | Criteria 2, 6(a–d), 7 |
 | 3 | **S3 Guided UI and persistence** | `step-capture` section, `capture_store.js` IndexedDB queue, arms and counters (including the 2 outer-end photos), rim-check step, marker checklist and chips, optional sensors on a secure context | S2 | Criteria 5 (T0/T1), 6(e) |
 | 4 | **S4 Preview SfM** | `reconstruct(max_attempts=…)`, `worker.run_preview`, `preview_report` (registration, collinearity, focal, elevation, azimuth, stereo pairs, marker scale, datum estimate §3a.4), finalize blocking plus override | S2 | Criteria 3 (except the G6 prediction), 5 (T3). Datum estimate calibrated per §12b.6. |
-| 5 | **S5 Coverage and recapture** | ROI tap, §5 cell map, calibrated `c_rej`/`c_ok` (now including `twosided_b` and `twosided_cal`), directional instructions including the outer-end rule (§5.4), top-down sketch, marker px thresholds calibrated on real prints | S4 | Criteria 3 (full), 4 |
+| 5 | **S5C Coverage and ROI guidance** (§12c) — **done** | ROI tap and ground lift, observation map (§12c.4), calibrated `c_rej`/`c_ok` over the 9 scale-able presets, directional instructions (§12c.6), capture/datum separation (§12c.7), top-down sketch. Real-print marker px thresholds move to S7. | S4 | §12c.11, which includes criteria 3 (full) and 4 — all met, `GUIDED_CAPTURE_PROGRESS.md` "S5C" + "S5C continuation" |
 | 6 | **S6b Capture report on the result** | `capture_report` row, "finalized with override" label | S4 | UI smoke: each replayed preset shows its path and matching instruction |
-| 7 | **S7 Device and field validation** | Android Chrome and iOS Safari over HTTP (no sensors) and HTTPS (sensors). ≥ 3 real sites, one with a pre-event DEM. | S5, S6b | Criterion 8 |
+| 7 | **S7 Device and field validation** | Android Chrome and iOS Safari over HTTP (no sensors) and HTTPS (sensors). ≥ 3 real sites, one with a pre-event DEM. Marker px thresholds on real prints (§4.1). | S5C, S6b | Criterion 8 |
+
+**Label note.** The progress log's "S5 — Capture persistence and recovery" is a separately approved slice of §10, not row 5. Row 5 was never built (S7 finding) and is now specified as **S5C** in §12c, and is now done (`GUIDED_CAPTURE_PROGRESS.md` "S5C" + "S5C continuation"). S7 must be re-run after S5C.
 
 Why this order:
 - **S0c and S6a are done** (see the Done table above) — S0c gave S4/S5 their path-1 reference (`twosided_cal`); S6a defined the ids and `RULES` that S2–S5 reuse and fixed the largest user-facing gap (a G9 result looked the same as a capture failure, and nothing offered the DEM path).
@@ -710,6 +716,266 @@ Run the preview (§4.3) on `twosided`, `twosided_b` and `twosided_cal` images. U
 - **Radially symmetric undulation** (§3a.1). By design the scene has none. Only a DEM comparison on a real site (criterion 8) checks it.
 - **Curved datums.** The scene is planar plus roughness. Quad/TPS adoption is covered only by the unit fixtures (R3).
 - **Path-2 status.** Item 10 validates the DEM measurement, not an `ok` on path 2. That needs the DEM gates named in §3a.2.
+
+## 12c. S5C — Coverage and ROI guidance
+
+**Status:** design only. No application, test or `tools/` file is changed by this section. This is the stage table's row 5 ("S5 Coverage and recapture"), renamed **S5C** because the label "S5" was reused for the separately approved persistence slice (`GUIDED_CAPTURE_PROGRESS.md` "S5 — Capture persistence and recovery"). Where §12c and §5 differ, §12c wins. §5 stays as the original design record.
+
+### 12c.1 Why this stage is needed (S7 evidence)
+
+- S7's unmocked end-to-end run on `arc` (`GUIDED_CAPTURE_PROGRESS.md` S7): the preview returned `preview_checks: []`, and the final result was `rejected` on `G6_rejected` (coverage 0.586, void 42.25 m²). The user got no warning on site. This is the exact failure §1 exists to prevent.
+- S4's §12b.6 datum-estimate calibration failed because there was no ROI. The §5.1 default ROI is about 3× the true polygon (309 m² vs 98.5 m²), so all three scenes read "unstable" (`twosided_cal` 0.067–0.070 vs the 0.05 ratio).
+- S4's elevation proxy reads 17.7–18.0° on `twosided_cal`, where the ground-truth ROI centroid gives 22.9–23.1°. The default-ROI centroid is the cause. That makes `G5_partial` a false warning on the reference scene.
+- A single-arm capture has no second arm, so `arm_separation_deg` is `None` and `T3_azimuth` cannot fire (`capture.py::preview_report`). Nothing in S4 tells a single-arc user to add arm B.
+- Criteria 3 (full) and 4 (§11) are open until this stage ships.
+
+### 12c.2 Scope
+
+In scope:
+1. ROI selection during capture (tap outline on one photo) and its lift to ground coordinates.
+2. A per-cell observation map inside the ROI and in its rim band, on the preview sparse cloud.
+3. A predicted G6 class from calibrated `c_rej` / `c_ok`.
+4. Directional recapture instructions for capture-class gaps inside the ROI.
+5. A predicted rim-visibility check (`G9_rim_partial`), kept separate from the datum estimate.
+6. One final re-run of the §12b.6 datum-estimate calibration with the tapped ROI.
+7. The API, persistence and frontend changes these need, including the top-down sketch.
+
+Out of scope: dense stereo in the preview, any gate or threshold change, any change to the final pipeline, a compass requirement, and real-print marker px calibration (moved to S7, because this environment has no real prints; §4.1 thresholds stay as they are).
+
+### 12c.3 ROI selection during capture
+
+**When.** The UI asks for the outline after the first arm-A photo that has a T1 verdict other than `fail`. It asks again after any preview whose report says `roi_source == "default"`. "Skip" is always allowed. A skipped ROI keeps the §5.1 default, and the report then says the coverage estimate is lower-confidence (§12c.9).
+
+**How the user draws it.** The last-photo card gets a "Draw slide outline" button. It opens the photo (from the local `File`/IndexedDB blob, not the server) in a canvas set up by `canvas.js::setupCanvas`. Each tap adds a vertex through `canvas.onTap`. Vertex drag reuses `hitTest`/`onDragMove` in the same way as `mark.js`. "Undo", "Clear" and "Save" buttons. Minimum 3 vertices. The instruction is: "Tap around the slide edge: the line between disturbed and undisturbed ground. Not the photo edge." The polygon is stored in **original-photo px** (`canvasToStored`).
+
+**Which photo.** Any kept photo may carry the ROI. The user may redraw on a later photo. The last saved ROI wins.
+
+**Lift to ground (server, in `preview_report`).**
+1. The ROI photo must be registered in the preview model. If it is not, or it was excluded, the preview uses the §5.1 default, with `roi_source = "default"` and `roi_note = "roi_photo_unregistered"` or `"roi_photo_excluded"`.
+2. Map `polygon_px` into the preview view's pixel frame. The implementation first checks which frame `ImageView.K` uses after a `max_image_size=1000` run (camera `width`/`height` vs the original size). If they differ, it multiplies by `camera.width / original_width`. A unit test pins this.
+3. Call `ground.select_region_ground(ctx, name, polygon_px, up=up, dense=False)`, the same ray-cast that final photo mode uses, on the sparse cloud. Take `ground_polygon`, `hit_frac` and `max_miss_run` from its `info`.
+4. If it returns `None` (hit < 0.5), fall back: project the sparse points into the view (`ImageView.project`), keep the points in front of the camera and inside the polygon (`points_in_polygon`), and take the convex hull of their `ground_basis(up)` coordinates. `roi_source = "tap_hull"`. The hull shrinks toward observed points and so hides edge voids. The report marks the result lower-confidence, and a hull ROI can never produce a predicted `ok` (§12c.5).
+5. The ROI centroid becomes the reference point for elevation, azimuth, the datum estimate and the cell map. This replaces the central-50 % sparse centroid whenever `roi_source != "default"`.
+
+The lift needs a metric scale (the grid is 1.0 m and the rim band is 0.5–2.5 m). The coverage map runs only when the marker check applied a scale. Without a scale the report sets `coverage = {"unavailable": "marker scale failed"}`. `T3_marker_scale` already blocks in that case, so no silent pass exists.
+
+### 12c.4 Observation map (replaces the §5.2 cell rule)
+
+Grid: 1.0 m cells in the `ground_basis(up)` plane, covering the lifted ROI plus a 2.5 m rim band (`geometry.ring_distance`, as in `select_region_world`). Each cell is tagged `roi` or `band`.
+
+For each cell, from the sparse points in it and their tracks (`rec.points3D[*].track` → image ids → arm label from `arms`):
+- `n_points`
+- `normal`: robust plane (`fit_plane_robust`) on the cell's points, plus the 8 neighbours' points when the cell has fewer than 6. No normal if the 3×3 block still has fewer than 6 points.
+- `grazing` per observing camera: the angle between the camera-to-cell-centre ray and the cell plane. `grazing = 90° − angle(ray, normal)`, clipped at 0.
+- `sectors`: the 45° azimuth sectors of the observing cameras about the cell centre. Recorded for the direction logic, not used for the class.
+
+Cell class. The good-cell rule is the S0b proxy that matched real dense clouds (§12a.3): "≥ 3 fused views from one arm at usable grazing". It replaces §5.2's "≥ 2 sectors" rule, which is not calibrated against anything.
+- **good**: some single arm has ≥ 3 observing cameras with `grazing ≥ THETA_G`. `THETA_G = 18°`, the value §12a.3 fitted to the two-arm dense case. It is fixed, not calibrated here.
+- **weak**: has points but is not good, or has points but no normal.
+- **void**: no points.
+
+Outputs:
+- `preview_coverage = good_roi_cells ÷ roi_cells`. A cell is `roi` if its centre is inside the ROI polygon (same inclusion rule as `_coverage_gate`).
+- `preview_void_m2`: the area of the largest connected non-good region inside the ROI (`scipy.ndimage.label`, 4-connectivity, as in `_coverage_gate`). Used for instructions and display. It does **not** enter the class prediction (§12c.5).
+- `band_windows_seen`: for the 8 overlapping 90° windows about the ROI centroid (the same windows as `_datum_holdout`), a window counts as seen when ≥ 50 % of its band cells are good or weak.
+- A compact grid for the sketch: `{u0, v0, cell, nx, ny, classes}`. `classes` is a row-major string over `. v w g`: outside, void, weak, good. `B` is added for band cells, as upper-case `V W G`. A 20 × 20 grid is 400 bytes.
+
+### 12c.5 Predicted G6 class and the `c_rej` / `c_ok` calibration
+
+**Rule (frozen after calibration):**
+- `preview_coverage < C_REJ` → predicted `rejected`.
+- `preview_coverage ≥ C_OK` **and** `roi_source == "tap"` → predicted `ok`.
+- Otherwise → predicted `indicative`.
+- Before calibration, and whenever `coverage` is unavailable: `predicted_g6 = null`. The UI shows "coverage estimate NN %" without a class.
+
+The void term is left out on purpose. At 1.0 m cells on a sparse cloud, void area measures sparsity more than it measures real holes. G6's void sub-condition is covered because the good-cell rule already marks the `twosided` void regions weak (§12a.3). If calibration shows that coverage alone cannot tell `twosided` (final `indicative`, void-driven) from `twosided_b`/`twosided_cal` (final `ok`), the fixed decision rule below applies. No void term is added after seeing the data.
+
+**Checks produced:**
+
+| Predicted | Check id (reused from `RULES`) | Level |
+| --- | --- | --- |
+| `rejected` | `G6_rejected` | **block**, if the calibration passes the no-false-block constraint below. Otherwise **warn**. |
+| `indicative` | `G6_indicative` | warn |
+| `ok` / `null` | none | — |
+
+The check text is `"Predicted: " + RULES[id]["action"]`, followed by the first recapture instruction (§12c.6). A single-arm capture (only arm A registered) with predicted `indicative` or `rejected` always gets the `new_arm` instruction. That closes the S4 gap in which `T3_azimuth` never fires on one arm.
+
+**Calibration set.** The 9 scale-able presets: `arc`, `lowtex`, `distorted`, `collinear`, `sparse8`, `descending`, `twosided`, `twosided_b`, `twosided_cal`.
+
+**Calibration procedure (one run, recorded in `GUIDED_CAPTURE_PROGRESS.md` under "S5C"):**
+1. **Proxy.** For each preset, stage its images and run exactly what `worker.run_preview` runs: `reconstruct(..., max_image_size=1000, max_attempts=1)`, then `preview_report(...)`. Arms come from preset metadata (`arc2` splits at n/2; every other preset is all arm A). The ROI is the ground-truth outline `polygon_px` on `polygon_image` from `ground_truth.json`, standing in for the user's tap. Marker side comes from `spec.json`. Record `preview_coverage`, `preview_void_m2`, `roi_source`, `roi_hit_frac`, median elevation and runtime.
+2. **Noise.** Run step 1 a second time on `twosided_cal` and `arc`. Record |Δ `preview_coverage`| as `noise`.
+3. **Reference class.** The final G6 class from a fresh `tools.benchmark` photo-mode run in the same session. `twosided*` reuse their cached `work/` as S4 did. Record `coverage_frac` and `largest_void_m2`. **Boundary presets:** where the final `coverage_frac` lies within ±0.03 of 0.60, both `rejected` and `indicative` count as a match and neither counts as optimistic. Predicting `ok` for them is always a failure. This handles the recorded `arc` flip (0.60–0.62 in the bench, 0.586 in S7).
+4. **Search.** Scan `C_REJ` and `C_OK` over [0, 1] in 0.005 steps, with `C_REJ ≤ C_OK`. Hard constraints:
+   - (a) **Never optimistic:** no preset is predicted better than its reference class (the boundary rule above applies).
+   - (b) **No false block:** `twosided`, `twosided_b` and `twosided_cal` are never predicted `rejected`, and neither is any other preset whose reference class is not `rejected` and that is outside the boundary band.
+5. **Choice.** Among feasible pairs with the most matches, take the **centre** of the feasible interval for each cut point, not its permissive edge. This replaces §5.3's "most permissive" rule, because §12c.1 shows the proxy is noisy near 0.60.
+6. **Margin.** Every chosen cut point must be ≥ `max(0.02, 2 × noise)` from every preset's `preview_coverage`. If not, the cut point is treated as infeasible (decision rule below).
+7. **Freeze.** Write `C_REJ`, `C_OK` and `COVERAGE_CALIBRATION = "s5c-v1"` as constants in `landslide/capture.py`, with a comment citing the progress entry. The report carries `calibration: "s5c-v1"`.
+
+**Decision rule, fixed in advance (no tuning to the result):**
+- No feasible `C_OK` → `ok` is never predicted. The maximum shown is "at least indicative".
+- No feasible `C_REJ` that also meets constraint (b) → predicted `rejected` becomes a **warn**, never a block.
+- Neither feasible → `predicted_g6` stays `null`. The coverage estimate and directional instructions still ship. Criterion 4 is recorded as failed.
+- Fewer than 8 of 9 matches with both cut points feasible → ship the one-sided predictions and record criterion 4 as failed. Do not change `THETA_G`, the cell size or the class rule to reach 8.
+- A preset's preview fails to register (`T3_registration` blocks) → it is excluded from the search and recorded. It is already blocked.
+
+### 12c.6 Directional recapture instructions (replaces the §5.4 count and direction rules)
+
+**Gaps.** Connected groups (4-connectivity) of non-good ROI cells with area ≥ 2 m² (the G6 void limit). Each gap gets:
+- `area_m2`, `centroid_uv`.
+- `face_az`: circular mean of the horizontal component of the cells' normals, i.e. the azimuth the surface faces. Cells with no normal use the azimuth opposite the circular mean of the sectors that observed the gap. Void cells with neither take the gap's azimuth as seen from the ROI centroid, plus 180°.
+- `slope_deg`: median cell slope (0 where there is no normal).
+- `cause`: `"elevation"` if some arm has ≥ 3 cameras within ±20° of `face_az` (the right side, too low or occluded). Otherwise `"azimuth"` (no camera on that side).
+
+**Arm geometry from the model.** For each arm label: camera azimuths about the ROI centroid, circular mean, and the two end azimuths. The **outer end** is the end farther (circularly) from the other arm's mean. With one arm, both ends are outer ends.
+
+**Instruction kinds** (one per gap, largest area first, at most 3 shown; gaps whose target azimuths lie within 15° are merged):
+
+| Kind | When | Parameters | Text (template) |
+| --- | --- | --- | --- |
+| `higher` | `cause == "elevation"` | `arm`, photo range (seq of the arm cameras within ±20° of `face_az`), `need_elev = max(20°, THETA_G + slope_deg)`, `stand_m = h_med ÷ tan(need_elev)` where `h_med` is the arm's median camera height above the ROI centroid | "Part of the slide near photos {i}–{j} is hidden. Re-shoot that stretch of arm {arm} from higher ground, or from about {stand_m:.0f} m from the slide centre instead of {d_med:.0f} m." |
+| `extend_arm` | `cause == "azimuth"`, ≥ 1 arm | `arm` = the arm whose **outer** end is circularly closest to `face_az`. `Δ` = angle from that end to `face_az`. `n = ceil(Δ ÷ 7°) + 2` (7° step from §12a.4, +2 outer-end photos from §3 step 3), minimum 3. Stand distance = the arm's median camera-to-centroid distance. | "Continue arm {arm} past its end: walk about {Δ:.0f}° further around the slide, same distance, and take {n} more photos, one every few steps." |
+| `new_arm` | only arm A registered, and the capture-class prediction is not `ok` | target = arm A mean ± 90°, choosing the side where `face_az` of the largest gap lies (default +90°). Clamped to 60–120° (§3 step 5, §6 marker limit). | "Start arm B: keep shooting every few steps while you walk about {sep:.0f}° around the slide to the {left/right}, then take at least 12 photos plus 2 extra at the far end." |
+
+Rules:
+- **Never** send the user to an isolated far-side position. Every `extend_arm` starts from an outer arm end (§12a.3: a mini-pass across the gap does not register). If `n > 15`, the text adds: "This side needs a long walk. If it is unsafe or blocked, you can keep an indicative result."
+- **Direction frames**, in order of preference:
+  - **Compass bearing**: only if sensor headings exist and the model-to-compass offset residual spread is < 20° (§5.4).
+  - **Relative**: "to your left/right from arm {arm}'s last photo", from the sign of the angular step in the ground basis as seen by a camera looking at the ROI centroid. Always available.
+  - **Sketch**: always available.
+- **Instruction progress** is derived, not stored. The count of kept photos with `seq > report.max_seq` on the instruction's arm label, shown as "{k} of {n} photos". Extension photos keep the arm label they extend (`A` or `B`), not `R<n>`, so per-arm azimuth spans stay correct. `R<n>` stays for in-span retakes (`higher`).
+- When every shown instruction reaches its count, the UI prompts "Re-run preview". There is no automatic re-run, which saves battery and the worker.
+
+**Rim-side prediction (`G9_rim_partial`, capture class).** If `band_windows_seen < 6`: add a **warn** `G9_rim_partial` with `"Predicted: " + RULES["G9_rim_partial"]["action"]`. Add one `extend_arm`/`new_arm` instruction aimed at the centre of the largest run of unseen windows. It uses the same builder with `face_az` = window centre + 180° (the camera must stand beyond that side, looking back across it). This is a warning, never a block, because a side may be physically unreachable (§3a.3). Sparse rim-point **counts** are never used for this (§3a.4: too few sparse points ≠ unseen). Only the observation classes are used.
+
+**`G9_no_rim` (capture/tracing class).** If `roi_source == "tap"` and ≥ 30 % of the lifted polygon lies within 2.5 m of the sparse cloud's convex-hull edge, add a warn: `"Predicted: " + RULES["G9_no_rim"]["action"]`. This catches an outline traced to the photo edge.
+
+### 12c.7 Separating capture failures from G9 datum failures
+
+The rule from §7a applies unchanged to the preview. S5C enforces it structurally:
+
+1. **Only capture-class items produce instructions.** `recapture_instructions(report)` reads `coverage.gaps` and the `G9_rim_partial` finding only. It never reads `datum_estimate`. A unit test builds a report with an unstable datum and no gaps, and asserts that the instruction list is empty.
+2. **Only capture-class items can block.** Of the S5C checks, only `G6_rejected` may be `block`. `G6_indicative`, `G9_rim_partial` and `G9_no_rim` are `warn`. The datum estimate, if surfaced at all, is `info`.
+3. **Datum estimate: one final calibration.** S4's §12b.6 failure was caused by the missing ROI input, not by the ratio. S5C re-runs §12b.6 **once** with the tapped ground-truth ROI, the same 0.05 ratio and the same fixed rule: "unstable" on `twosided` and `twosided_b`, silent on `twosided_cal`.
+   - **Pass** → `T3_datum_unstable` becomes an `info` check. It is shown only in a separate "Reference surface" panel with the §7a.2 preview text and the §3b step-4 DEM sentence. It is never shown in the recapture list, never counted in `blocking`, and never shown when `roi_source != "tap"`. `test_datum_estimate_never_becomes_a_check` is replaced by a test pinning "`info` only, never `block`, only with a tapped ROI".
+   - **Fail** → the estimate is dropped from the UI permanently. The raw numbers stay in the report. No third attempt.
+4. **Combined case.** A preview with capture gaps **and** an unstable datum estimate shows the gaps first. The reference-surface panel then shows the §7a.2 combined sentence: "After a better capture this result will still be indicative unless you use a pre-event elevation model."
+5. **Rim-band cells are not interior coverage.** Band cells feed only `band_windows_seen`. A hole in the band is never reported as a G6 gap, and an interior gap is never reported as a rim problem.
+
+### 12c.8 API changes
+
+All changes are additive. No existing field changes meaning.
+
+| Change | Detail |
+| --- | --- |
+| `PUT /api/jobs/{id}/capture/roi` (new; already named in §9.2) | Body `CaptureRoiRequest {photo_uuid: str, polygon: list[tuple[float, float]]}`. Responses: 404 for an unknown photo; 409 if the photo is excluded or the job is not `capturing`; 422 for < 3 vertices, > 200 vertices, a vertex outside the original image bounds, or a self-intersecting polygon (a simple O(n²) segment check). Stores `capture.roi = {photo_uuid, polygon_px, set_at}` under `job.lock`, then `save_capture()`. If a preview is running, it sets `preview.rerun_after = True`, reusing the S4 mechanism. Returns `{ok: true, preview_stale: bool}`. Idempotent: last write wins. |
+| `POST .../capture/preview` body | Optional `{roi_only: bool = false}`. When true **and** the kept-photo uuid set equals `preview.photo_set` of the last `done` preview, the worker calls `reconstruct(..., reuse=True)` on `capture/preview/` and only recomputes the report (seconds, not ~100 s). Otherwise it runs a full preview. `reconstruct`'s own `reuse` does not check the photo set (`sfm.py:313`), so this check lives in the route. |
+| `preview` manifest entry | Adds `photo_set` (a sorted list of kept uuids at submit) and `max_seq`. |
+| `preview_report(...)` | `roi` is now used (§12c.3). New `report["coverage"]`: `{roi_source, roi_note?, roi_ground, roi_area_m2, roi_hit_frac, roi_centroid_uv, cell_m, grid, preview_coverage, preview_void_m2, band_windows_seen, predicted_g6, calibration, gaps: [{area_m2, centroid_uv, face_az, slope_deg, cause}], instructions: [{kind, arm, n_photos, photo_range?, target_az, stand_m, need_elev?, bearing_deg?, relative, text}], cameras: [{name, arm, seq, u, v}], compass_offset_deg}` or `{unavailable: reason}`. New `checks` ids: `G6_rejected`, `G6_indicative`, `G9_rim_partial`, `G9_no_rim`, and `T3_datum_unstable` (only per §12c.7.3). |
+| `landslide/capture.py` | New `coverage_map(ctx, up, roi_ground, arms, ...)` and `recapture_instructions(coverage, arms_geom)`, both pure numpy and unit-testable. `preview_report` calls them. `_default_roi_polygon` stays as the fallback. The constants `THETA_G`, `CELL_M = 1.0`, `C_REJ`, `C_OK`, `COVERAGE_CALIBRATION` live next to the S4 constants. |
+| `POST .../capture/finalize` 409 body | Adds `stale_preview: bool`: true when the kept-photo set differs from `preview.photo_set`. Blocking behaviour is unchanged. The UI uses the flag to offer "Re-run preview" before "Finish anyway". |
+| `jobs._capture_report` (S6b) | Adds `preview_coverage`, `predicted_g6`, `roi_source`, `open_gaps` (number of instructions at finalize) and `coverage_calibration`. The result panel shows "predicted G6 {x} → actual {y}", the comparison that criterion 8 needs in the field. |
+| `schemas.py` | `CaptureRoiRequest`, and `CapturePreviewRequest {roi_only: bool = False}` with the body optional for backward compatibility. |
+
+No change to `sfm`, `densify`, `volume`, `gates`, `pipeline` or `ground`. `select_region_ground` is called as-is, with `dense=False`.
+
+### 12c.9 Frontend changes
+
+- **`index.html`**: inside `#capture-session`, add `#capture-roi` (button, canvas and Undo/Clear/Save/Skip), `#capture-coverage` (sketch canvas, legend, coverage estimate, predicted class) and `#capture-recapture` (up to 3 instruction cards with progress). Add `#capture-datum` (the reference-surface panel, hidden unless §12c.7.3 passes). Reuse existing classes. No new library.
+- **`js/capture_guidance.js`** (pure, `node --test`): `sketchLayout(coverage, w, h)` returns the transform and the draw lists (ROI path, cell rects by class, camera dots by arm, target arcs as an arm-end-to-target wedge at `stand_m`, and a north arrow only when `compass_offset_deg` is set). `instructionProgress(instructions, manifestPhotos, maxSeq)` returns `[{k, n, done}]`. `coverageSummaryText(coverage)` returns a one-line text: "Coverage estimate 71 % (lower-confidence: no outline drawn)" or "Predicted: indicative".
+- **`js/steps/capture.js`**:
+  - ROI flow per §12c.3. Uses `setupCanvas` on a local object URL of the photo blob and `PUT .../roi`.
+  - `renderPreview` done-state draws the sketch, the summary and the instruction cards. It shows "Update coverage for new outline" (`roi_only: true`) when the ROI changed after the last preview.
+  - Choosing an instruction card sets the current arm label to its `arm`, so new photos extend the right arm.
+  - The finalize 409 handler renders `blocking[].text` as a list and shows "Re-run preview" when `stale_preview` is set. This fixes the recorded `[object Object]` alert (`GUIDED_CAPTURE_PROGRESS.md` S5-persistence deviations) in `api.js`: when `detail` is not a string, it keeps the object on the thrown error as `err.detail`.
+- **`result.js`**: in the S6b capture row, show the "predicted vs actual G6" pair and the ROI source.
+- No new JS files. Cache-bust the changed modules as in earlier stages.
+
+### 12c.10 Persistence and recovery
+
+| Situation | Behaviour |
+| --- | --- |
+| ROI saved, then tab killed or page reloaded | The ROI is in `session.json` (atomic `save_capture`). `loadSession` renders it from `GET .../capture`. There is no client copy to reconcile. |
+| ROI drawn while offline | The draft polygon is kept in `localStorage[LS_CAPTURE_KEY].roi_draft`, with try/catch as for all storage. It is re-sent on the next successful request, and the draft is cleared on the 200. The server copy wins if the manifest already has a newer `set_at`. |
+| ROI changed while a preview runs | `rerun_after = True` (existing S4 path). The finished report is replaced by the rerun's report. |
+| Server restart during preview | Unchanged: `stale`. "Re-run preview" does a full run, because `roi_only` requires a `done` preview with a matching `photo_set`. |
+| Old session or report without `coverage` | `roi: null` → default ROI. A report without `coverage` renders "Re-run preview for the coverage map". Legacy S6b reports render without the new fields. |
+| ROI photo later excluded | The ROI stays stored. The next preview reports `roi_note = "roi_photo_excluded"`, uses the default, and the UI asks for a redraw. |
+| Recapture in progress, then reload | Progress is recomputed from the manifest plus `preview.max_seq` (§12c.6). No new state. |
+| Finalize | Unchanged. `blocking_at_finalize` now can hold `G6_rejected`. The capture report records `open_gaps`. |
+
+`session.json` `version` stays 1. Every new field is optional and additive.
+
+### 12c.11 Objective acceptance criteria (S5C exit)
+
+Each is a runnable check. Test file names are proposals. "Preview" means exactly the `worker.run_preview` path (1000 px, `max_attempts=1`) on the preset's images, with the ground-truth `polygon_px` as the ROI tap.
+
+1. **ROI lift accuracy** (`twosided_cal`). `roi_source == "tap"`. `roi_hit_frac ≥ 0.85`. Lifted ROI area within ±15 % of π·5.6² = 98.5 m². ROI centroid within 1.0 m of the bowl centre, after mapping the preview frame to ground truth with `tools.benchmark._umeyama_pose_aware` on camera centres, as in S0b.
+2. **Elevation with a real ROI.** `twosided_cal` median camera elevation within ±2.0° of the ground-truth 22.9–23.1°, so `G5_partial` does not fire. `twosided`: median < 20° and the warning fires (ground truth 16.5–19.2°).
+3. **Cell-map unit tests** (`tests/test_capture_coverage.py`, fast). On a hand-built sparse context (a plane plus a bowl, with fake tracks from two synthetic arms):
+   - A cell seen by 3 arm-A cameras at 25° grazing is good. At 10° grazing it is weak.
+   - A cell with no points is void.
+   - `preview_coverage` and `preview_void_m2` match hand counts.
+   - Band cells never enter `preview_coverage`.
+   - `band_windows_seen` counts 8 on a full ring and ≤ 4 on a half ring.
+4. **Instruction unit tests** (same file):
+   - A gap facing the inter-arm gap produces `extend_arm` from the nearer **outer** end, with `n = ceil(Δ/7°)+2`.
+   - A gap inside an arm's azimuth span produces `higher` with the formula `stand_m`.
+   - One arm only produces `new_arm` at 60–120°.
+   - No instruction targets a position not connected to an arm end.
+   - At most 3 instructions, largest first. Gaps within 15° are merged.
+   - A report with an unstable datum and no gaps produces **zero** instructions.
+5. **Calibration recorded** (§12c.5 procedure). A table of all 9 presets with `preview_coverage`, `preview_void_m2`, `roi_source`, final `coverage_frac`, final class and predicted class, plus `noise`, `C_REJ`, `C_OK` and the margins. Pass conditions:
+   - 0 optimistic predictions.
+   - 0 predicted `rejected` on `twosided`, `twosided_b` and `twosided_cal`.
+   - Criterion 4 (§11): ≥ 8 of 9 matches. A miss is recorded, not tuned (§12c.5 decision rule).
+6. **Directional behaviour on real previews:**
+   - `arc`, `lowtex`, `distorted`: predicted `indicative` or `rejected`, and the first instruction is `new_arm` with a separation of 60–120°.
+   - `twosided`: predicted `indicative`. ≥ 1 instruction. Every instruction is `extend_arm` (from an outer end) or `higher`. None is `new_arm`.
+   - `twosided_b`, `twosided_cal`: no instruction, no `G6_*` check, and predicted `ok` if `C_OK` is feasible.
+   - **Truncation control:** `twosided_cal` minus the last 6 photos of arm B (images 32–37) must produce a gap. Its first instruction is `extend_arm` on arm B, with `n ≥ 3`. If no gap appears, run one final benchmark on the truncated set and record both results. If the final result also stays `ok`, the control is invalid, not the design. Re-run it once without 8 photos (30–37), then stop.
+7. **Capture vs datum separation:**
+   - `twosided_b`: zero instructions, zero blocking items and zero capture-class warnings from S5C (it is a clean capture).
+   - The datum recalibration (§12c.7.3) is recorded with ratios for all three scenes and the pass/fail outcome.
+   - If it passes: `twosided_b` and `twosided` show `T3_datum_unstable` at level `info` only. `twosided_cal` shows nothing. `blocking` never contains it.
+   - A one-sided-rim fixture (the R5 shape) predicts `G9_rim_partial` as a warn, with an instruction aimed at the missing side.
+8. **API and persistence** (`tests/test_capture_preview_routes.py`, extended, with `submit_job` monkeypatched):
+   - ROI PUT: every validation error code in §12c.8. The ROI persists across `load_persisted_jobs`.
+   - A PUT during a running preview sets `rerun_after`.
+   - `roi_only` falls back to a full run when the photo set changed.
+   - A finalize 409 carries `stale_preview` correctly.
+   - A report without `coverage` still finalizes, and still renders in `_capture_report`.
+9. **Frontend units** (`tests/test_capture_guidance.mjs`): `sketchLayout` fits the ROI and cameras inside the canvas with ≥ 8 px margin and draws the north arrow only with an offset. `instructionProgress` counts only photos after `max_seq` on the right arm. `node --check` is clean on every changed file.
+10. **Latency.** `coverage_map` + `recapture_instructions` ≤ 5 s on the `twosided_cal` preview (38 photos). A `roi_only` rerun ≤ 20 s. Record the full preview time next to S4's 111 s.
+11. **End-to-end replay** (`tests/test_e2e_capture.py`, `e2e` marker). This is §11 criterion 3 in full: every preset replayed through `PUT .../photos` (JPEG re-encoded, q 92, as in S7), `PUT .../roi`, and `POST .../preview`, with the expectations of §11 criterion 3 and item 6 above. For `twosided_cal`, `preview_coverage` from JPEG and PNG input differ by ≤ `max(0.02, 2 × noise)`.
+12. **No regression.** `pytest -q -k "not e2e"` is green, with the S7 baseline (239 passed, 3 skipped) plus the new tests. `node --test tests/*.mjs` is green. With `roi` unset, every S4 preview field other than the new `coverage` key is unchanged on the three cached `twosided*` contexts.
+
+### 12c.12 Focused validation plan (one pass)
+
+1. Implement §12c.3–§12c.10. Run criteria 3, 4, 8, 9 and 12 (fast).
+2. Run the calibration script from the scratchpad (not committed; about 120 lines). It:
+   - runs 11 previews (9 presets plus 2 noise repeats, about 20 min at S4's ~100 s each),
+   - runs 6 fresh photo-mode benchmarks (the non-`twosided*` presets, about 10 min from `data/bench/results.md` runtimes),
+   - uses cached `work/` for the three `twosided*` presets,
+   - prints the criterion-5 table.
+3. Freeze `C_REJ` / `C_OK` per §12c.5, or apply its decision rule.
+4. Run the §12c.7.3 datum recalibration from the same previews. Apply its pass/fail rule.
+5. Run criteria 1, 2, 6, 7, 10, then the truncation control.
+6. Run criterion 11 (e2e, slow).
+7. Record everything in `GUIDED_CAPTURE_PROGRESS.md` under "S5C — Coverage and ROI guidance". Include every miss with its number. Do not change a gate, `THETA_G`, `CELL_M`, or any §4.1 threshold to make a criterion pass.
+
+**Stop conditions (fixed in advance):**
+- Criterion 1 fails (the ROI lift is wrong) → stop before calibration. Calibration on a wrong ROI would fit noise. Analyse the lift only.
+- Criterion 5's optimistic count > 0 for every feasible pair → the proxy cannot be trusted for a class. Ship coverage and instructions with `predicted_g6 = null`. Record it.
+- Criterion 7 (`twosided_b` produces a capture instruction) fails → the good-cell rule mislabels a clean capture. Stop and analyse. Do not ship instructions that would send a user on a G9 site back out with the camera.
+
+### 12c.13 What S5C does not validate
+
+- Real-photo sparse density, vegetation and lighting. The cut points are fitted on one synthetic renderer. S7 must compare predicted and actual G6 on real sites (criterion 8), using the new `capture_report` pair.
+- Real field-board marker px thresholds (§4.1 note). These move to S7.
+- Compass alignment accuracy on a real device.
+- The radially symmetric datum blind spot (§3a.1). S5C does not change it.
 
 ## 13. Deliberately out of scope
 

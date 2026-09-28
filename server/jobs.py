@@ -231,6 +231,7 @@ def _capture_report(capture: dict) -> dict:
     finalized = capture.get("finalized") or {}
     all_checks = report.get("checks") or []
     datum = report.get("datum_estimate") or {}
+    coverage = report.get("coverage") or {}
     override = bool(finalized.get("override"))
     by_id = {c["id"]: c.get("text", c["id"]) for c in all_checks}
     return {
@@ -251,6 +252,14 @@ def _capture_report(capture: dict) -> dict:
                            for c in all_checks if c.get("level") in ("warn", "block")],
         # informational only (§3a.4, §12b.6) — never a predicted status.
         "datum_estimate_ratio": datum.get("ratio"),
+        # S5C (§12c.8): predicted-vs-actual G6 pair for the field-validation
+        # comparison (§11 criterion 8) — actual status/coverage come from
+        # `job.result`, read alongside this dict by `Job.snapshot()`.
+        "preview_coverage": coverage.get("preview_coverage"),
+        "predicted_g6": coverage.get("predicted_g6"),
+        "roi_source": coverage.get("roi_source"),
+        "open_gaps": len(coverage.get("instructions") or []),
+        "coverage_calibration": coverage.get("calibration"),
         "finalized_override": override,
         "overridden_checks": [{"id": rid, "text": by_id.get(rid, rid)}
                               for rid in finalized.get("blocking_at_finalize", [])]

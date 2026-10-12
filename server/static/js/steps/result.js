@@ -74,6 +74,36 @@ const REASON_RULES = {
   DEM_no_coverage_gate: { cls: "info", action:
     "Measured against your pre-event model. Indicative until SlopeLens " +
     "can check how much of the slide the model covers." },
+  // multi-view marking (landslide/gates.py RULES, class "marking")
+  MV_insufficient_pov: { cls: "marking", action:
+    "Outline the slide on 2 photos from each of 4 different viewpoints " +
+    "(8 outlines). Follow the suggested photos; if the photo set has " +
+    "fewer than 4 viewpoints, add photos from further around the slide." },
+  MV_mask_disagreement: { cls: "marking", action:
+    "One or more outlines mark a different area than the others. Open " +
+    "the flagged photos and redraw the outline on the same slide edge." },
+  MV_poor_visibility: { cls: "marking", action:
+    "Part of the region is seen from fewer than 2 viewpoints, or mostly " +
+    "hidden in an outlined photo. Outline it on photos that show that " +
+    "part, from another direction." },
+  MV_uncertain_boundary: { cls: "marking", action:
+    "The outlines do not agree on where the edge is. Redraw the loosest " +
+    "outlines along the line between disturbed and undisturbed ground, " +
+    "and add an outline from another viewpoint." },
+  MV_occlusion_support: { cls: "marking", action:
+    "Too little 3-D surface was reconstructed under an outline to tell " +
+    "what hides what. Use photos where the slide surface is textured and " +
+    "reconstructed, or outline on a different photo." },
+  MV_disconnected: { cls: "marking", action:
+    "The outlines agree on separate patches, not one region. Outline " +
+    "one connected slide; measure separate slides one at a time." },
+};
+
+const confidenceLabels = {
+  high: "high — 4 viewpoints × 2 photos outlined, every check passed",
+  lower: "lower — single-photo outline (legacy); outline several viewpoints for a final result",
+  indicative: "indicative only",
+  rejected: "rejected",
 };
 
 const pathLabels = {
@@ -81,6 +111,7 @@ const pathLabels = {
   dem: "Measured against your pre-event model.",
   indicative_only: "Not a photo problem — more photos will not help.",
   capture_failure: "Capture problem — fixable.",
+  marking: "Outline problem — fixable by redrawing or adding outlines, no new photos needed.",
 };
 
 // S6b (GUIDED_CAPTURE_PLAN.md §9.3, §12 stage table row 6): `result.capture_report`
@@ -178,6 +209,31 @@ export function showResult(r) {
     // label it rather than silently rendering as if it had been checked.
     rows.push(["status", "pre-gate result — not checked"]);
   }
+  // multi-view marking: a photo-mode result with no `annotation_mode` was
+  // saved before multi-view existed — it is a single-photo outline too
+  const singleView = r.mode === "photo" && r.annotation_mode !== "multi_view";
+  const conf = r.confidence || (singleView ? "lower" : null);
+  if (conf) rows.push(["confidence", confidenceLabels[conf] || conf]);
+  const mvr = r.multiview;
+  if (mvr) {
+    const rq = mvr.requirement;
+    rows.push(["outlines used", `${mvr.n_used} of ${mvr.n_annotations} · ` +
+      `${rq.n_groups_complete} of ${rq.min_groups} viewpoints complete`]);
+    const b = r.volume_bounds_m3;
+    if (b && b.lower && b.upper) {
+      rows.push(["cut, region bounds (confident – best – outer limit)",
+        `${b.lower.cut_volume_m3.toFixed(1)} – ${b.best.cut_volume_m3.toFixed(1)} – ` +
+        `${b.upper.cut_volume_m3.toFixed(1)} m³`]);
+      rows.push(["net, region bounds",
+        `${b.lower.net_volume_m3.toFixed(1)} – ${b.best.net_volume_m3.toFixed(1)} – ` +
+        `${b.upper.net_volume_m3.toFixed(1)} m³`]);
+    }
+    rows.push(["fused region area (confident – best – outer limit)",
+      `${mvr.area_lower_m2.toFixed(1)} – ${mvr.area_best_m2.toFixed(1)} – ${mvr.area_upper_m2.toFixed(1)} m²`]);
+    if (typeof mvr.weak_support_frac === "number") {
+      rows.push(["region seen from fewer than 2 viewpoints", `${(mvr.weak_support_frac * 100).toFixed(0)}%`]);
+    }
+  }
   rows.push(
     ["net volume (fill − cut)", `${r.net_volume_m3.toFixed(1)} m³`],
     ["cut (depression below rim)", `${r.cut_volume_m3.toFixed(1)} m³`],
@@ -259,6 +315,9 @@ export function showResult(r) {
   $("img-overlay").src = artifactURL("overlay.jpg", true);
   $("img-height").src = artifactURL("heightmap.png", true);
   $("img-slope").src = artifactURL("slopemap.png", true);
+  const hasRegion = (r.artifacts || []).includes("regionmap.png");
+  $("fig-region").classList.toggle("hidden", !hasRegion);
+  if (hasRegion) $("img-region").src = artifactURL("regionmap.png", true);
   $("step-result").scrollIntoView({ behavior: "smooth" });
 }
 

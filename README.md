@@ -44,12 +44,20 @@ Workflow in the browser:
      dicts and picks the best match); or
    - *Manual*: pick two photos that show a known length (survey pole, tape,
      person's height), click its two endpoints in each photo, enter the length.
-3. **Mark the landslide** — trace the boundary on the **top-down view**
-   (recommended: no perspective distortion; generated on demand from the
-   dense cloud) or on the photo where the feature is clearest. Click around
-   the **rim** (the boundary between disturbed and undisturbed ground) — the
-   ring just outside your line is used as the undisturbed-ground datum.
-   Close the polygon and press *Compute volume*.
+3. **Mark the landslide** — click around the **rim** (the boundary between
+   disturbed and undisturbed ground); the ring just outside your line is
+   used as the undisturbed-ground datum. Three ways to trace:
+   - *photos — several viewpoints* (default): outline the same slide on
+     2 photos from each of 4 viewpoints. The app suggests which photo to
+     outline next, shows the current 3-D region projected into each photo as
+     an editable starting outline, flags an outline that disagrees with the
+     others, and combines them in 3-D. *Compute volume* unlocks at 4 × 2
+     (or tick "indicative result" for fewer). See
+     `MULTIVIEW_REGION_PROGRESS.md`.
+   - *top-down view*: no perspective distortion; generated on demand from
+     the dense cloud.
+   - *single photo* (legacy): one outline on one photo; the result is
+     marked lower-confidence.
 4. **Result** — net / cut / fill volume, area, max depth, datum model, an
    uncertainty estimate (datum roughness + scale accuracy), quality
    warnings, a swell-factor toggle for loose/truckload volume, an overlay of

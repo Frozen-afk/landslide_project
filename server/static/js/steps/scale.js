@@ -2,7 +2,7 @@
  * reference measured in two photos. */
 import { state, $ } from "../state.js";
 import { api } from "../api.js";
-import { setScaleStatusUpdater } from "./mark.js";
+import { setScaleStatusUpdater, canMeasure } from "./mark.js";
 
 let manA = null, manB = null;
 
@@ -40,7 +40,7 @@ export function updateScaleStatus() {
   } else {
     el.innerHTML = '<span class="err">scale not set yet</span>';
   }
-  $("measure-btn").disabled = !(state.polygonClosed && state.scale);
+  $("measure-btn").disabled = !canMeasure();
 }
 
 async function arucoDetect() {

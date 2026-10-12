@@ -34,7 +34,8 @@ class Job:
                  status: str = "reconstructing", error: str | None = None,
                  log: list[str] | None = None, scale_info: dict | None = None,
                  result: dict | None = None, ortho: dict | None = None,
-                 dem_info: dict | None = None, capture: dict | None = None):
+                 dem_info: dict | None = None, capture: dict | None = None,
+                 annotations: dict | None = None, annotations_rev: int = 0):
         self.id = job_id
         self.dir = DATA_DIR / job_id
         self.status = status          # reconstructing|ready|measuring|orthorectifying|error|capturing
@@ -47,6 +48,12 @@ class Job:
         self.ortho = ortho            # orthophoto metadata, persisted
         self.dem_info = dem_info      # prior-DEM transform, persisted
         self.capture = capture        # guided-capture session manifest (S2, §9.1)
+        # multi-view region outlines, {image name: {polygon, status, source,
+        # updated}}; `annotations_rev` bumps on every change so a result can
+        # be told apart from outlines edited after it was measured
+        self.annotations = annotations or {}
+        self.annotations_rev = annotations_rev
+        self._mv_preview = None       # (rev, scale, fusion preview) — in-memory only
         # RLock, not Lock: ensure_ctx() holds this for its whole body
         # (including its evict_ctx() call), and evict_ctx() can pick this
         # same job as an eviction candidate and call its own save_state(),
@@ -76,6 +83,8 @@ class Job:
                                if s else None)(self.scale_info),
                 "result": self.result, "ortho": self.ortho,
                 "dem_info": self.dem_info,
+                "annotations": self.annotations,
+                "annotations_rev": self.annotations_rev,
             }
             tmp = self.state_path.with_suffix(f".tmp-{uuid.uuid4().hex[:8]}")
             tmp.write_text(json.dumps(state))
@@ -193,6 +202,9 @@ class Job:
                 "reconstructable": self.reconstructable,
                 "ortho": self.ortho,
                 "ctx_loading": self._ctx_loading,
+                "annotations_rev": self.annotations_rev,
+                "n_annotations": sum(1 for a in self.annotations.values()
+                                     if a.get("status") == "accepted"),
             }
             if self.capture is not None:
                 out["capture"] = self.capture
@@ -362,7 +374,13 @@ def load_persisted_jobs() -> None:
                       error=state.get("error"), log=state.get("log"),
                       scale_info=state.get("scale_info"),
                       result=state.get("result"), ortho=state.get("ortho"),
-                      dem_info=state.get("dem_info"), capture=capture)
+                      dem_info=state.get("dem_info"), capture=capture,
+                      annotations=state.get("annotations"),
+                      annotations_rev=state.get("annotations_rev", 0))
+            if job.status == "measuring" and _model_complete(d / "work" / "sparse"):
+                # the worker died with the server; say so instead of coming
+                # back `ready` with the result silently missing
+                job.error = "measurement was interrupted by a server restart — run it again"
             if job.status in ("reconstructing", "measuring", "orthorectifying"):
                 # a job that was mid-reconstruction (or mid-measure/-ortho,
                 # which both require a finished model) when the server

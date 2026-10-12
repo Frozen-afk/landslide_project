@@ -1,18 +1,47 @@
 /* Step 3: mark the landslide region — polygon tracing (click / freehand /
  * auto-detect), zoom/pan/vertex-drag/insert/delete (F2), keyboard shortcuts,
- * top-down (ortho) toggle, prior-surface DEM import, and "compute volume". */
+ * top-down (ortho) toggle, prior-surface DEM import, and "compute volume".
+ * Trace modes: "multi" (preferred — the same outline tools, one outline per
+ * photo, fused server-side; steps/multiview.js), "photo" (legacy single
+ * photo, lower confidence), "ortho". */
 import { state, $ } from "../state.js";
 import { api } from "../api.js";
 import { storedToCanvas, dist, closestOnSegment } from "../coords.js";
 import { poll } from "./upload.js";
 import { showResult } from "./result.js";
+import * as mv from "./multiview.js";
 
 const HIT_R = 10; // canvas backing-store px
 
 let markCanvas = null;
 let freehand = false, fhDragging = false;
 
+const isMulti = () => state.traceMode === "multi";
+let enterImage = null;   // photo to reopen when the multi-view step loads
+const LS_MARK = (id) => `lsv-mark:${id}`;
+
+function rememberView() {
+  if (!state.jobId) return;
+  try {
+    localStorage.setItem(LS_MARK(state.jobId),
+      JSON.stringify({ mode: state.traceMode, image: state.markImg }));
+  } catch (e) { /* storage full / disabled */ }
+}
+
+/* every edit of the polygon ends here: measure-button state, and in
+ * multi-view mode the outline is saved */
+function polygonEdited() {
+  updateScaleStatusRef();
+  if (isMulti()) mv.polygonEdited();
+}
+
+export function canMeasure() {
+  if (!state.scale || !state.scale.applied) return false;
+  return isMulti() ? mv.canMeasure() : state.polygonClosed;
+}
+
 function polygonDecorator(ctx, s) {
+  if (isMulti()) mv.decorate(ctx, s);
   const p = state.polygon;
   if (!p.length) return;
   ctx.strokeStyle = "#ffe14d"; ctx.lineWidth = 2.5; ctx.setLineDash([]);
@@ -72,6 +101,24 @@ function resetPolygon() {
   $("poly-close").disabled = true;
   $("auto-note").textContent = "";
   markCanvas.draw(markCanvas.decorator);
+  polygonEdited();
+}
+
+/* multi-view: show `name` with its stored outline (or none) */
+function openImage(name) {
+  if (!name) return;
+  $("mark-img").value = name;
+  state.markImg = name;
+  const poly = mv.polygonFor(name);
+  state.polygon = poly || [];
+  state.polygonClosed = !!poly;
+  state.selectedVertex = -1;
+  $("poly-close").disabled = true;
+  $("auto-note").textContent = "";
+  markCanvas.load(name, 940);
+  updateScaleStatusRef();
+  rememberView();
+  mv.onImageOpened(name);
 }
 
 function deleteSelectedVertex() {
@@ -81,7 +128,7 @@ function deleteSelectedVertex() {
   if (state.polygon.length < 3) state.polygonClosed = false;
   $("poly-close").disabled = state.polygon.length < 3;
   markCanvas.draw(markCanvas.decorator);
-  updateScaleStatusRef();
+  polygonEdited();
 }
 
 /* set by scale.js at init time to avoid a circular import (scale.js also
@@ -93,7 +140,13 @@ function updateTraceUI() {
   const ortho = state.traceMode === "ortho";
   $("mark-img").parentElement.classList.toggle("hidden", ortho);
   $("ortho-btn").classList.toggle("hidden", ortho ? !!state.ortho : true);
-  if (!ortho) {
+  $("mv-panel").classList.toggle("hidden", !isMulti());
+  $("mv-tools").classList.toggle("hidden", !isMulti());
+  $("legacy-note").classList.toggle("hidden", state.traceMode !== "photo");
+  if (isMulti()) {
+    $("ortho-note").textContent = "";
+    mv.enter(enterImage);
+  } else if (!ortho) {
     $("ortho-note").textContent = "";
     markCanvas.load(state.markImg, 940);
   } else if (state.ortho) {
@@ -149,7 +202,7 @@ async function autoDetect() {
     state.polygonClosed = true;
     state.selectedVertex = -1;
     $("poly-close").disabled = true;
-    updateScaleStatusRef();
+    polygonEdited();
     note.innerHTML =
       `detected (${(best.confidence * 100).toFixed(0)}% confidence, ` +
       `${best.polygon.length} pts on ${useOrtho ? "top-down view" : r.image}) — ` +
@@ -195,34 +248,65 @@ async function removeDem() {
   } catch (e) { /* ignore */ }
 }
 
-async function runMeasure() {
-  $("measure-btn").disabled = true;
+let measuring = false;   // a second click while one request is in flight is dropped
+
+function measureNote(html) { $("measure-note").innerHTML = html; }
+const esc = (t) => String(t).replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+function waitForResult() {
   $("progress").classList.remove("hidden");
   $("progress-text").textContent = "measuring…";
+  poll((snap) => {
+    $("progress").classList.add("hidden");
+    measuring = false;
+    if (snap.result) {
+      measureNote("");
+      showResult(snap.result);
+      mv.setResultRev(snap.result, snap.annotations_rev);
+    } else if (snap.error) {
+      measureNote(`<span class="err">${esc(snap.error)} — fix it and press "Compute volume" again</span>`);
+    }
+    updateScaleStatusRef();
+  });
+}
+
+async function runMeasure() {
+  if (measuring) return;
+  measuring = true;
+  $("measure-btn").disabled = true;
+  measureNote("");
   $("step-result").classList.add("hidden");
   try {
-    const body = {
-      polygon: state.polygon.map((p) => [p.x, p.y]),
-      dense: $("use-dense").checked,
-      mode: state.traceMode,
-    };
-    if (state.traceMode === "photo") body.image = state.markImg;
+    const body = { dense: $("use-dense").checked, mode: "photo" };
+    if (isMulti()) {
+      // the server measures what it has stored: every outline must be there first
+      if (!(await mv.flush())) throw new Error("some outlines are not saved yet — check the connection");
+      body.multiview = true;
+      body.indicative = mv.wantsIndicative();
+    } else {
+      body.polygon = state.polygon.map((p) => [p.x, p.y]);
+      body.mode = state.traceMode;
+      if (state.traceMode === "photo") body.image = state.markImg;
+    }
     await api(`/api/jobs/${state.jobId}/measure`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
   } catch (e) {
-    $("progress").classList.add("hidden");
-    $("progress-text").innerHTML = "";
-    alert("could not start measurement: " + e.message);
-    $("measure-btn").disabled = false;
+    if (e.status === 409 && !e.detail) {
+      // already measuring (double submit, second tab, reload): follow that run
+      waitForResult();
+      return;
+    }
+    measuring = false;
+    const why = e.detail
+      ? `${esc(e.detail.message)}<ul>${(e.detail.instructions || []).map((t) => `<li>${esc(t)}</li>`).join("")}</ul>`
+      : esc(e.message);
+    measureNote(`<span class="err">could not start measurement: ${why}</span>`);
+    updateScaleStatusRef();
     return;
   }
-  poll((snap) => {
-    $("progress").classList.add("hidden");
-    if (snap.result) showResult(snap.result);
-    else if (snap.error) alert("measurement failed: " + snap.error);
-    $("measure-btn").disabled = false;
-  });
+  waitForResult();
 }
 
 export function initMark(canvas) {
@@ -241,7 +325,7 @@ export function initMark(canvas) {
     }
     state.selectedVertex = hit.index;
   };
-  markCanvas.onDragEnd = () => updateScaleStatusRef();
+  markCanvas.onDragEnd = () => polygonEdited();
   markCanvas.onTap = (p) => {
     if (freehand) return;
     if (!state.polygonClosed) {
@@ -255,18 +339,30 @@ export function initMark(canvas) {
   };
   markCanvas.gestureEnabled = () => !freehand;
 
+  mv.initMultiview({
+    openImage,
+    redraw: () => markCanvas.draw(markCanvas.decorator),
+    refreshMeasure: () => updateScaleStatusRef(),
+  });
+
   $("mark-img").addEventListener("change", (e) => {
+    if (isMulti()) { openImage(e.target.value); return; }
     if (state.traceMode !== "photo") return;
     state.markImg = e.target.value;
     resetPolygon();
     markCanvas.load(state.markImg, 940);
     updateScaleStatusRef();
+    rememberView();
   });
-  $("trace-mode").addEventListener("change", (e) => {
+  $("trace-mode").addEventListener("change", async (e) => {
+    if (isMulti()) await mv.flush();     // leaving multi-view: nothing left unsaved
     state.traceMode = e.target.value;
-    resetPolygon();
+    state.polygon = []; state.polygonClosed = false; state.selectedVertex = -1;
+    $("poly-close").disabled = true;
+    enterImage = state.markImg;
     updateTraceUI();
     updateScaleStatusRef();
+    rememberView();
   });
   $("ortho-btn").addEventListener("click", generateOrtho);
   $("poly-auto").addEventListener("click", autoDetect);
@@ -284,7 +380,9 @@ export function initMark(canvas) {
     $("freehand-note").textContent = freehand
       ? "press & drag along the boundary — release to close"
       : "";
-    resetPolygon();
+    state.polygon = []; state.polygonClosed = false; state.selectedVertex = -1;
+    $("poly-close").disabled = true;
+    markCanvas.draw(markCanvas.decorator);
   });
   markCanvas.addEventListener("pointerdown", (ev) => {
     if (!freehand || state.polygonClosed) return;
@@ -313,7 +411,7 @@ export function initMark(canvas) {
       }
       state.polygonClosed = true;
       $("poly-close").disabled = true;
-      updateScaleStatusRef();
+      polygonEdited();
     } else {
       state.polygon = [];
     }
@@ -326,12 +424,12 @@ export function initMark(canvas) {
     state.selectedVertex = -1;
     markCanvas.draw(markCanvas.decorator);
     $("poly-close").disabled = state.polygon.length < 3;
-    updateScaleStatusRef();
+    polygonEdited();
   });
   $("poly-close").addEventListener("click", () => {
     state.polygonClosed = true;
     markCanvas.draw(markCanvas.decorator);
-    updateScaleStatusRef();
+    polygonEdited();
   });
   $("poly-clear").addEventListener("click", resetPolygon);
   $("measure-btn").addEventListener("click", runMeasure);
@@ -362,8 +460,21 @@ export function onJobReady(snap) {
     o.value = n; o.textContent = n;
     sel.appendChild(o);
   }
-  const want = state.markImg && names.includes(state.markImg) ? state.markImg : mid;
+  // page reload / job switch: come back to the same mode and photo
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(LS_MARK(state.jobId)) || "{}"); } catch (e) { /* ignore */ }
+  if (["multi", "photo", "ortho"].includes(saved.mode)) state.traceMode = saved.mode;
+  $("trace-mode").value = state.traceMode;
+  const prefer = saved.image || state.markImg;
+  const want = prefer && names.includes(prefer) ? prefer : mid;
   if (want) sel.value = want;
   state.markImg = sel.value;
+  enterImage = saved.image && names.includes(saved.image) ? saved.image : null;
+  measuring = false;
+  mv.resetMultiview();
+  mv.setResultRev(snap.result, snap.annotations_rev);
+  // a measurement that failed or was cut off by a restart while the page
+  // was away: say so here instead of silently showing no result
+  measureNote(snap.error && !snap.result ? `<span class="err">${esc(snap.error)}</span>` : "");
   updateTraceUI();
 }

@@ -36,7 +36,8 @@ from landslide.scaling import aruco_scale, manual_scale  # noqa: E402
 from landslide.sfm import IMAGE_EXTS, count_photos  # noqa: E402
 from server import executor, jobs, worker  # noqa: E402
 from server.jobs import JOBS, JOBS_LOCK, Job, _photo_cache  # noqa: E402
-from server.schemas import (ArucoScaleRequest, CaptureFinalizeRequest,  # noqa: E402
+from server.schemas import (AnnotationRequest, ArucoScaleRequest,  # noqa: E402
+                            CaptureFinalizeRequest,
                             CapturePhotoMeta, CapturePreviewRequest,
                             CaptureRoiRequest, CaptureSessionRequest,
                             ManualScaleRequest, MeasureRequest)
@@ -671,12 +672,190 @@ def remove_dem(job_id: str):
     return {"removed": True}
 
 
+# ---------------------------------------------------------------------------
+# Multi-view region outlines (MULTIVIEW_REGION_PROGRESS.md). One outline per
+# photo, persisted in state.json; every write is an idempotent PUT/DELETE so
+# a retried or doubled request cannot create a second copy.
+# ---------------------------------------------------------------------------
+
+MV_PREVIEW_POINTS = 150_000   # cloud subsample for the in-request fusion preview
+
+
+def _accepted(job: Job) -> list[dict]:
+    return [{"image": n, "polygon": a["polygon"]}
+            for n, a in sorted(job.annotations.items())
+            if a.get("status") == "accepted" and len(a.get("polygon") or []) >= 3]
+
+
+def _mv_preview(job: Job) -> dict | None:
+    """Fusion of the accepted outlines on a subsample of the cached cloud
+    (sparse cloud when no dense cache exists yet), for the marking UI:
+    agreement per outline and the 3D rings to reproject. Cached per
+    (annotations_rev, scale); None when there is nothing to fuse."""
+    import numpy as np
+
+    from landslide import multiview
+    from landslide.densify import load_cached_dense
+
+    anns = [a for a in _accepted(job) if a["image"] in job.ctx.views]
+    if not anns:
+        return None
+    key = (job.annotations_rev, job.ctx.scale)
+    cached = job._mv_preview
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    dense = load_cached_dense(job.ctx, log=lambda *_: None)
+    pts = dense["points"] if dense is not None and len(dense["points"]) else job.ctx.sparse
+    pts = np.ascontiguousarray(pts[:: max(1, len(pts) // MV_PREVIEW_POINTS)])
+    try:
+        f = multiview.fuse(job.ctx, anns, pts=pts, log=lambda *_: None)
+        out = {"stats": f["stats"], "rings": f["rings"], "error": None}
+    except Exception as e:
+        out = {"stats": None, "rings": {}, "error": str(e)}
+    job._mv_preview = (key, out)
+    return out
+
+
+def _mv_summary(job: Job) -> dict:
+    """Everything the marking step shows: POV groups and progress toward
+    4 x 2, the photos to outline next, agreement per outline, and what to
+    do about each problem."""
+    from landslide import multiview
+
+    pov = multiview.pov_groups(job.ctx)
+    registered = {n: a for n, a in job.annotations.items() if n in pov["views"]}
+    preview = _mv_preview(job)
+    stats = (preview or {}).get("stats")
+    by_img = {a["image"]: a for a in (stats or {}).get("annotations", [])}
+    used = [n for n, a in registered.items() if a.get("status") == "accepted"
+            and not by_img.get(n, {}).get("rejected")]
+    req = multiview.requirement(pov, used)
+    ring = (preview or {}).get("rings", {}).get("best")
+    suggestions = multiview.suggest_images(job.ctx, pov, registered, target=ring)
+
+    todo: list[str] = []
+    for a in by_img.values():
+        if a["rejected"]:
+            todo.append(f"{a['image']}: outline marks a different area than the "
+                        "others — redraw it or delete it")
+        elif a["weight"] < 1.0:
+            todo.append(f"{a['image']}: outline only partly agrees with the others "
+                        "— check its edge")
+    if not req["met"]:
+        if not req["achievable"]:
+            todo.append(f"these photos cover only {req['n_groups_available']} viewpoint(s) "
+                        f"with {req['min_per_group']}+ photos; a high-confidence result "
+                        f"needs {req['min_groups']} — add photos from further around the "
+                        "slide, or compute an indicative result")
+        if suggestions:
+            s0 = suggestions[0]
+            todo.append(f"next: outline the slide on {s0['image']} (viewpoint "
+                        f"P{s0['group']}, {s0['azimuth_deg']:.0f}° around)")
+    if preview and preview.get("error"):
+        todo.append(f"the outlines could not be fused: {preview['error']}")
+
+    return {
+        "groups": [{"id": g, "azimuth_deg": info["azimuth_deg"],
+                    "elevation_deg": info["elevation_deg"],
+                    "n_images": len(info["images"]), "images": info["images"],
+                    "n_accepted": req["counts"].get(g, 0)}
+                   for g, info in sorted(pov["groups"].items())],
+        "views": pov["views"],
+        "requirement": req,
+        "suggestions": suggestions,
+        "agreement": by_img,
+        "fusion": ({k: stats[k] for k in ("n_groups", "n_used", "area_lower_m2",
+                                           "area_best_m2", "area_upper_m2",
+                                           "uncertain_area_frac", "weak_support_frac",
+                                           "components")} if stats else None),
+        "instructions": todo,
+    }
+
+
+def _annotations_payload(job: Job) -> dict:
+    with job.lock:
+        anns = {n: dict(a) for n, a in job.annotations.items()}
+        rev = job.annotations_rev
+    return {"annotations": anns, "rev": rev, "summary": _mv_summary(job)}
+
+
+@router.get("/api/jobs/{job_id}/annotations")
+def list_annotations(job_id: str):
+    return _annotations_payload(_get_ready_job(job_id))
+
+
+@router.get("/api/jobs/{job_id}/annotations/{image}")
+def get_annotation(job_id: str, image: str):
+    """One photo's outline plus the current 3D region reprojected into that
+    photo (`projected.{lower,best,upper}`) — the editable suggestion, and the
+    confident/uncertain band to draw against."""
+    from landslide import multiview
+
+    job = _get_ready_job(job_id)
+    view = job.ctx.views.get(image)
+    if view is None:
+        raise HTTPException(404, "that photo is not part of the reconstruction")
+    preview = _mv_preview(job)
+    rings = (preview or {}).get("rings") or {}
+    pov = multiview.pov_groups(job.ctx)
+    return {"image": image, "annotation": job.annotations.get(image),
+            "rev": job.annotations_rev, "view": pov["views"][image],
+            "projected": {lvl: multiview.project_ring(view, rings.get(lvl))
+                          for lvl in ("lower", "best", "upper")}}
+
+
+@router.put("/api/jobs/{job_id}/annotations/{image}")
+def put_annotation(job_id: str, image: str, spec: AnnotationRequest):
+    job = _get_ready_job(job_id)
+    view = job.ctx.views.get(image)
+    if view is None:
+        raise HTTPException(404, "that photo is not part of the reconstruction")
+    poly = [[float(x), float(y)] for x, y in spec.polygon]
+    if spec.status != "skipped":
+        if len(poly) < 3:
+            raise HTTPException(422, "polygon needs at least 3 vertices")
+        m = 0.5 * max(view.width, view.height)      # generous: zoomed-out drags
+        if not all(-m <= x <= view.width + m and -m <= y <= view.height + m
+                   for x, y in poly):               # also rejects NaN/inf
+            raise HTTPException(422, "polygon lies outside the photo")
+    entry = {"polygon": poly, "status": spec.status, "source": spec.source}
+    with job.lock:
+        old = job.annotations.get(image)
+        if old is None or {k: old.get(k) for k in entry} != entry:   # idempotent re-PUT
+            job.annotations[image] = {**entry, "updated": time.time()}
+            job.annotations_rev += 1
+        saved, rev = dict(job.annotations[image]), job.annotations_rev
+    job.save_state()
+    return {"image": image, "annotation": saved, "rev": rev}
+
+
+@router.delete("/api/jobs/{job_id}/annotations/{image}")
+def delete_annotation(job_id: str, image: str):
+    job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(404, "unknown job")
+    with job.lock:
+        if job.annotations.pop(image, None) is not None:   # deleting twice is fine
+            job.annotations_rev += 1
+        rev = job.annotations_rev
+    job.save_state()
+    return {"deleted": image, "rev": rev}
+
+
 @router.post("/api/jobs/{job_id}/measure")
 def run_measure_endpoint(job_id: str, spec: MeasureRequest):
     job = JOBS.get(job_id)
     if job is None:
         raise HTTPException(404, "unknown job")
-    if len(spec.polygon) < 3:
+    multiview_anns = None
+    if spec.multiview:
+        if spec.mode != "photo":
+            raise HTTPException(400, "multi-view outlines are a photo-mode workflow")
+        with job.lock:
+            multiview_anns, anns_rev = _accepted(job), job.annotations_rev
+        if not multiview_anns:
+            raise HTTPException(400, "accept at least one outline first")
+    elif len(spec.polygon) < 3:
         raise HTTPException(400, "polygon needs at least 3 points")
     if not (job.scale_info or {}).get("applied"):
         raise HTTPException(400, "set the scale (reference object) first")
@@ -694,6 +873,19 @@ def run_measure_endpoint(job_id: str, spec: MeasureRequest):
         raise HTTPException(409, "this job has no cached reconstruction (it "
                                  "may have failed or been interrupted before "
                                  "finishing) — re-upload the photos")
+    if multiview_anns and not spec.indicative:
+        # a final (high-confidence-eligible) multi-view measurement needs
+        # 4 viewpoints x 2 photos; below that the caller must ask for an
+        # indicative result explicitly
+        if job.status in BUSY_STATUSES:
+            raise HTTPException(409, "the server is busy on this job")
+        summary = _mv_summary(_get_ready_job(job_id))
+        if not summary["requirement"]["met"]:
+            raise HTTPException(409, {
+                "message": "outline the slide on 2 photos from each of 4 viewpoints "
+                           "first, or ask for an indicative result",
+                "requirement": summary["requirement"],
+                "instructions": summary["instructions"]})
     # S3: check-and-set the busy status atomically — two racing POSTs must
     # not both see "not busy" and both submit.
     with job.lock:
@@ -705,6 +897,8 @@ def run_measure_endpoint(job_id: str, spec: MeasureRequest):
     spec_dict = {"image": spec.image, "polygon": spec.polygon, "dense": spec.dense,
                  "rim_px": spec.rim_px, "rim_inner_px": spec.rim_inner_px,
                  "mode": spec.mode, "ortho": job.ortho}
+    if multiview_anns:
+        spec_dict.update(annotations=multiview_anns, annotations_rev=anns_rev)
     executor.submit_job(job, worker.run_measure, job.scale_info, job.dem_info,
                         spec_dict, job.dir / "artifacts", on_done=_on_measure_done)
     return {"queued": True}

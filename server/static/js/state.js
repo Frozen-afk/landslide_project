@@ -13,11 +13,13 @@ export const state = {
   ortho: null,         // orthophoto metadata (when rendered)
   manual: { a: { img: null, pts: [] }, b: { img: null, pts: [] } },
   markImg: null,
-  traceMode: "photo",  // "photo" | "ortho"
+  traceMode: "multi",  // "multi" (outlines on several photos) | "photo" (legacy single) | "ortho"
   polygon: [],         // original-image px (or ortho px)
   polygonClosed: false,
   selectedVertex: -1,  // index into `polygon`, -1 = none selected
   lastResult: null,
+  // multi-view outlines, mirrored from the server (steps/multiview.js)
+  mv: { annotations: {}, summary: null, rev: 0, projected: null, resultRev: null },
   // S3 guided-capture session (GUIDED_CAPTURE_PLAN.md §9.4). `photos` mirrors
   // the server manifest (source of truth, §10) — not a separate client copy.
   capture: { jobId: null, arm: "A", seq: 0, photos: [] },

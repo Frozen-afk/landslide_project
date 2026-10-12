@@ -4,13 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Landslide Volume from Phone Photos</title>
-<link rel="stylesheet" href="/static/style.css?v=6">
+<link rel="stylesheet" href="/static/style.css?v=7">
 </head>
 <body>
 <header>
   <h1>📷 Landslide volume from phone photos</h1>
   <p>Upload overlapping photos (60–80% overlap, sweep left → right), scale from
-  a reference of known size, mark the landslide, get the volume.
+  a reference of known size, outline the landslide on photos from several
+  viewpoints, get the volume.
   <a href="/static/capture.html">Live capture helper →</a> — checks sharpness,
   exposure and sweep speed on your phone <em>before</em> you upload.</p>
 </header>
@@ -144,19 +145,28 @@
 <section id="step-mark" class="card hidden">
   <h2>3 · Mark the landslide</h2>
   <p class="note">Draw the boundary ON THE RIM — the ring just outside your polygon is used
-  as the undisturbed-ground datum for the volume. The top-down view has no perspective
-  distortion and is the most accurate way to trace. Scroll/pinch to zoom, drag empty
-  space to pan, drag a point to move it, click an edge to insert a point, click a point
-  then press Delete to remove it.</p>
+  as the undisturbed-ground datum for the volume. Outline the same slide on 2 photos from
+  each of 4 viewpoints: the outlines are combined in 3-D, so one imprecise line, or ground
+  that only looks enclosed from one direction, no longer decides the result. Scroll/pinch
+  to zoom, drag empty space to pan, drag a point to move it, click an edge to insert a
+  point, click a point then press Delete to remove it.</p>
   <div class="row">
     <label>trace on
       <select id="trace-mode">
-        <option value="photo" selected>photo (perspective)</option>
+        <option value="multi" selected>photos — several viewpoints (recommended)</option>
+        <option value="photo">single photo (legacy, lower confidence)</option>
         <option value="ortho">top-down view</option>
       </select>
     </label>
     <button id="ortho-btn" class="hidden">Generate top-down view</button>
     <span id="ortho-note" class="note"></span>
+  </div>
+  <p id="legacy-note" class="warn hidden">Single-photo outline: kept for older jobs. The
+  result is marked lower-confidence — use the multi-view mode for a final measurement.</p>
+  <!-- multi-view marking (steps/multiview.js): progress by viewpoint, what to do next -->
+  <div id="mv-panel" class="mv-panel hidden">
+    <div id="mv-progress"></div>
+    <div id="mv-instructions" class="capture-checks"></div>
   </div>
   <label>photo <select id="mark-img"></select></label>
   <canvas id="mark-canvas" width="960" height="720"></canvas>
@@ -170,9 +180,28 @@
     <span id="freehand-note" class="note"></span>
   </div>
   <p id="auto-note" class="note"></p>
+  <div id="mv-tools" class="mv-panel">
+    <div class="row">
+      <button id="mv-accept" class="primary" disabled>Accept outline</button>
+      <button id="mv-suggest" disabled>Use projected region as outline</button>
+      <button id="mv-skip">Skip this photo</button>
+      <button id="mv-delete" disabled>Delete outline</button>
+      <button id="mv-next" disabled>Next suggested photo →</button>
+      <span id="mv-save-note" class="note"></span>
+    </div>
+    <p class="note"><span class="mv-key" style="color:#ffe14d">━</span> your outline ·
+      <span class="mv-key" style="color:#4fd0ff">╍</span> current 3-D region seen from this photo (editable suggestion) ·
+      <span class="mv-key" style="color:#4fd964">━</span> confident interior ·
+      <span class="mv-key" style="color:#ff9d3c">┄</span> outer limit of the uncertain boundary</p>
+    <div id="mv-fusion" class="note"></div>
+    <div id="mv-list" class="capture-checks"></div>
+    <label class="inline"><input type="checkbox" id="mv-indicative"> fewer than 4 viewpoints × 2
+      photos: compute an <b>indicative</b> result anyway</label>
+  </div>
   <div class="row">
     <label class="inline"><input type="checkbox" id="use-dense" checked> dense cloud</label>
     <button id="measure-btn" class="primary" disabled>Compute volume</button>
+    <span id="measure-note" class="note"></span>
   </div>
   <div class="row">
     <label class="inline note">prior surface (optional):</label>
@@ -204,10 +233,11 @@
     <figure><img id="img-overlay" alt="overlay"><figcaption>marked region</figcaption></figure>
     <figure><img id="img-height" alt="heightmap"><figcaption>height vs datum (m)</figcaption></figure>
     <figure><img id="img-slope" alt="slope map"><figcaption>slope hazard (°)</figcaption></figure>
+    <figure id="fig-region" class="hidden"><img id="img-region" alt="fused region"><figcaption>fused region, top-down: confident (green) · uncertain boundary (amber)</figcaption></figure>
   </div>
 </section>
 </main>
 
-<script type="module" src="/static/js/main.js?v=2"></script>
+<script type="module" src="/static/js/main.js?v=3"></script>
 </body>
 </html>

@@ -875,7 +875,8 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
                  up: np.ndarray | None = None,
                  max_edge_factor: float = 20.0,
                  max_edge_abs_m: float = 0.5,
-                 polygon_ground: np.ndarray | None = None) -> dict:
+                 polygon_ground: np.ndarray | None = None,
+                 bootstrap: bool = True) -> dict:
     """Cut/fill volume of interior points above the rim-fitted datum surface.
 
     All units: whatever the points are in (caller passes metric-scaled pts).
@@ -916,7 +917,9 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
     diagnostic. When the rim datum is used, `net_volume_ci95_m3` (T2.2,
     `bootstrap_volume_ci`) gives a resampling-based 95% interval — centered
     on the TIN net, spread estimated from the (cheap) raster proxy — in
-    place of the old flat `sigma_datum × area` heuristic.
+    place of the old flat `sigma_datum × area` heuristic. `bootstrap=False` skips
+    that bootstrap (the multi-view lower/upper bound selections only need
+    the volumes; the bootstrap is ~95% of this function's runtime).
     """
     if len(interior) < 30:
         raise RuntimeError(
@@ -1186,7 +1189,7 @@ def prism_volume(interior: np.ndarray, rim: np.ndarray | None,
     # the risk that a genuinely unmeasured patch hides real relief, so this
     # is the honest way to fold that specific, unresampled risk in.
     ci = None
-    if datum.startswith("rim_") and rim is not None and len(rim) >= 15:
+    if bootstrap and datum.startswith("rim_") and rim is not None and len(rim) >= 15:
         offsets = bootstrap_volume_ci(interior_pre_cap, rim, up, cap, cap_low,
                                       cell_r, datum, log=log)
         if offsets is not None:

@@ -15,6 +15,7 @@ export async function api(path, opts) {
       if (typeof detail === "string" && detail) msg = detail;
     } catch (e) { /* not JSON */ }
     const err = new Error(msg);
+    err.status = r.status;
     if (detail && typeof detail === "object") err.detail = detail;
     throw err;
   }

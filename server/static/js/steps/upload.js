@@ -81,6 +81,7 @@ function switchJob(id, { keepProgress = false } = {}) {
   state.manual = { a: { img: null, pts: [] }, b: { img: null, pts: [] } };
   state.scale = null; state.images = []; state.ortho = null;
   state.lastResult = null;
+  state.traceMode = "multi";
   $("step-result").classList.add("hidden");
   $("step-scale").classList.add("hidden");
   $("step-mark").classList.add("hidden");

@@ -25,12 +25,26 @@ class ManualScaleRequest(BaseModel):
 
 
 class MeasureRequest(BaseModel):
-    polygon: list[tuple[float, float]]
+    """`multiview=True` (photo mode) measures the fused region of the job's
+    accepted outlines instead of `polygon`/`image`; `indicative=True` allows
+    that below the 4 viewpoints x 2 photos requirement. Both default off, so
+    a pre-multi-view client's body means exactly what it always did."""
+    polygon: list[tuple[float, float]] = []
     mode: Literal["photo", "ortho"] = "photo"
     image: Optional[str] = None
     dense: bool = True
     rim_px: float = 12.0
     rim_inner_px: Optional[float] = None
+    multiview: bool = False
+    indicative: bool = False
+
+
+class AnnotationRequest(BaseModel):
+    """One photo's outline of the landslide region, in stored-photo px.
+    `skipped` needs no polygon; `draft` is saved but not used for fusion."""
+    polygon: list[tuple[float, float]] = Field(default_factory=list, max_length=2000)
+    status: Literal["draft", "accepted", "skipped"] = "accepted"
+    source: Literal["manual", "suggested", "auto"] = "manual"
 
 
 class CaptureSessionRequest(BaseModel):

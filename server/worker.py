@@ -125,5 +125,8 @@ def run_measure(job_id: str, photos_dir, work_dir, queue,
                   mode=spec.get("mode", "photo"),
                   ortho=spec.get("ortho"),
                   dem=dem,
-                  artifacts_dir=Path(artifacts_dir), log=log)
+                  artifacts_dir=Path(artifacts_dir), log=log,
+                  annotations=spec.get("annotations"))
+    if "multiview" in res:
+        res["multiview"]["annotations_rev"] = spec.get("annotations_rev")
     return res

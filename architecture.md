@@ -26,6 +26,7 @@ current tree). For the upgrade roadmap see `implementation_plan.md`.
  │      ├─▶ scaling.py   ArUco / manual metric scale                        │
  │      ├─▶ densify.py   multi-view SGBM depth fusion → semi-dense cloud   │
  │      ├─▶ ground.py    ray-cast photo polygon → ground-frame selection   │
+ │      ├─▶ multiview.py outlines on several photos → one fused 3D region  │
  │      ├─▶ ortho.py     top-down orthophoto + ground-coordinate selection  │
  │      ├─▶ volume.py    rim datum (plane/quad/TPS) + 2.5D prism integral   │
  │      ├─▶ dem.py       prior-DEM import, trimmed point-to-plane ICP       │
@@ -43,7 +44,8 @@ current tree). For the upgrade roadmap see `implementation_plan.md`.
    photos/           EXIF-normalised JPEGs (000_name.jpg …), gps.json
    work/             database.db, sparse/0/, dense_<w>_<fingerprint>.npz, enhanced/
    artifacts/        ortho.jpg, ortho.json, overlay.jpg, heightmap.png, slopemap.png, pointcloud.ply
-   state.json        status, error, log tail, scale_info, result, ortho meta, dem_info
+   state.json        status, error, log tail, scale_info, result, ortho meta, dem_info,
+                     annotations (multi-view outlines), annotations_rev
    dem.xyz           uploaded prior DEM (optional)
 ```
 
@@ -60,8 +62,9 @@ GIL in C++, so two jobs run concurrently on the `ThreadPoolExecutor(max_workers=
 | 3. Scale | `POST …/scale/aruco` or `…/scale/manual` | `scaling.aruco_scale` / `manual_scale` | `ctx.scale`, `scale_info` |
 | 4a. Ortho (optional) | `POST …/ortho` | `densify.dense_cloud` → `ortho.render_orthophoto` | `dense_<w>_<fp>.npz`, `ortho.jpg`, `ortho.json` |
 | 4b. Prior DEM (optional) | `POST …/dem` | `dem.load_dem` → `dem.align_to_dem` | `dem.xyz`, `dem_info` (R, t, rms) |
-| 5. Mark | browser canvas | `app.js` polygon state | polygon in stored-photo px or ortho px |
-| 6. Measure | `POST …/measure` | `pipeline.measure` → `volume.prism_volume` or `volume.dem_volume` | result dict, artifacts |
+| 5. Mark (multi-view, preferred) | browser canvas, one outline per photo; `PUT …/annotations/{image}` | `steps/multiview.js`, `routes.put_annotation`, `multiview.fuse` (preview) | outlines persisted in `state.json`; progress by POV group, suggestions, agreement |
+| 5′. Mark (legacy) | browser canvas | `steps/mark.js` polygon state | one polygon in stored-photo px (lower confidence) or ortho px |
+| 6. Measure | `POST …/measure` | `pipeline.measure` → (`multiview.select_region_multiview` \| `ground.select_region_ground` \| `ortho.select_region_ortho`) → `volume.prism_volume` or `volume.dem_volume` | result dict, artifacts |
 | 7. Change (CLI only) | `landslide.cli change A B` | `change.change_volume` | change result JSON |
 
 ### 1.2 Job state machine (`server/jobs.py`, `server/routes.py`)
@@ -77,7 +80,11 @@ GIL in C++, so two jobs run concurrently on the `ThreadPoolExecutor(max_workers=
 
 Persistence: every status change writes `state.json` atomically (`Job.save_state`,
 `server/jobs.py`). On startup `_load_persisted_jobs` reattaches job directories;
-jobs interrupted mid-SfM become `error`, finished models become `ready`. The `ReconCtx`
+jobs interrupted mid-SfM become `error`, finished models become `ready` (a job cut off
+mid-measure comes back `ready` with `error` = "measurement was interrupted by a server
+restart — run it again" instead of a silently missing result). Multi-view outlines
+(`Job.annotations`, `annotations_rev`) are part of `state.json` and are restored the same
+way; a `state.json` written before they existed loads with `{}` / `0`. The `ReconCtx`
 is rebuilt lazily from the COLMAP cache on first touch (`Job.ensure_ctx`); `GET
 /api/jobs/{id}` never blocks on this reload — it kicks off `Job.start_ctx_reload()` in a
 background thread (idempotent, guarded so a second poll doesn't start a second reload)
@@ -113,6 +120,7 @@ existing poll loop, see §6).
 | `landslide/sfm.py` | 505 | pycolmap wrapper; retry ladder; `ImageView`/`ReconCtx` data classes; covisibility graph |
 | `landslide/densify.py` | 691 | `StereoConfig`; geometry-gated neighbour selection; per-reference multi-view depth-consensus fusion; outlier/normal filters; scene-based up-vector |
 | `landslide/ground.py` | 181 | ray-cast a photo-mode polygon onto a ground DSM for parallax-free region selection |
+| `landslide/multiview.py` | 590 | multi-view region marking: POV groups, 4×2 requirement, image suggestions, per-view occlusion-aware votes, robust fusion into lower/best/upper regions, reprojection of the 3D region into a photo |
 | `landslide/scaling.py` | 394 | ArUco multi-view (with per-view outlier rejection, squareness fit, PnP cross-check) and manual two-view metric scale, quality gates |
 | `landslide/volume.py` | 825 | region selection (photo mode), robust datum fitting, prism volume, DEM differencing, LoD, slope stats |
 | `landslide/ortho.py` | 150 | top-down raster render; region selection in ground coordinates (shared `select_region_world`) |
@@ -135,6 +143,7 @@ existing poll loop, see §6).
 | `server/static/js/main.js` + `coords.js`/`state.js`/`api.js`/`canvas.js`/`steps/*.js` | ~1.1k | ES-module frontend (T3.2, replaces the old monolithic `app.js`): `coords.js` is dependency-free pixel/zoom/pan math (unit-tested from Node, see `tests/test_coords.mjs`); `canvas.js` adds wheel/pinch zoom, pan, vertex drag/insert/delete over T0.7's pointer-event tracing |
 | `server/static/capture.html` | 123 | client-side live capture quality helper |
 | `tools/synth.py` | ~430 | synthetic ground-truth scene generator; `--preset` (T3.3): `arc` (default, unchanged), `oblique60`, `descending`, `collinear`, `nadir`, `sparse8`, `lowtex`, `distorted` |
+| `tools/mv_benchmark.py` | ~300 | multi-view validation: synthetic ground-truth masks for the cached preset scenes, 1-view vs 2/4/8/16 outlines under clean / noisy / bad / occluded / missing-POV conditions (§7.2) |
 | `tools/benchmark.py` | ~190 | T3.3 harness: SfM→scale→dense→measure per preset, Markdown table (registered views, scale/volume error, cloud RMS, runtime, peak RSS) |
 | `tests/` | ~2.7k | unit + slow e2e (`-k "not e2e"` for the fast set) plus `test_server.py` (API, TestClient), `test_e2e_presets.py` (`@pytest.mark.slow`, T3.3 presets), `test_coords.mjs` (Node, frontend coordinate math) |
 
@@ -308,6 +317,70 @@ still measurably beats the image-plane fallback there; `pipeline.measure`'s G5 g
 separately reports the achieved `hit_frac`/`longest_miss_run` as `status="indicative"` even
 when ground-frame selection was used successfully.
 
+**Photo mode, multi-view fusion (preferred workflow)** — `multiview.py`,
+`pipeline.measure(..., annotations=[{image, polygon}, …])`. Instead of one polygon on one
+photo, the same region is outlined on several photos and the outlines are fused in 3D
+(`region_method = "multiview_fusion"`). Design, calibration and evidence:
+MULTIVIEW_REGION_PROGRESS.md.
+
+* **POV groups** (`pov_groups`): each registered view's direction from the scene centre
+  (median sparse point) to its camera centre; complete-linkage clustering cut at
+  `POV_GROUP_DEG = 15°`, so azimuth *and* elevation separate groups and several photos
+  panned from one standpoint are one group. Ids `P1…Pn` in azimuth order, cached on the ctx.
+* **Requirement** (`requirement`): an eligible high-confidence result needs
+  `MIN_POV_GROUPS = 4` groups each holding `MIN_PER_GROUP = 2` accepted, non-rejected
+  outlines (≥ 8). `achievable` says whether the photo set can reach that at all.
+* **Suggestions** (`suggest_images`): groups in farthest-first order of viewing direction;
+  the four best-spread groups that hold ≥ 2 photos are completed first, one photo per group
+  per round; within a group, the photo keeping most of the target (the current region ring,
+  or the sparse cloud before any outline) in frame. Accepted and skipped photos are excluded.
+* **Per-view votes** (`_view_votes`): every dense point is projected into each outlined
+  view (`ImageView.project`, distortion included). It votes only if it has positive depth,
+  lands inside the frame, and passes that view's z-buffer (6 px cells, nearest depth + 2% of
+  the view's median depth — the same tolerance as `_front_surface_mask`). **An occluded or
+  out-of-frame point gets no vote from that view, never a negative one.** The vote is soft:
+  a signed-distance ramp `BOUNDARY_FRAC = 0.5%` of the image long side wide around the
+  outline, so pixel-level tracing noise lands in "uncertain" rather than flipping a hard vote.
+* **Ground cells**: the same votes are taken on a ground grid (cell = 2× median point
+  spacing, clipped to [0.05, 0.5] m, ≤ 400 k cells) so the region has a footprint, not just a
+  point set. A cell holding points votes like a point, at its median height. A cell with
+  **no data** (within 2 m of data, the reach `ground.fill_dsm_holes` gives the ray-cast) has
+  no surface to project or occlude; each outline votes on it through its ray-cast ground
+  polygon (`ground.cast_polygon_to_ground`, the single-photo path's own boundary), so an
+  unobserved pocket inside every outline stays inside the region — where G6 measures it —
+  and one outside stays outside.
+* **Pooling**: votes are averaged within a POV group first, then across the groups that saw
+  the point — eight outlines from one standpoint are one opinion.
+* **Robust weights**: each outline's leave-one-out IoU against the consensus of the others
+  (over the points it can see). The worst outline is dropped (`weight = 0`) while its IoU is
+  below `IOU_REJECT = 0.50` **and** it is the odd one out (the others' median IoU ≥
+  `IOU_WARN = 0.70`, at least three of them); outlines between the two thresholds are
+  down-weighted linearly. A general split with no odd one out is left alone and reported.
+  A rejected outline does not count toward the 4×2 requirement.
+* **Classes**: confident interior = seen by ≥ `MIN_SUPPORT_GROUPS = 2` groups with mean group
+  vote ≥ `T_INTERIOR = 0.75`; exterior = ≥ 2 groups, vote ≤ `T_EXTERIOR = 0.25`; everything
+  between is uncertain boundary. Three nested footprints follow: **lower** (confident),
+  **best** (vote ≥ 0.5, ≥ 1 group), **upper** (vote > 0.25). `_footprint` closes 0.3 m gaps,
+  fills enclosed holes, keeps the largest connected part and contours it
+  (`contourpy`, Gaussian-smoothed, simplified); further significant parts are counted as
+  `components`.
+* **Hand-off to the existing pipeline** (`select_region_multiview`): interior = points inside
+  the footprint polygon minus points two or more groups agree are exterior (floaters, a
+  board standing in the footprint); rim = `ortho.select_region_world`'s annulus outside the
+  **upper** footprint (the uncertain band may still be slide material); `polygon_ground` =
+  the best footprint, so `prism_volume`, the rim steepness filter, datum fit, G6 coverage,
+  G9 holdout, bootstrap CI and artifacts run unchanged. The lower and upper selections are
+  integrated too (`prism_volume(..., bootstrap=False)`, same rim) and reported as
+  `volume_bounds_m3 = {lower, best, upper}`; their spread is a floor on
+  `est_volume_error_m3`.
+* **Reprojection** (`project_ring`): the best/lower/upper footprint rings, lifted to the DSM,
+  projected into any photo as an editable polygon suggestion (None when under half the ring
+  is in frame).
+
+**Photo mode, single photo (legacy)** — unchanged below; a result from it carries
+`annotation_mode = "single_view"`, `confidence = "lower"` and a warning, while its `status`,
+gates and every number are exactly what they were.
+
 **Photo mode, image-plane fallback** (`volume.select_region`, `:497`): project the whole
 cloud into the marked view (`ImageView.project` uses `cv2.projectPoints` with distortion,
 returning depth too); points with `depth <= 0` are dropped, and a coarse per-view z-buffer
@@ -403,7 +476,9 @@ Datum labels: `rim_plane`, `rim_quad`, `rim_tps`, `surface_plane`, `dem`, `prior
   track a smooth natural surface well there. So the TIN stays primary; the raster is kept as
   an independent diagnostic and as the (cheap, no-hole-fill `_raster_net`) resampling proxy
   for the bootstrap CI below.
-* **Uncertainty** (T2.2, `bootstrap_volume_ci`, `:598`): when a rim datum was used, 50
+* **Uncertainty** (T2.2, `bootstrap_volume_ci`, `:598`; skipped with `bootstrap=False`, which only
+  the multi-view lower/upper bound selections pass — the bootstrap is ~95% of
+  `prism_volume`'s runtime and those two calls only need the volumes): when a rim datum was used, 50
   bootstrap resamples of the rim points each refit the plane (and quadratic, if adopted —
   never the TPS membrane, too expensive to refit 50×) and recompute the fast raster net; the
   2.5/97.5 percentile spread **around that resample distribution's own median** (so the
@@ -469,6 +544,22 @@ REMAINING_ACCURACY_PROGRESS.md for why), not the mitigations themselves:
   accuracy target an `ok` result is meant to meet). Silent on planar/correctly-curved ground
   and on the two real presets' non-G9 gates; does not change `datum` selection, `cut`/`net`/
   `fill`, `net_volume_ci95_m3`, or G6's own thresholds.
+* **MV multi-view marking gates** (only when `res["multiview"]` exists; class `marking` in
+  `RULES`, `measurement_path = "marking"` — fixed by outlining, not by recapturing). All
+  `indicative`:
+  `MV_insufficient_pov` (4×2 requirement unmet after rejections);
+  `MV_mask_disagreement` (an outline was dropped or down-weighted, or outlines with no odd
+  one out still disagree, IoU < 0.70);
+  `MV_poor_visibility` (> 15% of the footprint not seen by ≥ 2 groups — aligned with G6's
+  0.85 — or < 30% of the region visible in an outlined photo);
+  `MV_uncertain_boundary` ((upper − lower) / best footprint area > 25%, or no confident
+  interior at all);
+  `MV_occlusion_support` (< 50% of an outline's image area has reconstructed depth, so
+  occlusion cannot be checked there);
+  `MV_disconnected` (the outlines agree on more than one patch).
+  G5 does not apply (no single ray-cast boundary); G1–G4, G6, G7, G9 are evaluated on the
+  fused region with unchanged thresholds. `res["confidence"]` = `high` (multi-view, `status
+  == "ok"`, which implies 4×2), the status itself when not `ok`, or `lower` (single photo).
 * **G8 UI** (`server/static/js/steps/result.js`): `status`, `reasons`, `region_method`,
   `hit_frac`, `coverage_frac`/`largest_void_m2`, `cut_upper_m3` are shown in the result table;
   gate reasons are folded into the existing warnings panel when `status != "ok"`.
@@ -528,7 +619,11 @@ malformed input is rejected with a 422 instead of crashing inside numpy. Errors 
 | `POST /api/jobs/{id}/scale/manual` | `{"length_m": 1.0, "a": {"image", "p1":[x,y], "p2":[x,y]}, "b": {…}}` | `scale_info` (manual keys) | 400 gates |
 | `POST /api/jobs/{id}/dem` | multipart `file` (XYZ / GeoTIFF) | `{"aligned": true, "rms_m", "n_points"}` | 400 scale unset / parse / ICP |
 | `DELETE /api/jobs/{id}/dem` | — | `{"removed": true}` | 404 |
-| `POST /api/jobs/{id}/measure` | `{"polygon": [[x,y],…], "mode": "photo"|"ortho", "image": "<name>", "dense": true, "rim_px": 12}` | `{"queued": true}`; result arrives in snapshot | 400 polygon/scale/ortho, 409 busy |
+| `GET /api/jobs/{id}/annotations` | — | `{annotations: {image: {polygon, status, source, updated}}, rev, summary: {groups[], views, requirement, suggestions[], agreement, fusion, instructions[]}}` | 404, 409 job error |
+| `GET /api/jobs/{id}/annotations/{image}` | — | `{image, annotation\|null, rev, view: {group, azimuth_deg, elevation_deg}, projected: {lower, best, upper}}` — the current 3D region reprojected into that photo | 404 |
+| `PUT /api/jobs/{id}/annotations/{image}` | `{"polygon": [[x,y],…], "status": "accepted"\|"draft"\|"skipped", "source": "manual"\|"suggested"\|"auto"}` | `{image, annotation, rev}`; create or update, idempotent (an identical re-PUT does not bump `rev`) | 404 unregistered photo, 422 polygon |
+| `DELETE /api/jobs/{id}/annotations/{image}` | — | `{deleted, rev}`; deleting twice is fine | 404 unknown job |
+| `POST /api/jobs/{id}/measure` | `{"polygon": [[x,y],…], "mode": "photo"\|"ortho", "image": "<name>", "dense": true, "rim_px": 12}` (legacy, unchanged) **or** `{"multiview": true, "indicative": false}` (photo mode: the job's accepted outlines) | `{"queued": true}`; result arrives in snapshot | 400 polygon/scale/ortho/no outline, 409 busy (string detail), 409 `{message, requirement, instructions}` when 4×2 is unmet and `indicative` is not set |
 | `GET /api/jobs/{id}/auto-detect?image=<name>` | optional photo name; omit → `artifacts/ortho.jpg` | `{"frame": "photo"|"ortho", "image", "regions": [{polygon, confidence, class, area_px}], "message"?}` | 400 no key / no ortho, 404, 502 upstream |
 | `POST /api/jobs/{id}/ortho` | `{}` | `{"queued": true}` or `{"ready": true}` | 404, 409 busy |
 | `GET /api/jobs/{id}/artifact/{name}` | — | file (`png`, `jpg`, `ply`, `json`) | 404 |
@@ -581,16 +676,23 @@ datum_rms_m datum_holdout_m? datum_holdout_windows (G9 input, prism_volume only;
 mean_height_m max_depth_m max_height_m
 max_slope_deg mean_slope_deg area_steep_m2
 lod_m lod_max_m sig_area_frac warnings[]
-mode ∈ {photo, ortho}  image?  region_method ∈ {ground_frame, image_projection}?
+mode ∈ {photo, ortho}  image?
+region_method ∈ {multiview_fusion, ground_frame, image_projection}?
+annotation_mode ∈ {multi_view, single_view}? (photo mode)  confidence ∈ {high, lower, indicative, rejected}?
+volume_bounds_m3? {lower|best|upper: {net_volume_m3, cut_volume_m3, fill_volume_m3, area_m2} | null}
+multiview? {n_annotations, n_used, n_groups, requirement{met, counts, …},
+  annotations[{image, group, iou, weight, rejected, visible_frac, zbuf_support}],
+  n_confident, n_uncertain, area_lower_m2, area_best_m2, area_upper_m2,
+  uncertain_area_frac, weak_support_frac, components, cell_m, annotations_rev}
 rim_band_px[2]?  rim_band_m[2]?
 polygon_px scale scale_method scale_rel_error cloud ∈ {dense, sparse} n_cloud_points
-artifacts: [overlay.jpg, heightmap.png, slopemap.png, pointcloud.ply?]
+artifacts: [overlay.jpg, heightmap.png, slopemap.png, regionmap.png? (multi-view), pointcloud.ply?]
 (change_volume adds icp_rms_m, registration ∈ {marker, icp})
 ```
 
 ### 5.6 Job snapshot (`GET /api/jobs/{id}`)
 `id, status, error, created, log[-60:], reconstructable, ctx_loading, ortho,
-images[{name,width,height,points}],
+annotations_rev, n_annotations, images[{name,width,height,points}],
 scale, geo{origin_llh, n_fixes, gps_residual_median_m, gps_scale_vs_marker}|null, result?`.
 
 ### 5.7 CLI spec (`cli.TEMPLATE`, `pipeline.run_spec`)
@@ -599,7 +701,8 @@ scale, geo{origin_llh, n_fixes, gps_residual_median_m, gps_scale_vs_marker}|null
  "scale": {"method": "aruco", "side_m": 0.25, "dict": "DICT_6X6_250", "id": 0}
         | {"method": "manual", "length_m": 2.0, "a": {...}, "b": {...}},
  "region": {"mode": "photo"|"ortho", "image": "...", "polygon": [[x,y],...],
-            "dense": true, "rim_px": 12, "rim_inner_px": 6}}
+            "dense": true, "rim_px": 12, "rim_inner_px": 6}
+         | {"annotations": [{"image": "...", "polygon": [[x,y],...]}, ...]}}
 ```
 
 ---
@@ -610,8 +713,8 @@ Replaces the old monolithic `app.js` (717 lines, global state, no tests) with pl
 browser-native ES modules loaded via `<script type="module" src="js/main.js">`:
 
 * `state.js` — the module-scoped equivalent of the old global `state` object
-  (`jobId, images, scale, ortho, manual{a,b}, markImg, traceMode, polygon[],
-  polygonClosed, lastResult`).
+  (`jobId, images, scale, ortho, manual{a,b}, markImg, traceMode ∈ {multi, photo, ortho},
+  polygon[], polygonClosed, lastResult, mv{annotations, summary, rev, projected}`).
 * `api.js` — fetch wrappers for every backend route in §4.
 * `coords.js` — **dependency-free** pixel/zoom/pan/rotation math (no DOM, no `window`,
   no `canvas`): image px ↔ display px round-trips under an arbitrary zoom/pan state.
@@ -624,15 +727,40 @@ browser-native ES modules loaded via `<script type="module" src="js/main.js">`:
   additions — mouse-wheel/pinch zoom, drag-to-pan, vertex drag, edge-click insert,
   Delete/Backspace to remove the selected vertex, Escape to deselect/cancel. Canvas
   backing store still only resizes on image load (T0.7), not per redraw.
-* `steps/{upload,scale,mark,result}.js` — one module per workflow step, mirroring the
-  original file's own section structure.
+* `steps/{upload,scale,mark,multiview,result}.js` — one module per workflow step, mirroring
+  the original file's own section structure.
+* `steps/multiview.js` — the preferred marking workflow (`trace-mode = "multi"`, the
+  default): the same canvas and outline tools, one outline per photo. The server owns the
+  outlines and everything derived from them; the module renders progress chips per POV
+  group (`P3 1/2`), the 4×2 status line, actionable instructions (which photo to outline
+  next, which outline disagrees, missing viewpoints), the per-outline agreement list
+  (click to revisit), and the fused region's confident / best / outer-limit areas. On the
+  canvas it overlays the current 3D region reprojected into the open photo — best
+  (dashed cyan, "Use projected region as outline" copies it in as an editable polygon),
+  confident interior (green), outer limit of the uncertain boundary (orange). Buttons:
+  Accept, Use projected region, Skip, Delete, Next suggested photo. Every edit of a closed
+  outline is saved (debounced idempotent `PUT`, queued per photo, retried until it lands,
+  `beforeunload` guard while anything is unsaved); `mv.flush()` runs before a measurement.
+  "Compute volume" is enabled once 4×2 is met, or with the explicit "indicative result"
+  checkbox and ≥ 1 accepted outline. Mode and open photo are remembered per job
+  (`localStorage["lsv-mark:<job>"]`) and the outlines reload from the server, so a page
+  reload returns to the same state; a result older than the current outlines is marked
+  stale (`annotations_rev`).
+* `steps/mark.js` measure flow: one in-flight request per page (a second click is dropped),
+  a `409 busy` attaches to the running measurement instead of failing, a 4×2 refusal shows
+  the server's instructions, and failures appear in `#measure-note` rather than an `alert`.
+  After a reload, a measurement that failed or was interrupted while the page was away is
+  reported from the snapshot's `error`.
 * Auto-detect fills `state.polygon` from the largest returned region (unchanged).
 * Polling loop (unchanged behavior, moved into `steps/`): 1.2 s `setTimeout` until status
   leaves `reconstructing|measuring|orthorectifying`. SSE (`GET …/events`, §1.2/§4) exists
   server-side but is **not yet adopted client-side** — left as the obvious next step,
   not done in this pass.
 * Result panel: volumes, area, depth, datum name, swell factor, warnings, and now (T3.2)
-  the T2.2 bootstrap `net_volume_ci95_m3` as a 95% CI next to net volume when present
+  `confidence`, and for a multi-view result the outlines used, cut/net region bounds
+  (confident – best – outer limit), fused areas and the `regionmap.png` artifact; a
+  photo-mode result with no `annotation_mode` (saved before multi-view) is labelled
+  lower-confidence; the T2.2 bootstrap `net_volume_ci95_m3` as a 95% CI next to net volume when present
   (falling back to the flat `est_volume_error_m3` otherwise, mirroring `pipeline.py`'s
   own fallback) plus the T2.1 `volume_raster_m3`/`unmeasured_area_m2` cross-check row;
   all three artifacts (`overlay.jpg`, `heightmap.png`, `slopemap.png`), cache-busted.
@@ -686,3 +814,28 @@ gate (`gates.py`, §3.8a) each preset's measured coverage implies:
 | descending | 20/21 | rejected | ~47% | degenerate low cameras (RC3); `test_descending_focal_spread_is_tight` can fail on a re-built reconstruction — see REMAINING_ACCURACY_PROGRESS.md §6 (pre-existing `sfm.py` ladder gap, not fixed by this pass) |
 | nadir | 21/21 | rejected | — | `aruco_scale` now raises outright (marker side spread >10%, G2) before any volume is computed |
 | oblique60 | 21/21 | — | — | unchanged: `aruco_scale` still raises (marker visible in only one photo) |
+
+### 7.2 Multi-view region marking (`tools/mv_benchmark.py`)
+
+`python -m tools.mv_benchmark --presets twosided_cal,twosided_b,arc,sparse8` writes
+synthetic ground-truth masks (`data/bench/<scene>/gt_masks.json`: the true ring projected
+into every photo with its ground-truth camera) and scores the legacy single outline against
+1 / 2 / 4 / 8 / 16 fused outlines, boundary noise, one bad mask, an occluder and missing POV
+groups: 3D precision / recall, boundary error, uncertain-area share, status and reasons,
+volume error, region bounds, runtime, peak RSS. It never runs SfM or stereo (cached scenes
+only). Full table: `data/bench/multiview_results.md`; discussion:
+MULTIVIEW_REGION_PROGRESS.md §5.
+
+| scene | legacy 1-view | 8 outlines (4×2) |
+| --- | --- | --- |
+| `twosided_cal` | ok, 1.48% volume error, boundary 0.018 m | ok / confidence high, 1.39%, boundary 0.027 m, bounds 66.1 – 66.2 – 66.3 m³ |
+| `twosided_b` | indicative (`G9_datum_unstable`), 16.8% | indicative (`G9_datum_unstable`), 17.4% |
+| `arc` | rejected (G6), 26.0% | rejected (G6 + `MV_poor_visibility`), 26.0% |
+| `sparse8` | rejected, 39.1% | rejected (4×2 not achievable with 8 photos), 32.7% |
+
+One deliberately bad outline among eight is rejected on all four scenes (leave-one-out IoU
+0.13–0.18 against ≥ 0.84 for every honest outline); region metrics and volume do not move.
+
+`tests/test_multiview.py` (analytic scene, fast), `tests/test_annotations_api.py`,
+`tests/test_multiview_ui.mjs` and `tests/test_e2e_multiview.py` (slow, `twosided_cal`) pin
+this behaviour.

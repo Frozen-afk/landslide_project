@@ -98,3 +98,8 @@ figcaption { color: #9fb0c3; font-size: 0.82rem; margin-top: 4px; }
 .jobchip:hover:not(.cur) { border-color: #58719a; }
 .jobchip.cur { border-color: #2f6fd6; color: #9fc4ff; }
 .job-list-wrap .link { font-size: 0.8rem; margin-right: 10px; }
+
+/* multi-view marking (steps/multiview.js) */
+.mv-panel { margin-top: 10px; font-size: 0.86rem; }
+.mv-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.mv-key { font-weight: bold; }

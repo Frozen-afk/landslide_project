@@ -153,7 +153,7 @@ def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
             rim_px: float = 12.0, rim_inner_px: float | None = None,
             mode: str = "photo", ortho: dict | None = None,
             artifacts_dir=None, log=print, save_cloud: bool = False,
-            dem=None) -> dict:
+            dem=None, annotations: list | None = None) -> dict:
     """Full measurement of one marked region. Returns the result dict.
 
     mode="photo": polygon is drawn on `image_name` (pixel coords).
@@ -162,9 +162,22 @@ def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
     selection then happens in true ground coordinates — no parallax.
     dem=(R, t, surface): with a prior-surface DEM aligned to the model, the
     datum is the DEM itself (no rim extrapolation) — surface − DEM directly.
+    annotations=[{"image", "polygon"}, ...] (mode="photo" only): outlines of
+    the SAME region on several photos, fused into one 3D region by
+    landslide.multiview — the preferred photo-mode workflow. `image_name`/
+    `polygon` are then ignored. Without it, the single-photo path below runs
+    exactly as before and the result is marked `confidence="lower"`.
     """
     if not ctx.scale_info.get("applied"):
         raise RuntimeError("metric scale not set yet (mark the reference first)")
+    if annotations:
+        if mode != "photo":
+            raise ValueError("multi-view outlines need mode='photo'")
+        annotations = [a for a in annotations
+                       if a["image"] in ctx.views and len(a["polygon"]) >= 3]
+        if not annotations:
+            raise ValueError("none of the outlined photos is part of the reconstruction")
+        image_name, polygon = annotations[0]["image"], annotations[0]["polygon"]
     polygon = np.asarray(polygon, np.float64)
     if len(polygon) < 3:
         raise ValueError("polygon needs at least 3 vertices")
@@ -206,29 +219,46 @@ def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
         up_info: dict = {}
         up = estimate_up(ctx.views, ctx.sparse, log=log, info=up_info)
 
-        # ground-frame selection (T1.2): cast the traced polygon onto a
-        # ground DSM instead of projecting the cloud into the photo, so
-        # photo-mode tracing is as parallax-free as ortho-mode tracing.
-        # Falls back to the image-plane projection when the ray-cast can't
-        # resolve most of the boundary (steep oblique angle, thin cloud).
-        ground = None
-        try:
-            from .ground import select_region_ground
-            ground = select_region_ground(ctx, image_name, polygon, up=up, log=log,
-                                          dense=dense)
-        except Exception as e:
-            log(f"[measure] ground-frame selection failed ({e}); "
-                "falling back to image-plane selection")
-        polygon_ground = None
-        if ground is not None:
-            interior, rim, ginfo = ground
-            region_method = "ground_frame"
-            polygon_ground = np.asarray(ginfo["ground_polygon"], np.float64)
+        mv = None
+        if annotations:
+            # multi-view fusion: every outline votes on the points it can
+            # see; the fused footprint replaces the single ray-cast polygon
+            from .multiview import select_region_multiview
+            mv = select_region_multiview(ctx, annotations, up=up, log=log, dense=dense)
+            interior, rim, ginfo = mv["interior"]["best"], mv["rim"], mv["info"]
+            polygon_ground = mv["polygons"]["best"]
+            region_method = "multiview_fusion"
         else:
-            _, _, interior, rim = select_region(ctx, image_name, polygon,
-                                                rim_px, rim_inner_px,
-                                                extra_views=1)
-            region_method = "image_projection"
+            # ground-frame selection (T1.2): cast the traced polygon onto a
+            # ground DSM instead of projecting the cloud into the photo, so
+            # photo-mode tracing is as parallax-free as ortho-mode tracing.
+            # Falls back to the image-plane projection when the ray-cast can't
+            # resolve most of the boundary (steep oblique angle, thin cloud).
+            ground = None
+            try:
+                from .ground import select_region_ground
+                ground = select_region_ground(ctx, image_name, polygon, up=up, log=log,
+                                              dense=dense)
+            except Exception as e:
+                log(f"[measure] ground-frame selection failed ({e}); "
+                    "falling back to image-plane selection")
+            polygon_ground = None
+            if ground is not None:
+                interior, rim, ginfo = ground
+                region_method = "ground_frame"
+                polygon_ground = np.asarray(ginfo["ground_polygon"], np.float64)
+            else:
+                _, _, interior, rim = select_region(ctx, image_name, polygon,
+                                                    rim_px, rim_inner_px,
+                                                    extra_views=1)
+                region_method = "image_projection"
+
+        def _bound_volume(sel, poly):
+            if dem is not None:
+                from .volume import dem_volume
+                return dem_volume((pts[sel] * ctx.scale) @ dem[0].T + dem[1], dem[2], log=log)
+            return prism_volume(pts[sel] * ctx.scale, pts[rim] * ctx.scale,
+                                log=log, up=up, polygon_ground=poly, bootstrap=False)
 
         if dem is not None:
             R, t, surface = dem
@@ -245,7 +275,27 @@ def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
         res["region_method"] = region_method
         res["up_source"] = up_info["up_source"]
         res["up_disagree_deg"] = up_info["disagree_deg"]
-        if region_method == "ground_frame":
+        res["annotation_mode"] = "multi_view" if mv else "single_view"
+        if mv:
+            # lower / upper region selections -> volume bounds. Same rim (and
+            # so the same kind of datum) as the best selection; only the
+            # interior extent changes.
+            res["rim_band_m"] = [ginfo["rim_inner_m"], ginfo["rim_outer_m"]]
+            bounds = {"best": {k: res[k] for k in
+                               ("net_volume_m3", "cut_volume_m3", "fill_volume_m3", "area_m2")}}
+            for lvl in ("lower", "upper"):
+                sel = mv["interior"][lvl]
+                try:
+                    if sel is None:
+                        raise RuntimeError("no region at this level")
+                    r_l = _bound_volume(sel, mv["polygons"][lvl])
+                    bounds[lvl] = {k: r_l[k] for k in bounds["best"]}
+                except Exception as e:
+                    log(f"[multiview] {lvl} selection not measurable: {e}")
+                    bounds[lvl] = None
+            res["volume_bounds_m3"] = bounds
+            res["multiview"] = mv["fusion"]["stats"]
+        elif region_method == "ground_frame":
             res["rim_band_m"] = [ginfo["rim_inner_m"], ginfo["rim_outer_m"]]
             res["hit_frac"] = ginfo["hit_frac"]
             res["max_miss_run"] = ginfo["max_miss_run"]
@@ -298,6 +348,13 @@ def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
         res["est_volume_error_m3"] = float(max(net - lo, hi - net, heuristic))
     elif scale_rel:
         res["est_volume_error_m3"] = float(heuristic)
+    if res.get("volume_bounds_m3"):
+        # the region itself is uncertain: the spread between the lower/upper
+        # selections is a floor on the reported error, same max() rule as F9
+        b = res["volume_bounds_m3"]
+        spread = max((abs(b[k]["net_volume_m3"] - net) for k in ("lower", "upper") if b[k]),
+                     default=0.0)
+        res["est_volume_error_m3"] = float(max(res.get("est_volume_error_m3") or 0.0, spread))
     for w in ctx.scale_info.get("warnings") or []:
         res.setdefault("warnings", []).append(f"scale: {w}")
     for w in getattr(ctx, "warnings", None) or []:
@@ -316,6 +373,15 @@ def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
     # only — never changes status or any volume number.
     res["measurement_path"] = classify_measurement_path(
         status, res.get("reason_ids", []), res.get("datum"))
+    # multi-view marking: "high" needs the 4x2 requirement AND every gate;
+    # a single-photo outline keeps its status but is marked lower-confidence
+    if res.get("annotation_mode") == "multi_view":
+        res["confidence"] = "high" if status == "ok" else status
+    elif res.get("annotation_mode") == "single_view":
+        res["confidence"] = "lower"
+        res.setdefault("warnings", []).append(
+            "single-photo outline (legacy) — lower confidence: outline the slide "
+            "on 2 photos from each of 4 viewpoints for a high-confidence result")
 
     if artifacts_dir is not None:
         artifacts_dir = Path(artifacts_dir)
@@ -335,6 +401,10 @@ def measure(ctx: ReconCtx, image_name: str | None, polygon, dense: bool = True,
                      artifacts_dir / "heightmap.png")
         heat_slope(debug["uv2"], debug["z"], artifacts_dir / "slopemap.png")
         res["artifacts"] = ["overlay.jpg", "heightmap.png", "slopemap.png"]
+        if mode == "photo" and annotations:
+            from .multiview import region_map
+            region_map(mv["fusion"], artifacts_dir / "regionmap.png")
+            res["artifacts"].append("regionmap.png")
         if save_cloud:
             _save_ply(pts * ctx.scale, ctx.cloud(dense=dense)[1],
                       artifacts_dir / "pointcloud.ply")
@@ -362,7 +432,8 @@ def run_spec(spec: dict, log=print) -> dict:
       photos_dir, out_dir?, reuse_dense?,
       scale: {"method": "aruco", "side_m", "dict"?, "id"?} or
              {"method": "manual", "length_m", "a": {...}, "b": {...}},
-      region: {"image", "polygon": [[x,y],...], "dense"?, "rim_px"?},
+      region: {"image", "polygon": [[x,y],...], "dense"?, "rim_px"?} or
+              {"annotations": [{"image", "polygon"}, ...]}  (multi-view),
       save_cloud?
     }
     """
@@ -393,12 +464,13 @@ def run_spec(spec: dict, log=print) -> dict:
         _, ortho = render_orthophoto(
             ctx, jpg_path=out_dir / "artifacts" / "ortho.jpg",
             meta_path=out_dir / "artifacts" / "ortho.json", log=log)
-    res = measure(ctx, reg.get("image"), reg["polygon"],
+    res = measure(ctx, reg.get("image"), reg.get("polygon") or [],
                   dense=reg.get("dense", True), rim_px=reg.get("rim_px", 12.0),
                   rim_inner_px=reg.get("rim_inner_px"),
                   mode=mode, ortho=ortho,
                   artifacts_dir=out_dir / "artifacts", log=log,
-                  save_cloud=spec.get("save_cloud", True))
+                  save_cloud=spec.get("save_cloud", True),
+                  annotations=reg.get("annotations"))
     with open(out_dir / "result.json", "w") as f:
         json.dump(res, f, indent=2)
     log(f"[done] net {res['net_volume_m3']:.2f} m^3 | cut {res['cut_volume_m3']:.2f} | "

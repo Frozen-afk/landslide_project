@@ -10,6 +10,7 @@ explicit-rejection captures, not fix targets.
 """
 from __future__ import annotations
 
+from .multiview import IOU_WARN
 from .sfm import FOCAL_SPREAD_RATIO_BAD, ReconCtx, _camera_center_collinearity, _focal_spread
 
 _RANK = {"ok": 0, "indicative": 1, "rejected": 2}
@@ -73,15 +74,48 @@ RULES: dict[str, dict[str, str]] = {
     "DEM_no_coverage_gate": {"class": "info", "action":
         "Measured against your pre-event model. Indicative until SlopeLens "
         "can check how much of the slide the model covers."},
+    # ---- multi-view marking (MULTIVIEW_REGION_PROGRESS.md). class
+    # "marking": fixed by outlining, not by recapturing or a DEM. ----
+    "MV_insufficient_pov": {"class": "marking", "action":
+        "Outline the slide on 2 photos from each of 4 different viewpoints "
+        "(8 outlines). Follow the suggested photos; if the photo set has "
+        "fewer than 4 viewpoints, add photos from further around the slide."},
+    "MV_mask_disagreement": {"class": "marking", "action":
+        "One or more outlines mark a different area than the others. Open "
+        "the flagged photos and redraw the outline on the same slide edge."},
+    "MV_poor_visibility": {"class": "marking", "action":
+        "Part of the region is seen from fewer than 2 viewpoints, or mostly "
+        "hidden in an outlined photo. Outline it on photos that show that "
+        "part, from another direction."},
+    "MV_uncertain_boundary": {"class": "marking", "action":
+        "The outlines do not agree on where the edge is. Redraw the loosest "
+        "outlines along the line between disturbed and undisturbed ground, "
+        "and add an outline from another viewpoint."},
+    "MV_occlusion_support": {"class": "marking", "action":
+        "Too little 3-D surface was reconstructed under an outline to tell "
+        "what hides what. Use photos where the slide surface is textured and "
+        "reconstructed, or outline on a different photo."},
+    "MV_disconnected": {"class": "marking", "action":
+        "The outlines agree on separate patches, not one region. Outline "
+        "one connected slide; measure separate slides one at a time."},
 }
+
+# multi-view gate thresholds (calibration: MULTIVIEW_REGION_PROGRESS.md §4)
+MV_UNCERTAIN_AREA_FRAC = 0.25   # (upper - lower footprint) / best
+MV_WEAK_SUPPORT_FRAC = 0.15     # footprint not SEEN by >= 2 POV groups (= 1 - G6's 0.85)
+MV_MIN_VISIBLE_FRAC = 0.30      # of the fused region visible in an outlined photo
+MV_MIN_ZBUF_SUPPORT = 0.50      # reconstructed depth under an outline
 
 
 def classify_measurement_path(status: str, reason_ids: list[str],
                               datum: str | None) -> str:
-    """§7a.1: rim / dem / indicative_only / capture_failure. First match
+    """§7a.1: rim / dem / indicative_only / capture_failure (+ marking, for
+    the multi-view outline gates). First match
     wins. Additive only — never changes status or any volume number."""
     if any(RULES.get(rid, {}).get("class") == "capture" for rid in reason_ids):
         return "capture_failure"
+    if any(RULES.get(rid, {}).get("class") == "marking" for rid in reason_ids):
+        return "marking"
     if datum == "dem":
         return "dem"
     if "G9_datum_unstable" in reason_ids:
@@ -201,6 +235,49 @@ def evaluate_gates(ctx: ReconCtx, res: dict, region_method: str) -> tuple[str, l
                  f"departs ±{dh:.2f} m from the fitted surface, about "
                  f"{dh * area:.1f} m³ ({dh * area / max(net, 1e-9):.0%}) of the volume",
                  "G9_datum_unstable")
+
+    # MV — multi-view marking gates (only when the fused region was used)
+    mv = res.get("multiview")
+    if mv:
+        req = mv["requirement"]
+        if not req["met"]:
+            flag("indicative", f"outlines cover {req['n_groups_complete']} of "
+                 f"{req['min_groups']} viewpoints with {req['min_per_group']} photos each "
+                 f"({req['n_annotations']} of {req['min_annotations']} outlines) — "
+                 "below the multi-view requirement", "MV_insufficient_pov")
+        anns = mv["annotations"]
+        bad = [a["image"] for a in anns if a["rejected"]]
+        soft = [a["image"] for a in anns if not a["rejected"] and a["weight"] < 1.0]
+        # no single odd one out, but the outlines do not agree with each other
+        split = [a["image"] for a in anns if a["weight"] >= 1.0
+                 and a["iou"] is not None and a["iou"] < IOU_WARN]
+        if bad or soft or split:
+            flag("indicative", "outline disagreement: " + "; ".join(
+                f"{', '.join(names)} {what}" for names, what in
+                ((bad, "excluded"), (soft, "down-weighted"),
+                 (split, "disagree with each other")) if names),
+                 "MV_mask_disagreement")
+        hidden = [a["image"] for a in anns
+                  if not a["rejected"] and a["visible_frac"] < MV_MIN_VISIBLE_FRAC]
+        weak = mv.get("weak_support_frac") or 0.0
+        if weak > MV_WEAK_SUPPORT_FRAC or hidden:
+            flag("indicative", f"{weak:.0%} of the region is seen from fewer than 2 "
+                 "viewpoints" + (f"; mostly hidden in {', '.join(hidden)}" if hidden else ""),
+                 "MV_poor_visibility")
+        unc = mv.get("uncertain_area_frac")
+        if unc is None or unc > MV_UNCERTAIN_AREA_FRAC:
+            flag("indicative", "region boundary uncertain: the outlines leave "
+                 + ("no confident interior" if unc is None else
+                    f"{unc:.0%} of the region area undecided"), "MV_uncertain_boundary")
+        thin = [a["image"] for a in anns
+                if not a["rejected"] and a["zbuf_support"] < MV_MIN_ZBUF_SUPPORT]
+        if thin:
+            flag("indicative", "occlusion cannot be checked under the outline on "
+                 + ", ".join(thin) + " (too little reconstructed surface)",
+                 "MV_occlusion_support")
+        if mv.get("components", 1) > 1:
+            flag("indicative", f"the outlines agree on {mv['components']} separate "
+                 "patches — only the largest was measured", "MV_disconnected")
 
     res["reason_ids"] = reason_ids
     return status, reasons
